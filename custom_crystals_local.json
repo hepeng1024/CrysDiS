@@ -19,7 +19,7 @@
           "z": 0.0,
           "occupancy": 0.5,
           "label": "Al0",
-          "color": "#AEB6BF"
+          "color": "#dced1c"
         },
         {
           "element": "Ni",
@@ -60,7 +60,7 @@
       ]
     },
     {
-      "name": "Al",
+      "name": "Al (mp-134)",
       "lattice_system": "cubic",
       "a": 0.403892969,
       "b": 0.403892969,
@@ -83,7 +83,7 @@
       ]
     },
     {
-      "name": "AlNi3",
+      "name": "AlNi3 (mp-2593)",
       "lattice_system": "cubic",
       "a": 0.35230547300000004,
       "b": 0.35230547300000004,
@@ -91,7 +91,7 @@
       "alpha": 90.0,
       "beta": 90.0,
       "gamma": 90.0,
-      "space_group": "P1",
+      "space_group": "Pm-3m",
       "repeat_boundary_atoms": true,
       "sites": [
         {
@@ -105,59 +105,100 @@
         },
         {
           "element": "Ni",
-          "x": 0.0,
+          "x": 0.5,
           "y": 0.5,
-          "z": 0.5,
+          "z": 0.0,
           "occupancy": 1.0,
           "label": "Ni1",
           "color": "#10B7A5"
+        }
+      ]
+    },
+    {
+      "name": "D024 Ni3Ti",
+      "lattice_system": "hexagonal",
+      "a": 0.5053601,
+      "b": 0.5053601,
+      "c": 0.8231432000000001,
+      "alpha": 90.0,
+      "beta": 90.0,
+      "gamma": 119.99999999999999,
+      "space_group": "P6_3/mmc",
+      "repeat_boundary_atoms": true,
+      "sites": [
+        {
+          "element": "Ti",
+          "x": 0.0,
+          "y": 0.0,
+          "z": 0.0,
+          "occupancy": 1.0,
+          "label": "Ti0",
+          "color": "#0aff3f"
+        },
+        {
+          "element": "Ti",
+          "x": 0.3333333333333333,
+          "y": 0.6666666666666666,
+          "z": 0.25,
+          "occupancy": 1.0,
+          "label": "Ti1",
+          "color": "#0aff3f"
         },
         {
           "element": "Ni",
           "x": 0.5,
-          "y": 0.0,
-          "z": 0.5,
+          "y": 0.5,
+          "z": 0.0,
           "occupancy": 1.0,
           "label": "Ni2",
-          "color": "#10B7A5"
+          "color": "#d50ee3"
         },
         {
           "element": "Ni",
-          "x": 0.5,
-          "y": 0.5,
-          "z": 0.0,
+          "x": 0.8333333333333334,
+          "y": 0.6666666666666666,
+          "z": 0.25,
           "occupancy": 1.0,
           "label": "Ni3",
-          "color": "#10B7A5"
+          "color": "#d50ee3"
         }
       ]
     },
     {
-      "name": "AlNi3 (symmetrized)",
-      "lattice_system": "cubic",
-      "a": 0.35230547300000004,
-      "b": 0.35230547300000004,
-      "c": 0.35230547300000004,
+      "name": "L10 MnNi",
+      "lattice_system": "tetragonal",
+      "a": 0.37400000000000005,
+      "b": 0.37400000000000005,
+      "c": 0.35200000000000004,
       "alpha": 90.0,
       "beta": 90.0,
       "gamma": 90.0,
-      "space_group": "Pm-3m",
+      "space_group": "P4/mmm",
       "repeat_boundary_atoms": true,
       "sites": [
         {
-          "element": "Al",
+          "element": "Mn",
           "x": 0.0,
           "y": 0.0,
           "z": 0.0,
           "occupancy": 1.0,
-          "label": "Al0",
-          "color": "#AEB6BF"
+          "label": "Mn1",
+          "color": "#C77DFF"
+        },
+        {
+          "element": "Mn",
+          "x": 0.5,
+          "y": 0.5,
+          "z": 0.0,
+          "occupancy": 1.0,
+          "label": "Mn2",
+          "color": "#C77DFF"
         },
         {
           "element": "Ni",
           "x": 0.5,
-          "y": 0.5,
-          "z": 0.0,
+          "y": 0.0,
+          "z": 0.5,
           "occupancy": 1.0,
           "label": "Ni1",
           "color": "#10B7A5"
@@ -165,39 +206,7 @@
       ]
     },
     {
-      "name": "L12_Ni3Al_created_locally",
-      "lattice_system": "cubic",
-      "a": 0.3523,
-      "b": 0.3523,
-      "c": 0.3523,
-      "alpha": 90.0,
-      "beta": 90.0,
-      "gamma": 90.0,
-      "space_group": "Pm-3m",
-      "repeat_boundary_atoms": true,
-      "sites": [
-        {
-          "element": "Al",
-          "x": 0.0,
-          "y": 0.0,
-          "z": 0.0,
-          "occupancy": 1.0,
-          "label": "Al",
-          "color": "#dfe620"
-        },
-        {
-          "element": "Ni",
-          "x": 0.5,
-          "y": 0.5,
-          "z": 0.0,
-          "occupancy": 1.0,
-          "label": "Ni",
-          "color": "#be00cc"
-        }
-      ]
-    },
-    {
-      "name": "L12_Ni3Ti_created_locally",
+      "name": "L12 Ni3Ti",
       "lattice_system": "cubic",
       "a": 0.358,
       "b": 0.358,
@@ -229,7 +238,7 @@
       ]
     },
     {
-      "name": "Mg",
+      "name": "Mg (mp-153)",
       "lattice_system": "hexagonal",
       "a": 0.317202329,
       "b": 0.31720232899999995,
@@ -261,7 +270,7 @@
       ]
     },
     {
-      "name": "Mg5Si6",
+      "name": "Mg5Si6 (mp-568306)",
       "lattice_system": "monoclinic",
       "a": 1.4929464660000002,
       "b": 0.41428609800000005,
@@ -269,7 +278,7 @@
       "alpha": 90.0,
       "beta": 110.39231575999999,
       "gamma": 90.0,
-      "space_group": "C12/m1",
+      "space_group": "C2/m",
       "repeat_boundary_atoms": true,
       "sites": [
         {
@@ -329,7 +338,7 @@
       ]
     },
     {
-      "name": "Mg5Si6_no_sym",
+      "name": "Mg5Si6_no_sym (mp-568306)",
       "lattice_system": "triclinic",
       "a": 0.41428609800000005,
       "b": 0.681477068,
@@ -442,7 +451,7 @@
       ]
     },
     {
-      "name": "SiNi3",
+      "name": "Ni3Si (mp-828)",
       "lattice_system": "cubic",
       "a": 0.346374006,
       "b": 0.346374006,
@@ -469,79 +478,6 @@
           "z": 0.0,
           "occupancy": 1.0,
           "label": "Ni1",
-          "color": "#d50ee3"
-        }
-      ]
-    },
-    {
-      "name": "Ta_vesta",
-      "lattice_system": "cubic",
-      "a": 0.33030000000000004,
-      "b": 0.33030000000000004,
-      "c": 0.33030000000000004,
-      "alpha": 90.0,
-      "beta": 90.0,
-      "gamma": 90.0,
-      "space_group": "Im-3m",
-      "repeat_boundary_atoms": true,
-      "sites": [
-        {
-          "element": "Ta",
-          "x": 0.0,
-          "y": 0.0,
-          "z": 0.0,
-          "occupancy": 1.0,
-          "label": "XX",
-          "color": "#E71D36"
-        }
-      ]
-    },
-    {
-      "name": "TiNi3_ideal (symmetrized)",
-      "lattice_system": "hexagonal",
-      "a": 0.5053601,
-      "b": 0.5053601,
-      "c": 0.8231432000000001,
-      "alpha": 90.0,
-      "beta": 90.0,
-      "gamma": 119.99999999999999,
-      "space_group": "P6_3/mmc",
-      "repeat_boundary_atoms": true,
-      "sites": [
-        {
-          "element": "Ti",
-          "x": 0.0,
-          "y": 0.0,
-          "z": 0.0,
-          "occupancy": 1.0,
-          "label": "Ti0",
-          "color": "#0aff3f"
-        },
-        {
-          "element": "Ti",
-          "x": 0.3333333333333333,
-          "y": 0.6666666666666666,
-          "z": 0.25,
-          "occupancy": 1.0,
-          "label": "Ti1",
-          "color": "#0aff3f"
-        },
-        {
-          "element": "Ni",
-          "x": 0.5,
-          "y": 0.5,
-          "z": 0.0,
-          "occupancy": 1.0,
-          "label": "Ni2",
-          "color": "#d50ee3"
-        },
-        {
-          "element": "Ni",
-          "x": 0.8333333333333334,
-          "y": 0.6666666666666666,
-          "z": 0.25,
-          "occupancy": 1.0,
-          "label": "Ni3",
           "color": "#d50ee3"
         }
       ]

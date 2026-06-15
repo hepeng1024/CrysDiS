@@ -1361,6 +1361,160 @@ def canonical_symmetry_site(group: list[Any]) -> Any:
     return sorted(group, key=site_key)[0]
 
 
+def cif_values(block: dict[str, Any], *keys: str) -> list[Any]:
+    value = cif_block_value(block, *keys)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+
+def cif_value_at(values: list[Any], index: int, default: Any = "") -> Any:
+    if not values:
+        return default
+    if index < len(values):
+        return values[index]
+    return values[-1]
+
+
+def parse_cif_float(value: Any, default: float = 0.0) -> float:
+    text = str(value if value is not None else "").strip().strip("'\"")
+    if text in {"", ".", "?"}:
+        return float(default)
+    if "/" in text and re.fullmatch(r"[-+]?\d+\s*/\s*[-+]?\d+", text):
+        numerator, denominator = text.split("/", 1)
+        try:
+            return float(numerator) / float(denominator)
+        except ZeroDivisionError:
+            return float(default)
+    text = re.sub(r"\([^)]*\)$", "", text)
+    try:
+        return float(text)
+    except ValueError:
+        return float(default)
+
+
+def element_from_cif_atom(type_symbol: Any, label: Any) -> str:
+    for value in (type_symbol, label):
+        text = str(value if value is not None else "").strip().strip("'\"")
+        match = re.match(r"([A-Za-z]{1,2})", text)
+        if match:
+            return match.group(1).capitalize()
+    return ""
+
+
+def declared_cif_symmetry_operations(block: dict[str, Any], declared_space_group: str) -> list[Any]:
+    operation_texts = cif_values(
+        block,
+        "_space_group_symop_operation_xyz",
+        "_symmetry_equiv_pos_as_xyz",
+        "_space_group_symop.operation_xyz",
+    )
+    if operation_texts:
+        try:
+            from pymatgen.core.operations import SymmOp
+
+            operations = []
+            for text in operation_texts:
+                operation = str(text).strip().strip("'\"")
+                if operation:
+                    operations.append(SymmOp.from_xyz_str(operation))
+            if operations:
+                return operations
+        except Exception:
+            pass
+
+    symbol = space_group_symbol(declared_space_group)
+    if symbol in {"", "P1", "1"}:
+        return []
+    try:
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
+        return list(space_group.symmetry_ops)
+    except Exception:
+        return []
+
+
+def fractional_points_match(a: np.ndarray, b: np.ndarray, tolerance: float = SYMMETRY_SITE_TOL) -> bool:
+    delta = np.abs(wrap_fractional(np.asarray(a, dtype=float) - np.asarray(b, dtype=float)))
+    delta = np.minimum(delta, 1.0 - delta)
+    return bool(np.all(delta <= tolerance))
+
+
+def equivalent_under_operations(site: AtomicSite, representative: AtomicSite, operations: list[Any]) -> bool:
+    if site.element.strip().capitalize() != representative.element.strip().capitalize():
+        return False
+    if not math.isclose(float(site.occupancy), float(representative.occupancy), abs_tol=1e-5):
+        return False
+    target = snap_fractional(site.fractional)
+    base = snap_fractional(representative.fractional)
+    for operation in operations:
+        frac = snap_fractional(np.mod(operation.operate(base), 1.0))
+        if fractional_points_match(frac, target):
+            return True
+    return False
+
+
+def reduce_cif_sites_by_declared_symmetry(
+    sites: list[AtomicSite], block: dict[str, Any], declared_space_group: str
+) -> list[AtomicSite]:
+    operations = declared_cif_symmetry_operations(block, declared_space_group)
+    if not operations:
+        return [AtomicSite(**asdict(site)) for site in sites]
+
+    representatives: list[AtomicSite] = []
+    for site in sites:
+        if any(equivalent_under_operations(site, representative, operations) for representative in representatives):
+            continue
+        representatives.append(AtomicSite(**asdict(site)))
+    return representatives
+
+
+def atomic_sites_from_cif_block(block: dict[str, Any], declared_space_group: str) -> list[AtomicSite]:
+    xs = cif_values(block, "_atom_site_fract_x")
+    ys = cif_values(block, "_atom_site_fract_y")
+    zs = cif_values(block, "_atom_site_fract_z")
+    if not xs or not ys or not zs:
+        return []
+
+    labels = cif_values(block, "_atom_site_label")
+    symbols = cif_values(block, "_atom_site_type_symbol")
+    occupancies = cif_values(block, "_atom_site_occupancy")
+    row_count = max(len(xs), len(ys), len(zs), len(labels), len(symbols), len(occupancies), 0)
+    sites: list[AtomicSite] = []
+    for index in range(row_count):
+        label = str(cif_value_at(labels, index, "")).strip().strip("'\"")
+        element = element_from_cif_atom(cif_value_at(symbols, index, ""), label)
+        if not element:
+            continue
+        frac = snap_fractional(
+            wrap_fractional(
+                np.array(
+                    [
+                        parse_cif_float(cif_value_at(xs, index, 0.0)),
+                        parse_cif_float(cif_value_at(ys, index, 0.0)),
+                        parse_cif_float(cif_value_at(zs, index, 0.0)),
+                    ],
+                    dtype=float,
+                )
+            )
+        )
+        sites.append(
+            AtomicSite(
+                element=element,
+                x=float(frac[0]),
+                y=float(frac[1]),
+                z=float(frac[2]),
+                occupancy=parse_cif_float(cif_value_at(occupancies, index, 1.0), 1.0),
+                label=label or element,
+                color=color_for_element(element),
+            )
+        )
+    return reduce_cif_sites_by_declared_symmetry(sites, block, declared_space_group)
+
+
 def atomic_sites_from_structure(structure: Any, *, representatives_only: bool) -> list[AtomicSite]:
     source_sites: list[Any]
     if representatives_only:
@@ -1418,8 +1572,10 @@ def definition_from_cif(path: Path) -> CrystalDefinition:
     except Exception:
         pass
 
-    representatives_only = space_group_symbol(declared_space_group) not in {"", "P1", "1"}
-    sites = atomic_sites_from_structure(structure, representatives_only=representatives_only)
+    sites = atomic_sites_from_cif_block(cif_block, declared_space_group)
+    if not sites:
+        representatives_only = space_group_symbol(declared_space_group) not in {"", "P1", "1"}
+        sites = atomic_sites_from_structure(structure, representatives_only=representatives_only)
 
     if not sites:
         raise ValueError("The CIF file did not contain any atom sites.")
