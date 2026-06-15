@@ -1820,11 +1820,11 @@ class PanelController:
                 ).props("outlined dense").classes("panel-crystal")
                 self.zone_input = ui.input("Zone axis", value=self.state.zone_text, on_change=lambda _: self.apply()).props(
                     "outlined dense"
-                ).classes("panel-index")
+                ).classes("panel-index panel-zone")
                 self.zone_input.on("keydown.enter", self.apply_from_browser)
                 self.plane_input = ui.input("Plane", value=self.state.plane_text, on_change=lambda _: self.apply()).props(
                     "outlined dense"
-                ).classes("panel-index")
+                ).classes("panel-index panel-plane")
                 self.plane_input.on("keydown.enter", self.apply_from_browser)
                 self.vector_input = ui.input(
                     "Vector", value=self.state.vector_text, on_change=lambda _: self.apply()
@@ -2719,8 +2719,12 @@ class ComboPanelController:
                     value=self.state.selected_panel_id,
                     on_change=self.on_source_selected,
                 ).props("outlined dense").classes("combo-source-select")
-                ui.button("Add", on_click=self.add_selected_source).props("outline dense").classes("combo-action-button")
-                ui.button("Remove", on_click=self.remove_selected_source).props("outline dense").classes("combo-action-button")
+                ui.button("Add", on_click=self.add_selected_source).props("outline dense").classes(
+                    "combo-action-button combo-add-button"
+                )
+                ui.button("Remove", on_click=self.remove_selected_source).props("outline dense").classes(
+                    "combo-action-button combo-remove-button"
+                )
                 ui.button(icon="photo_camera", on_click=self.open_download_dialog).props("flat round dense").classes(
                     "combo-download-button"
                 ).tooltip("Download combo diffraction")
@@ -3071,7 +3075,7 @@ class SimulatorApp:
         ui.page_title("CrysDiS")
         self.dark_mode = ui.dark_mode(value=True)
         self.add_styles()
-        with ui.header().classes("app-header no-wrap items-center"):
+        with ui.header().classes("app-header items-center"):
             ui.label("CrysDiS").classes("app-title")
             ui.button("Intro", icon="help_outline", on_click=self.open_intro_dialog).props("flat dense").classes("intro-button")
             ui.space()
@@ -3493,23 +3497,25 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             .app-header {
                 background: #161c24;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-                height: 38px !important;
+                height: auto !important;
                 min-height: 38px !important;
-                padding: 3px 10px;
+                padding: 3px 8px;
                 display: flex;
-                flex-wrap: nowrap !important;
+                flex-wrap: wrap !important;
                 align-items: center;
-                gap: 4px;
+                align-content: center;
+                gap: 4px 6px;
+                overflow: visible;
             }
             .app-header.wrap {
-                flex-wrap: nowrap !important;
+                flex-wrap: wrap !important;
             }
             .app-header > * {
                 flex-shrink: 0;
             }
             .app-header .q-space {
                 flex: 1 1 auto;
-                min-width: 8px;
+                min-width: 0;
             }
             .app-title {
                 font-size: 14px;
@@ -3540,6 +3546,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                 min-height: 28px;
                 align-items: center;
                 color: #eef2f6;
+                flex: 0 1 auto;
             }
             .top-checkbox .q-checkbox__label {
                 font-size: 12px;
@@ -3566,11 +3573,13 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                 width: 100%;
                 display: grid;
                 grid-template-columns: 24px minmax(132px, 1.35fr) minmax(76px, 0.8fr) minmax(76px, 0.8fr) minmax(88px, 0.9fr) minmax(86px, 0.85fr) auto auto 30px 30px 26px;
+                grid-template-areas: "number crystal zone plane vector rotation apply sync download edit close";
                 gap: 4px;
                 align-items: center;
                 margin-bottom: 6px;
             }
             .panel-number {
+                grid-area: number;
                 width: 24px;
                 height: 38px;
                 display: flex;
@@ -3586,36 +3595,58 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             .panel-rotation {
                 min-width: 0;
             }
+            .panel-crystal {
+                grid-area: crystal;
+            }
+            .panel-zone {
+                grid-area: zone;
+            }
+            .panel-plane {
+                grid-area: plane;
+            }
+            .panel-vector {
+                grid-area: vector;
+            }
+            .panel-rotation {
+                grid-area: rotation;
+            }
             .panel-close-button {
+                grid-area: close;
                 width: 24px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-edit-button {
+                grid-area: edit;
                 width: 28px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-download-button {
+                grid-area: download;
                 width: 28px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-apply-button {
+                grid-area: apply;
                 min-width: 60px;
             }
             .panel-sync-button {
+                grid-area: sync;
                 min-width: 54px;
             }
             .combo-toolbar {
                 width: 100%;
                 display: grid;
                 grid-template-columns: 34px minmax(148px, 1fr) auto auto 30px 26px;
+                grid-template-areas: "combo-number combo-select combo-add combo-remove combo-download combo-close";
                 gap: 4px;
                 align-items: center;
                 margin-bottom: 6px;
             }
             .combo-number {
+                grid-area: combo-number;
                 color: #dce9fb;
                 font-size: 18px;
                 font-weight: 750;
@@ -3623,10 +3654,23 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                 text-align: center;
             }
             .combo-source-select {
+                grid-area: combo-select;
                 min-width: 0;
             }
             .combo-action-button {
                 min-width: 58px;
+            }
+            .combo-add-button {
+                grid-area: combo-add;
+            }
+            .combo-remove-button {
+                grid-area: combo-remove;
+            }
+            .combo-download-button {
+                grid-area: combo-download;
+            }
+            .combo-toolbar .panel-close-button {
+                grid-area: combo-close;
             }
             .comparison-panel .q-field--dense .q-field__control,
             .comparison-panel .q-field--dense .q-field__marginal {
@@ -4006,6 +4050,35 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                 width: 100%;
                 align-items: start;
             }
+            @media (max-width: 1280px) {
+                .app-header {
+                    padding: 3px 6px;
+                    gap: 3px 5px;
+                }
+                .app-header .q-space {
+                    display: none;
+                }
+                .app-title {
+                    font-size: 13px;
+                }
+                .intro-button {
+                    margin-left: 2px;
+                }
+                .app-header .q-btn {
+                    min-height: 26px;
+                    padding: 1px 5px;
+                    font-size: 11px;
+                }
+                .top-checkbox {
+                    min-height: 26px;
+                }
+                .top-checkbox .q-checkbox__label {
+                    font-size: 11px;
+                }
+                .top-checkbox .q-checkbox__inner {
+                    font-size: 24px;
+                }
+            }
             @media (max-width: 1100px) {
                 .panel-grid {
                     grid-template-columns: 1fr;
@@ -4014,7 +4087,23 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     --panel-visual-height: 300px;
                 }
                 .panel-toolbar {
-                    grid-template-columns: 24px minmax(120px, 1fr) repeat(4, minmax(70px, 0.76fr)) auto auto 30px 30px 26px;
+                    grid-template-columns: 24px minmax(136px, 1.5fr) minmax(86px, 0.85fr) minmax(86px, 0.85fr) minmax(106px, 1fr) minmax(96px, 0.9fr);
+                    grid-template-areas:
+                        "number crystal zone plane vector rotation"
+                        "number apply sync download edit close";
+                }
+                .panel-number {
+                    height: 100%;
+                    min-height: 38px;
+                    align-items: flex-start;
+                    padding-top: 8px;
+                }
+                .panel-apply-button,
+                .panel-sync-button,
+                .panel-download-button,
+                .panel-edit-button,
+                .panel-toolbar .panel-close-button {
+                    justify-self: start;
                 }
                 .combo-toolbar {
                     grid-template-columns: 42px minmax(180px, 1fr) auto auto 30px 28px;
@@ -4029,10 +4118,30 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     margin-top: 5px;
                     --panel-visual-height: 230px;
                 }
-                .panel-toolbar,
                 .advanced-grid,
                 .builder-grid {
                     grid-template-columns: 1fr !important;
+                }
+                .panel-toolbar {
+                    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr);
+                    grid-template-areas:
+                        "number crystal crystal"
+                        "number zone plane"
+                        "number vector rotation"
+                        "number apply sync"
+                        "number download edit"
+                        "number close close";
+                }
+                .panel-apply-button,
+                .panel-sync-button {
+                    width: 100%;
+                    min-width: 0;
+                    justify-self: stretch;
+                }
+                .panel-download-button,
+                .panel-edit-button,
+                .panel-toolbar .panel-close-button {
+                    justify-self: start;
                 }
                 .advanced-body {
                     grid-template-columns: 1fr;
@@ -4047,13 +4156,22 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     max-height: none;
                     overflow: visible;
                 }
-                .combo-toolbar,
                 .combo-stack {
                     grid-template-columns: 1fr;
                     height: auto;
                     min-height: 0;
                     max-height: none;
                     overflow: visible;
+                }
+                .combo-toolbar {
+                    grid-template-columns: 34px minmax(0, 1fr) 30px 28px;
+                    grid-template-areas:
+                        "combo-number combo-select combo-download combo-close"
+                        "combo-number combo-add combo-remove .";
+                }
+                .combo-action-button {
+                    width: 100%;
+                    min-width: 0;
                 }
                 .combo-source-list {
                     height: var(--panel-visual-height);
