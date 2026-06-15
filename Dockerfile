@@ -12,7 +12,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
-COPY crystal_diffraction_simulator_nice_gui.py ./
+COPY README.md ./
+COPY CrysDiS.py ./
 COPY custom_crystals_local.json ./
 
 RUN pip install --no-cache-dir --upgrade pip \
@@ -22,4 +23,4 @@ RUN mkdir -p data outputs
 
 EXPOSE 8080
 
-CMD ["python", "crystal_diffraction_simulator_nice_gui.py"]
+CMD ["python", "CrysDiS.py"]

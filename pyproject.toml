@@ -1,7 +1,7 @@
 [project]
-name = "crystal-diffraction-simulator-nicegui"
+name = "crysdis"
 version = "0.1.0"
-description = "Browser-based crystal structure and electron diffraction simulator built with NiceGUI."
+description = "CrysDiS: a browser-based crystal structure and electron diffraction simulator built with NiceGUI."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,11 +14,11 @@ dependencies = [
 ]
 
 [project.scripts]
-crystal-diffraction-simulator = "crystal_diffraction_simulator_nice_gui:main"
+crysdis = "CrysDiS:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["crystal_diffraction_simulator_nice_gui"]
+py-modules = ["CrysDiS"]

@@ -3068,11 +3068,11 @@ class SimulatorApp:
         self.builder: CrystalBuilder | None = None
 
     def build(self) -> None:
-        ui.page_title("Crystal Diffraction Simulator")
+        ui.page_title("CrysDiS")
         self.dark_mode = ui.dark_mode(value=True)
         self.add_styles()
         with ui.header().classes("app-header no-wrap items-center"):
-            ui.label("Crystal Diffraction Simulator").classes("app-title")
+            ui.label("CrysDiS").classes("app-title")
             ui.button("Intro", icon="help_outline", on_click=self.open_intro_dialog).props("flat dense").classes("intro-button")
             ui.space()
             self.show_zone_axis_input = ui.checkbox(
@@ -3130,6 +3130,8 @@ class SimulatorApp:
             ui.markdown(
                 """
 ### What this simulator does
+CrysDiS represents **Crystal Diffraction Simulator**.
+
 Compare a real-space crystal view with its electron diffraction pattern. Each ordinary panel has the crystal on the left and the diffraction pattern on the right.
 
 ### Basic workflow
@@ -4460,7 +4462,7 @@ def index() -> None:
 def main() -> None:
     port = int(os.environ.get("PORT", os.environ.get("NICEGUI_PORT", "8080")))
     host = os.environ.get("HOST", "0.0.0.0")
-    ui.run(title="Crystal Diffraction Simulator", host=host, port=port, reload=False, show=False)
+    ui.run(title="CrysDiS", host=host, port=port, reload=False, show=False)
 
 
 if __name__ in {"__main__", "__mp_main__"}:

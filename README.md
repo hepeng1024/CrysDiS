@@ -1,6 +1,6 @@
-# Crystal Diffraction Simulator
+# CrysDiS
 
-Browser-based crystal structure and electron diffraction simulator built with NiceGUI.
+CrysDiS stands for **Crystal Diffraction Simulator**. It is a browser-based crystal structure and electron diffraction simulator built with NiceGUI.
 
 The recommended way to share this app with labmates on Linux, Windows, macOS, and iPad is to deploy it as a hosted web app. Users only need a browser.
 
@@ -35,7 +35,7 @@ From this folder:
 
 ```bash
 python -m pip install -e .
-python crystal_diffraction_simulator_nice_gui.py
+python CrysDiS.py
 ```
 
 Then open:
@@ -47,7 +47,7 @@ http://127.0.0.1:8080
 You can choose another port:
 
 ```bash
-NICEGUI_PORT=8094 python crystal_diffraction_simulator_nice_gui.py
+NICEGUI_PORT=8094 python CrysDiS.py
 ```
 
 ## Run Locally With Docker
@@ -55,13 +55,13 @@ NICEGUI_PORT=8094 python crystal_diffraction_simulator_nice_gui.py
 Build:
 
 ```bash
-docker build -t crystal-diffraction-simulator .
+docker build -t crysdis .
 ```
 
 Run:
 
 ```bash
-docker run --rm -p 8080:8080 crystal-diffraction-simulator
+docker run --rm -p 8080:8080 crysdis
 ```
 
 Open:
@@ -93,7 +93,7 @@ HOST=0.0.0.0
 For local-only use, you can override the host:
 
 ```bash
-HOST=127.0.0.1 NICEGUI_PORT=8094 python crystal_diffraction_simulator_nice_gui.py
+HOST=127.0.0.1 NICEGUI_PORT=8094 python CrysDiS.py
 ```
 
 ## Privacy And Persistence Notes
@@ -110,7 +110,7 @@ GitHub Pages can host a landing/documentation page with screenshots and a link t
 
 ## Files
 
-- `crystal_diffraction_simulator_nice_gui.py`: main app
+- `CrysDiS.py`: main app
 - `pyproject.toml`: Python dependencies and optional console script
 - `Dockerfile`: reproducible container build
 - `.dockerignore`: keeps the Docker build context small
