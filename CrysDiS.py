@@ -3564,6 +3564,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                 width: 100%;
                 min-width: 0;
                 padding: 6px;
+                container-type: inline-size;
+                container-name: comparison-panel;
             }
             .combo-panel {
                 background: #151f2d;
@@ -3572,15 +3574,15 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             .panel-toolbar {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 24px minmax(132px, 1.35fr) minmax(76px, 0.8fr) minmax(76px, 0.8fr) minmax(88px, 0.9fr) minmax(86px, 0.85fr) auto auto 30px 30px 26px;
+                grid-template-columns: 22px minmax(104px, 1.3fr) minmax(58px, 0.7fr) minmax(58px, 0.7fr) minmax(74px, 0.8fr) minmax(74px, 0.8fr) minmax(52px, auto) minmax(48px, auto) 26px 26px 22px;
                 grid-template-areas: "number crystal zone plane vector rotation apply sync download edit close";
-                gap: 4px;
+                gap: 3px;
                 align-items: center;
                 margin-bottom: 6px;
             }
             .panel-number {
                 grid-area: number;
-                width: 24px;
+                width: 22px;
                 height: 38px;
                 display: flex;
                 align-items: center;
@@ -3612,29 +3614,29 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             }
             .panel-close-button {
                 grid-area: close;
-                width: 24px;
+                width: 22px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-edit-button {
                 grid-area: edit;
-                width: 28px;
+                width: 26px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-download-button {
                 grid-area: download;
-                width: 28px;
+                width: 26px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-apply-button {
                 grid-area: apply;
-                min-width: 60px;
+                min-width: 52px;
             }
             .panel-sync-button {
                 grid-area: sync;
-                min-width: 54px;
+                min-width: 48px;
             }
             .combo-toolbar {
                 width: 100%;
@@ -3715,8 +3717,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             }
             .comparison-panel .q-btn {
                 min-height: 34px;
-                padding: 2px 7px;
-                font-size: 12px;
+                padding: 2px 5px;
+                font-size: 11.5px;
             }
             .visual-stack {
                 display: grid;
@@ -4050,6 +4052,84 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                 width: 100%;
                 align-items: start;
             }
+            @container comparison-panel (max-width: 590px) {
+                .panel-toolbar {
+                    grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
+                    grid-template-areas:
+                        "number crystal zone plane vector rotation"
+                        "number apply sync download edit close";
+                }
+                .panel-number {
+                    height: 100%;
+                    min-height: 38px;
+                    align-items: flex-start;
+                    padding-top: 8px;
+                }
+                .panel-apply-button,
+                .panel-sync-button,
+                .panel-download-button,
+                .panel-edit-button,
+                .panel-toolbar .panel-close-button {
+                    justify-self: start;
+                }
+                .combo-toolbar {
+                    grid-template-columns: 42px minmax(180px, 1fr) auto auto 30px 28px;
+                }
+            }
+            @container comparison-panel (max-width: 500px) {
+                .panel-toolbar {
+                    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr);
+                    grid-template-areas:
+                        "number crystal crystal"
+                        "number zone plane"
+                        "number vector rotation"
+                        "number apply sync"
+                        "number download edit"
+                        "number close close";
+                }
+                .panel-apply-button,
+                .panel-sync-button {
+                    width: 100%;
+                    min-width: 0;
+                    justify-self: stretch;
+                }
+                .panel-download-button,
+                .panel-edit-button,
+                .panel-toolbar .panel-close-button {
+                    justify-self: start;
+                }
+                .combo-toolbar {
+                    grid-template-columns: 34px minmax(0, 1fr) 30px 28px;
+                    grid-template-areas:
+                        "combo-number combo-select combo-download combo-close"
+                        "combo-number combo-add combo-remove .";
+                }
+                .combo-action-button {
+                    width: 100%;
+                    min-width: 0;
+                }
+            }
+            @media (max-width: 1180px) and (min-width: 761px) {
+                .panel-toolbar {
+                    grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
+                    grid-template-areas:
+                        "number crystal zone plane vector rotation"
+                        "number apply sync download edit close";
+                }
+                .panel-number {
+                    height: 100%;
+                    min-height: 38px;
+                    align-items: flex-start;
+                    padding-top: 8px;
+                }
+                .panel-apply-button,
+                .panel-sync-button,
+                .panel-download-button,
+                .panel-edit-button,
+                .panel-toolbar .panel-close-button {
+                    justify-self: start;
+                }
+            }
             @media (max-width: 1280px) {
                 .app-header {
                     padding: 3px 6px;
@@ -4087,7 +4167,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     --panel-visual-height: 300px;
                 }
                 .panel-toolbar {
-                    grid-template-columns: 24px minmax(136px, 1.5fr) minmax(86px, 0.85fr) minmax(86px, 0.85fr) minmax(106px, 1fr) minmax(96px, 0.9fr);
+                    grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
                         "number apply sync download edit close";
