@@ -229,7 +229,7 @@ def build_cromer_mann_table() -> dict[str, tuple[list[float], list[float], float
 CROMER_MANN = build_cromer_mann_table()
 
 PLANE_COLORS = ["#FF6B6B", "#FFD166", "#06D6A0", "#4DABF7", "#C77DFF", "#F783AC"]
-VECTOR_COLORS = ["#E63946", "#2A9D8F", "#F4A261", "#577590", "#B5179E", "#80ED99"]
+VECTOR_COLORS = ["#E63946", "#F4A261", "#2A9D8F", "#577590", "#B5179E", "#80ED99"]
 PLANE_FILL_TEXTURE = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg=="
@@ -906,6 +906,40 @@ def reciprocal_delta_for_display(values: tuple[int, ...], model: CrystalModel) -
     if reciprocal_direction is None:
         return np.zeros(3, dtype=float)
     return reciprocal_direction * 0.72
+
+
+def shifted_segment_for_display_delta(delta: np.ndarray, model: CrystalModel) -> tuple[np.ndarray, np.ndarray]:
+    delta = np.asarray(delta, dtype=float)
+    if float(np.linalg.norm(delta)) < 1e-10:
+        return model.display_origin.copy(), model.display_origin.copy()
+    try:
+        delta_fractional = np.linalg.solve(model.display_lattice.T, delta)
+    except np.linalg.LinAlgError:
+        return model.display_origin.copy(), model.display_origin + delta
+
+    start_fractional = np.zeros(3, dtype=float)
+    for axis, component in enumerate(delta_fractional):
+        if component < 0.0:
+            start_fractional[axis] = min(max(-float(component), 0.0), 1.0)
+
+    end_fractional = start_fractional + delta_fractional
+    for axis in range(3):
+        if end_fractional[axis] > 1.0:
+            shift = min(float(end_fractional[axis] - 1.0), float(start_fractional[axis]))
+            start_fractional[axis] -= shift
+            end_fractional[axis] -= shift
+        elif end_fractional[axis] < 0.0:
+            shift = min(float(-end_fractional[axis]), float(1.0 - start_fractional[axis]))
+            start_fractional[axis] += shift
+            end_fractional[axis] += shift
+
+    start = model.display_origin + start_fractional @ model.display_lattice
+    end = start + delta
+    return start, end
+
+
+def reciprocal_segment_for_display(values: tuple[int, ...], model: CrystalModel) -> tuple[np.ndarray, np.ndarray]:
+    return shifted_segment_for_display_delta(reciprocal_delta_for_display(values, model), model)
 
 
 def reciprocal_index_components(values: tuple[int, ...], model: CrystalModel) -> tuple[int, int, int]:
@@ -1655,15 +1689,65 @@ class CrystalLibrary:
     def get(self, name: str) -> CrystalDefinition:
         return self.definitions.get(name, self.definitions["FCC"])
 
+    def exists(self, name: str) -> bool:
+        return (name or "").strip() in self.definitions
+
+    def path_for_scope(self, scope: str) -> Path:
+        return GLOBAL_LIBRARY_PATH if scope == "Global user library" else LOCAL_LIBRARY_PATH
+
     def save(self, definition: CrystalDefinition, scope: str) -> CrystalDefinition:
         definition = CrystalDefinition.from_dict(definition.to_dict())
         definition.name = self._custom_name(definition.name)
-        path = GLOBAL_LIBRARY_PATH if scope == "Global user library" else LOCAL_LIBRARY_PATH
+        path = self.path_for_scope(scope)
         saved = self._load_path(path)
         saved[definition.name] = definition
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"structures": [saved[name].to_dict() for name in sorted(saved)]}
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.reload()
+        return definition
+
+    def save_new(self, definition: CrystalDefinition, scope: str) -> CrystalDefinition:
+        definition = CrystalDefinition.from_dict(definition.to_dict())
+        definition.name = (definition.name or "Customized crystal").strip() or "Customized crystal"
+        if self.exists(definition.name):
+            raise ValueError(
+                f"A structure named {definition.name!r} already exists. Change the name or use SAVE EDITED STRUCTURE."
+            )
+        path = self.path_for_scope(scope)
+        saved = self._load_path(path)
+        saved[definition.name] = definition
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"structures": [saved[name].to_dict() for name in sorted(saved)]}
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.reload()
+        return definition
+
+    def save_edited(self, definition: CrystalDefinition, scope: str, original_name: str | None) -> CrystalDefinition:
+        definition = CrystalDefinition.from_dict(definition.to_dict())
+        definition.name = self._custom_name(definition.name)
+        original_name = (original_name or "").strip()
+        if original_name and original_name not in DEFAULT_NAMES and definition.name != original_name and self.exists(definition.name):
+            raise ValueError(f"A structure named {definition.name!r} already exists. Choose another name or save as a new structure.")
+
+        target_path = self.path_for_scope(scope)
+        target_saved = self._load_path(target_path)
+        if original_name and original_name not in DEFAULT_NAMES and definition.name != original_name:
+            for path in (GLOBAL_LIBRARY_PATH, LOCAL_LIBRARY_PATH):
+                saved = target_saved if path == target_path else self._load_path(path)
+                if original_name not in saved:
+                    continue
+                saved.pop(original_name, None)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                payload = {"structures": [saved[name].to_dict() for name in sorted(saved)]}
+                path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+                if path == target_path:
+                    target_saved = saved
+
+        target_saved[definition.name] = definition
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"structures": [target_saved[name].to_dict() for name in sorted(target_saved)]}
+        target_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         self.reload()
         return definition
 
@@ -1740,6 +1824,10 @@ class CrystalBuilder:
         self.site_rows: list[dict[str, Any]] = []
         self.site_container = None
         self.target_panel_id: int | None = None
+        self.mode = "new"
+        self.original_definition_name: str | None = None
+        self.save_edit_button = None
+        self.save_new_button = None
         self.repeat_boundary_atoms = True
         self._build()
 
@@ -1789,18 +1877,52 @@ class CrystalBuilder:
             self.site_container = ui.column().classes("full-width gap-2")
 
             with ui.row().classes("justify-end full-width gap-2"):
-                ui.button("Load selected crystal", icon="content_copy", on_click=self.load_selected).props("flat")
-                ui.button("Save structure", icon="save", on_click=self.save_structure).props("unelevated color=primary")
+                self.save_edit_button = ui.button(
+                    "Save edited structure",
+                    icon="save",
+                    on_click=self.save_edited_structure,
+                ).props("outline color=primary")
+                self.save_new_button = ui.button(
+                    "Save as a new structure",
+                    icon="save_as",
+                    on_click=self.save_as_new_structure,
+                ).props("unelevated color=primary")
 
-    def open(self, definition: CrystalDefinition | None = None, target_panel_id: int | None = None) -> None:
+    def open(
+        self,
+        definition: CrystalDefinition | None = None,
+        target_panel_id: int | None = None,
+        mode: str | None = None,
+    ) -> None:
+        self.mode = mode or ("edit" if definition is not None else "new")
         self.target_panel_id = target_panel_id
-        self.load_definition(definition or self.simulator.library.get("FCC"))
+        self.original_definition_name = definition.name if definition is not None else None
+        self.load_definition(definition or self.new_definition_template())
+        self.update_save_buttons()
         self.dialog.open()
 
-    def load_selected(self) -> None:
-        target = self.simulator.panel_state_by_id(self.target_panel_id)
-        selected = target.crystal_name if target is not None else (self.simulator.panel_states[0].crystal_name if self.simulator.panel_states else "FCC")
-        self.load_definition(self.simulator.library.get(selected))
+    def new_definition_template(self) -> CrystalDefinition:
+        return CrystalDefinition(
+            name="Customized crystal",
+            lattice_system="cubic",
+            a=0.35,
+            b=0.35,
+            c=0.35,
+            alpha=90.0,
+            beta=90.0,
+            gamma=90.0,
+            space_group="P1",
+            repeat_boundary_atoms=True,
+            sites=[AtomicSite("Ni", 0.0, 0.0, 0.0, 1.0, "Ni", color_for_element("Ni"))],
+        )
+
+    def update_save_buttons(self) -> None:
+        if self.save_edit_button is not None:
+            self.save_edit_button.visible = self.mode == "edit"
+            self.save_edit_button.update()
+        if self.save_new_button is not None:
+            self.save_new_button.visible = True
+            self.save_new_button.update()
 
     def load_definition(self, definition: CrystalDefinition) -> None:
         self.name_input.value = definition.name if definition.name not in DEFAULT_NAMES else f"{definition.name} custom"
@@ -1931,14 +2053,30 @@ class CrystalBuilder:
             raise ValueError("add at least one atom site")
         return definition
 
-    def save_structure(self) -> None:
+    def save_edited_structure(self) -> None:
         try:
             definition = self.read_definition()
-            saved = self.simulator.library.save(definition, self.scope_select.value or "Project local library")
+            saved = self.simulator.library.save_edited(
+                definition,
+                self.scope_select.value or "Project local library",
+                self.original_definition_name,
+            )
         except ValueError as exc:
             ui.notify(str(exc), type="negative")
             return
-        self.simulator.set_status(f"Saved {saved.name} to {self.scope_select.value}")
+        self.simulator.set_status(f"Saved edited structure {saved.name} to {self.scope_select.value}")
+        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id)
+        self.simulator.refresh_crystal_list()
+        self.dialog.close()
+
+    def save_as_new_structure(self) -> None:
+        try:
+            definition = self.read_definition()
+            saved = self.simulator.library.save_new(definition, self.scope_select.value or "Project local library")
+        except ValueError as exc:
+            ui.notify(str(exc), type="negative")
+            return
+        self.simulator.set_status(f"Saved new structure {saved.name} to {self.scope_select.value}")
         self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id)
         self.simulator.refresh_crystal_list()
         self.dialog.close()
@@ -2042,7 +2180,11 @@ class PanelController:
         self.apply()
 
     def open_builder(self) -> None:
-        self.simulator.builder.open(self.simulator.library.get(self.state.crystal_name), target_panel_id=self.state.panel_id)
+        self.simulator.builder.open(
+            self.simulator.library.get(self.state.crystal_name),
+            target_panel_id=self.state.panel_id,
+            mode="edit",
+        )
 
     def render_crystal_png(
         self,
@@ -2092,8 +2234,7 @@ class PanelController:
         vector_segments: list[tuple[ParsedIndex, np.ndarray, np.ndarray]] = []
         for vector in vectors:
             if vector.is_reciprocal:
-                start = model.display_origin.copy()
-                end = start + reciprocal_delta_for_display(vector.values, model)
+                start, end = reciprocal_segment_for_display(vector.values, model)
             else:
                 start, end = direction_segment_for_display(vector.values, model)
             vector_segments.append((vector, start, end))
@@ -2651,8 +2792,7 @@ class PanelController:
         for index, vector in enumerate(vectors):
             color = palette[index % len(palette)]
             if vector.is_reciprocal:
-                start = model.display_origin
-                end = start + reciprocal_delta_for_display(vector.values, model)
+                start, end = reciprocal_segment_for_display(vector.values, model)
                 self.draw_arrow(start, end, color, shaft_radius=0.011, head_radius=0.044, opacity=0.78)
                 self.draw_reciprocal_markers(start, end, color)
             else:
@@ -3258,7 +3398,7 @@ class SimulatorApp:
             ui.button("Advanced", icon="tune", on_click=lambda: self.advanced_dialog.open()).props("flat dense")
             ui.button("Crystal list", icon="format_list_bulleted", on_click=self.open_crystal_list).props("flat dense")
             ui.button("Load CIF", icon="upload_file", on_click=lambda: self.cif_dialog.open()).props("flat dense")
-            ui.button("Crystal builder", icon="add_box", on_click=lambda: self.builder.open()).props("flat dense")
+            ui.button("Crystal builder", icon="add_box", on_click=lambda: self.builder.open(mode="new")).props("flat dense")
             self.add_combo_button = ui.button(
                 "Add combo panel",
                 icon="join_inner",
@@ -3592,7 +3732,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
     def edit_crystal_from_list(self, name: str) -> None:
         if self.crystal_list_dialog is not None:
             self.crystal_list_dialog.close()
-        self.builder.open(self.library.get(name))
+        self.builder.open(self.library.get(name), mode="edit")
 
     def delete_crystal_from_list(self, name: str) -> None:
         if not self.library.delete(name):
