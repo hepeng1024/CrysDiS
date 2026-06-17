@@ -29,6 +29,71 @@ https://crysdis.onrender.com
 5. Use `Download` to export images.
 6. Use `Add combo panel` to overlay diffraction patterns from multiple panels.
 
+## Run The Source Code From GitHub
+
+This is a good option for people who want to run CrysDiS on their own Linux, Windows, or macOS computer instead of using the hosted Render app.
+
+First install Git and Anaconda/Miniconda. Then clone the repository:
+
+```bash
+git clone https://github.com/hepeng1024/CrysDiS.git
+cd CrysDiS
+```
+
+Create the conda environment:
+
+```bash
+conda env create -f environment.yml
+conda activate crysdis
+```
+
+Start CrysDiS:
+
+```bash
+python CrysDiS.py
+```
+
+Then open this address in a browser:
+
+```text
+http://127.0.0.1:8080
+```
+
+If port `8080` is already being used, choose another port:
+
+```bash
+NICEGUI_PORT=8094 python CrysDiS.py
+```
+
+On Windows PowerShell, use:
+
+```powershell
+$env:NICEGUI_PORT=8094
+python CrysDiS.py
+```
+
+## Update A Cloned Copy
+
+If the GitHub repository is updated later, go into the cloned folder and pull the newest files:
+
+```bash
+cd CrysDiS
+git pull
+```
+
+If dependencies changed, update the conda environment too:
+
+```bash
+conda env update -f environment.yml --prune
+conda activate crysdis
+```
+
+Then run the app again:
+
+```bash
+python CrysDiS.py
+```
+
 ## Run Locally With Python
 
 From this folder:
@@ -112,6 +177,8 @@ GitHub Pages can host a landing/documentation page with screenshots and a link t
 
 - `CrysDiS.py`: main app
 - `pyproject.toml`: Python dependencies and optional console script
+- `environment.yml`: conda environment for running from source
+- `requirements.txt`: pip dependency list used by `environment.yml`
 - `Dockerfile`: reproducible container build
 - `.dockerignore`: keeps the Docker build context small
 - `custom_crystals_local.json`: shared project-local custom structures
