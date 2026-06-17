@@ -224,7 +224,7 @@
           "z": 0.0,
           "occupancy": 1.0,
           "label": "Ti",
-          "color": "#ff0a68"
+          "color": "#0aff3f"
         },
         {
           "element": "Ni",
@@ -233,7 +233,7 @@
           "z": 0.0,
           "occupancy": 1.0,
           "label": "Ni",
-          "color": "#e3830e"
+          "color": "#d50ee3"
         }
       ]
     },

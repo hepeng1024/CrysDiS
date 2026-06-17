@@ -2698,6 +2698,37 @@ class PanelController:
         )
         self.set_scale_bar_from_distance(distance, model)
 
+    async def scene_client_size(self) -> tuple[float, float] | None:
+        """Return the actual browser size of this 3D scene in CSS pixels.
+
+        The real-space scale bar must use the actual rendered aspect ratio,
+        not the original nominal ui.scene(width=440, height=280) aspect ratio.
+        Otherwise the scale bar changes when the responsive layout changes.
+        """
+        selector = f".comparison-panel-{self.state.panel_id} .scene-wrap"
+        try:
+            size = await ui.run_javascript(
+                f"""
+                const element = document.querySelector({json.dumps(selector)});
+                if (!element) return null;
+                const rect = element.getBoundingClientRect();
+                return {{width: rect.width, height: rect.height}};
+                """,
+                timeout=1.0,
+            )
+        except Exception:
+            return None
+        if not isinstance(size, dict):
+            return None
+        try:
+            width = float(size.get("width", 0.0))
+            height = float(size.get("height", 0.0))
+        except (TypeError, ValueError):
+            return None
+        if width <= 1.0 or height <= 1.0:
+            return None
+        return width, height
+
     async def update_scene_scale_bar(self) -> None:
         if self.scene is None or self.current_model is None:
             return
@@ -2719,7 +2750,11 @@ class PanelController:
             )
         )
         if distance > 1e-9:
-            self.set_scale_bar_from_distance(distance, self.current_model)
+            self.set_scale_bar_from_distance(
+                distance,
+                self.current_model,
+                scene_size=await self.scene_client_size(),
+            )
         if self.simulator.auto_sync_view():
             unit = normalize_vector(
                 np.array(
@@ -2739,23 +2774,43 @@ class PanelController:
                     self.redraw_diffraction(self.current_model)
                     self.simulator.refresh_combo_panels()
 
-    def set_scale_bar_from_distance(self, distance: float, model: CrystalModel) -> None:
+    def set_scale_bar_from_distance(
+        self,
+        distance: float,
+        model: CrystalModel,
+        scene_size: tuple[float, float] | None = None,
+    ) -> None:
         if self.scale_bar_line is None or self.scale_bar_label is None:
             return
         self.apply_scale_bar_visibility()
         if not self.simulator.show_scale_bars():
             return
-        visible_nm = max(
-            2.0
-            * max(float(distance), 1e-9)
-            * math.tan(math.radians(REAL_SCENE_FOV_DEGREES / 2.0))
-            * REAL_SCENE_ASPECT
-            * model.scale_nm,
+
+        viewport_height_world = max(
+            2.0 * max(float(distance), 1e-9) * math.tan(math.radians(REAL_SCENE_FOV_DEGREES / 2.0)),
             1e-9,
         )
+        width_px: float | None = None
+        height_px: float | None = None
+        if scene_size is not None:
+            width_px, height_px = scene_size
+            actual_aspect = max(width_px / max(height_px, 1e-9), 1e-9)
+        else:
+            # Fallback for the first draw before the browser reports the actual size.
+            actual_aspect = REAL_SCENE_ASPECT
+
+        visible_nm = max(viewport_height_world * actual_aspect * model.scale_nm, 1e-9)
         bar_nm = choose_scale_bar(visible_nm)
-        fraction = min(max(bar_nm / visible_nm, 0.08), 0.46)
-        self.scale_bar_line.style(replace=f"width: {fraction * 100:.1f}%")
+
+        if height_px is not None:
+            # Convert nm -> world units -> pixels using the vertical FOV. This makes
+            # the overlay independent of screen size and responsive layout aspect ratio.
+            pixels_per_nm = height_px / max(viewport_height_world * model.scale_nm, 1e-9)
+            bar_px = max(bar_nm * pixels_per_nm, 1.0)
+            self.scale_bar_line.style(replace=f"width: {bar_px:.1f}px")
+        else:
+            fraction = bar_nm / visible_nm
+            self.scale_bar_line.style(replace=f"width: {fraction * 100:.2f}%")
         self.scale_bar_label.set_text(f"{bar_nm:g} nm")
 
     def apply_scale_bar_visibility(self) -> None:
@@ -4110,25 +4165,27 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             }
             .real-scale-bar {
                 position: absolute;
-                left: 16px;
+                left: 0;
                 bottom: 14px;
-                width: 38%;
-                min-width: 104px;
+                width: 100%;
+                min-width: 0;
                 pointer-events: none;
                 color: #f7fafc;
                 text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85);
             }
             .real-scale-line {
                 height: 3px;
-                width: 34%;
-                min-width: 26px;
-                max-width: 100%;
+                width: 80px;
+                min-width: 0;
+                max-width: none;
+                margin-left: 16px;
                 background: #f7fafc;
                 border-left: 2px solid #f7fafc;
                 border-right: 2px solid #f7fafc;
                 box-shadow: 0 1px 4px rgba(0, 0, 0, 0.7);
             }
             .real-scale-label {
+                margin-left: 16px;
                 margin-top: 3px;
                 color: #f7fafc;
                 font-size: 12px;

@@ -19,3 +19,4 @@ data/*
 outputs/*
 !data/.gitkeep
 !outputs/.gitkeep
+old_stuff/
