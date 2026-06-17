@@ -901,6 +901,51 @@ def pymatgen_structure_from_model(model: CrystalModel) -> Any:
     return Structure(Lattice(model.lattice * 10.0), species, coords, coords_are_cartesian=False, to_unit_cell=True)
 
 
+
+def occupancy_aware_tem_calculator_class(base_calculator_class: type[Any]) -> type[Any]:
+    """Return a TEMCalculator subclass that respects partial site occupancies.
+
+    Pymatgen's TEMCalculator already provides the reciprocal-space geometry,
+    electron wavelength, electron scattering factors, and spot projection.  This
+    subclass keeps that workflow but corrects the structure-factor sum for
+    disordered/mixed-occupancy sites:
+
+        F_hkl = sum_sites sum_species occ * f_species * exp(2*pi*i*g.r)
+
+    The average-site Bragg intensity is still calculated kinematically as
+    |F_hkl|^2 by the parent class.  Occupational diffuse scattering and
+    dynamical TEM effects are intentionally outside this Level-1 correction.
+    """
+
+    class OccupancyAwareTEMCalculator(base_calculator_class):  # type: ignore[misc, valid-type]
+        def cell_scattering_factors(self, structure: Any, bragg_angles: dict[Any, Any]) -> dict[Any, complex]:
+            electron_scattering_factors = self.electron_scattering_factors(structure, bragg_angles)
+            cell_scattering_factors: dict[Any, complex] = {}
+
+            for plane in bragg_angles:
+                hkl = np.asarray(plane, dtype=float)
+                structure_factor_sum = 0.0 + 0.0j
+
+                for site in structure:
+                    phase = np.exp(2j * np.pi * float(np.dot(hkl, site.frac_coords)))
+                    for specie, occupancy in site.species.items():
+                        symbol = getattr(specie, "symbol", str(specie)).strip().capitalize()
+                        scattering_by_plane = electron_scattering_factors.get(symbol)
+                        if scattering_by_plane is None:
+                            continue
+                        try:
+                            scattering_factor = scattering_by_plane[plane]
+                        except KeyError:
+                            continue
+                        structure_factor_sum += float(occupancy) * scattering_factor * phase
+
+                cell_scattering_factors[plane] = structure_factor_sum
+
+            return cell_scattering_factors
+
+    OccupancyAwareTEMCalculator.__name__ = "OccupancyAwareTEMCalculator"
+    return OccupancyAwareTEMCalculator
+
 def reciprocal_delta_for_display(values: tuple[int, ...], model: CrystalModel) -> np.ndarray:
     reciprocal_direction = normalize_vector(reciprocal_index_to_cart(values, model))
     if reciprocal_direction is None:
@@ -1303,6 +1348,28 @@ def electron_wavelength_nm(voltage_kv: float) -> float:
     return wavelength_angstrom * 0.1
 
 
+def detector_scale_mm_per_nm_inv(camera_length_mm: float, voltage_kv: float) -> float:
+    """Return detector-plane distance in mm for 1 nm^-1 reciprocal spacing.
+
+    For small-angle electron diffraction, R ~= L * lambda * g, where
+    L is camera length in mm, lambda is electron wavelength in nm, and
+    g is reciprocal spacing in nm^-1.
+    """
+    return max(float(camera_length_mm), 1e-9) * electron_wavelength_nm(voltage_kv)
+
+
+def default_detector_half_width_mm() -> float:
+    """Detector half-width used for the diffraction plot in camera mode.
+
+    It is chosen so the default 500 kV / 200 mm view shows the same
+    reciprocal-space window that the previous implementation used.
+    """
+    return DIFFRACTION_BASE_LIMIT_NM_INV * detector_scale_mm_per_nm_inv(
+        DEFAULT_CAMERA_LENGTH_MM,
+        DEFAULT_VOLTAGE_KV,
+    )
+
+
 def choose_scale_bar(limit: float) -> float:
     target = max(limit * 0.32, 1e-9)
     exponent = math.floor(math.log10(target))
@@ -1316,19 +1383,32 @@ def choose_scale_bar(limit: float) -> float:
     return nice * 10**exponent
 
 
-def diffraction_scale_bar_items(limit: float) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    bar = choose_scale_bar(limit)
+def diffraction_scale_bar_items(
+    limit: float,
+    reciprocal_units_per_plot_unit: float = 1.0,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build a scale bar for the diffraction panel.
+
+    In detector/camera display mode, the plot coordinates are detector-plane
+    distances in mm, but the label is still reported as reciprocal-space length
+    in nm^-1.  reciprocal_units_per_plot_unit converts one plotted unit into
+    nm^-1; for detector coordinates it is 1 / (L * lambda).
+    """
+    reciprocal_units_per_plot_unit = max(float(reciprocal_units_per_plot_unit), 1e-12)
+    reciprocal_limit = max(float(limit) * reciprocal_units_per_plot_unit, 1e-9)
+    bar_reciprocal = choose_scale_bar(reciprocal_limit)
+    bar_plot = bar_reciprocal / reciprocal_units_per_plot_unit
     x0 = -0.94 * limit
     y0 = -0.91 * limit
     tick = 0.022 * limit
     line = {"type": "line", "xref": "x", "yref": "y", "line": {"color": "#F7FAFC", "width": 3}}
     shapes = [
-        {**line, "x0": x0, "x1": x0 + bar, "y0": y0, "y1": y0},
+        {**line, "x0": x0, "x1": x0 + bar_plot, "y0": y0, "y1": y0},
         {**line, "x0": x0, "x1": x0, "y0": y0 - tick, "y1": y0 + tick, "line": {"color": "#F7FAFC", "width": 2}},
         {
             **line,
-            "x0": x0 + bar,
-            "x1": x0 + bar,
+            "x0": x0 + bar_plot,
+            "x1": x0 + bar_plot,
             "y0": y0 - tick,
             "y1": y0 + tick,
             "line": {"color": "#F7FAFC", "width": 2},
@@ -1336,11 +1416,11 @@ def diffraction_scale_bar_items(limit: float) -> tuple[list[dict[str, Any]], lis
     ]
     annotations = [
         {
-            "x": x0 + bar * 0.5,
+            "x": x0 + bar_plot * 0.5,
             "y": y0 + 0.055 * limit,
             "xref": "x",
             "yref": "y",
-            "text": f"{bar:g} nm<sup>-1</sup>",
+            "text": f"{bar_reciprocal:g} nm<sup>-1</sup>",
             "showarrow": False,
             "font": {"color": "#F7FAFC", "size": 11},
             "xanchor": "center",
@@ -2936,7 +3016,11 @@ class PanelController:
         spot_color: str,
         zone_label: str = "",
     ) -> dict[str, Any]:
-        shapes, annotations = diffraction_scale_bar_items(limit) if self.simulator.show_scale_bars() else ([], [])
+        shapes, annotations = (
+            diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit())
+            if self.simulator.show_scale_bars()
+            else ([], [])
+        )
         if zone_label:
             annotations.append(diffraction_zone_axis_annotation(limit, zone_label))
         data: list[dict[str, Any]] = []
@@ -3297,7 +3381,11 @@ class ComboPanelController:
         self.diffraction.update_figure(self.build_combo_figure(sources, limit, zone_label))
 
     def build_combo_figure(self, sources: list[PanelState], limit: float, zone_label: str = "") -> dict[str, Any]:
-        shapes, annotations = diffraction_scale_bar_items(limit) if self.simulator.show_scale_bars() else ([], [])
+        shapes, annotations = (
+            diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit())
+            if self.simulator.show_scale_bars()
+            else ([], [])
+        )
         if zone_label:
             annotations.append(diffraction_zone_axis_annotation(limit, zone_label))
         data: list[dict[str, Any]] = []
@@ -4717,11 +4805,19 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             return DEFAULT_CAMERA_LENGTH_MM
         return max(float(match.group(1)), 1.0)
 
+    def current_detector_scale_mm_per_nm_inv(self) -> float:
+        return detector_scale_mm_per_nm_inv(self.current_camera_length_mm(), self.current_voltage_kv())
+
+    def current_reciprocal_units_per_plot_unit(self) -> float:
+        # Plot coordinates are detector-plane millimeters in camera mode.
+        # This converts plotted mm back to reciprocal-space nm^-1 for the scale bar.
+        return 1.0 / max(self.current_detector_scale_mm_per_nm_inv(), 1e-12)
+
     def current_diffraction_limit(self) -> float:
-        return max(
-            0.8,
-            min(100.0, DIFFRACTION_BASE_LIMIT_NM_INV * DEFAULT_CAMERA_LENGTH_MM / self.current_camera_length_mm()),
-        )
+        # Camera-mode plot coordinates use detector-plane millimeters.
+        # Keep a fixed detector half-width so changing voltage/camera length
+        # physically shrinks or expands the diffraction pattern.
+        return max(0.05, default_detector_half_width_mm())
 
     def model_for(self, name: str) -> CrystalModel:
         definition = self.library.get(name)
@@ -4892,7 +4988,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
 
             structure = pymatgen_structure_from_model(model)
             zone_axis = integer_zone_axis_from_view(model, view_vector)
-            calculator = TEMCalculator(
+            calculator_class = occupancy_aware_tem_calculator_class(TEMCalculator)
+            calculator = calculator_class(
                 symprec=None,
                 voltage=self.current_voltage_kv(),
                 beam_direction=zone_axis,
@@ -4914,6 +5011,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
         if normal is None:
             normal = np.array([1.0, 0.0, 0.0])
         u_axis, v_axis = projection_basis(normal, roll)
+        detector_scale = self.current_detector_scale_mm_per_nm_inv()
         compression = self.current_intensity_compression_factor()
         for dot in dots:
             h, k, l = (int(value) for value in dot.hkl)
@@ -4924,8 +5022,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             if display_intensity <= threshold:
                 continue
             g_vector = np.array([h, k, l], dtype=float) @ model.reciprocal
-            x_coord = float(np.dot(g_vector, u_axis))
-            y_coord = float(np.dot(g_vector, v_axis))
+            x_coord = detector_scale * float(np.dot(g_vector, u_axis))
+            y_coord = detector_scale * float(np.dot(g_vector, v_axis))
             rows.append(
                 [
                     x_coord,
@@ -4949,6 +5047,9 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
         x_screen = reciprocal_points @ u_axis
         y_screen = reciprocal_points @ v_axis
         depth = reciprocal_points @ normal
+        detector_scale = self.current_detector_scale_mm_per_nm_inv()
+        x_plot = detector_scale * x_screen
+        y_plot = detector_scale * y_screen
 
         wavelength_nm = electron_wavelength_nm(self.current_voltage_kv())
         ewald_radius = 1.0 / wavelength_nm
@@ -4960,8 +5061,9 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
 
         thickness = self.current_thickness_nm()
         thickness_shape = np.sinc(excitation_error * thickness) ** 2
-        high_angle_envelope = np.exp(-0.0008 * g_perp2)
-        raw_intensity = structure_intensity * thickness_shape * high_angle_envelope
+        # high_angle_envelope = np.exp(-0.0008 * g_perp2)
+        # raw_intensity = structure_intensity * thickness_shape * high_angle_envelope
+        raw_intensity = structure_intensity * thickness_shape
         zero_beam = np.all(hkl == 0, axis=1)
         raw_intensity[zero_beam] = max(float(raw_intensity.max(initial=1.0)), 1.0)
         if raw_intensity.max(initial=0.0) > 0:
@@ -4971,8 +5073,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
         visible = (display_intensity > self.current_spot_intensity_threshold()) & valid_curvature
         return np.column_stack(
             (
-                x_screen[visible],
-                y_screen[visible],
+                x_plot[visible],
+                y_plot[visible],
                 display_intensity[visible],
                 hkl[visible, 0],
                 hkl[visible, 1],
