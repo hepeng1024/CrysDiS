@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import io
+import importlib.util
 import json
 import math
 import os
 import re
+import socket
+import sys
 import tempfile
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -14,12 +17,41 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from nicegui import ui
+from nicegui import native, ui
 
 
-APP_DIR = Path(__file__).resolve().parent
-LOCAL_LIBRARY_PATH = APP_DIR / "custom_crystals_local.json"
-GLOBAL_LIBRARY_PATH = Path.home() / ".crystal_diffraction_simulator" / "custom_crystals.json"
+try:
+    from platformdirs import user_data_dir
+except Exception:
+    user_data_dir = None
+
+
+def resource_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent
+
+
+def app_data_dir() -> Path:
+    if user_data_dir is not None:
+        return Path(user_data_dir("CrysDiS", appauthor=False))
+    return Path.home() / ".crysdis"
+
+
+def find_open_port(host: str = "127.0.0.1") -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+APP_DIR = resource_dir()
+BUNDLED_LIBRARY_PATH = APP_DIR / "custom_crystals_local.json"
+USER_DATA_DIR = app_data_dir()
+USER_LIBRARY_PATH = USER_DATA_DIR / "custom_crystals.json"
+LEGACY_LIBRARY_PATH = Path.home() / ".crystal_diffraction_simulator" / "custom_crystals.json"
+LOCAL_LIBRARY_PATH = BUNDLED_LIBRARY_PATH
+GLOBAL_LIBRARY_PATH = USER_LIBRARY_PATH
+USER_LIBRARY_SCOPE = "User app-data library"
 
 CUSTOM_SENTINEL = "Create / edit customized crystal..."
 SIMULATION_METHOD_EWALD = "Ewald Sphere Kinematic"
@@ -348,6 +380,7 @@ class ComboPanelState:
     combo_id: int
     source_panel_ids: list[int] = field(default_factory=list)
     selected_panel_id: int | None = None
+    bind_motion: bool = False
 
 
 def atomic_site_from_dict(data: dict[str, Any]) -> AtomicSite:
@@ -1162,6 +1195,42 @@ def rotate_orientation(
     return new_normal, normalize_roll(new_roll)
 
 
+def orientation_frame(view_vector: np.ndarray, roll: float) -> np.ndarray:
+    normal = normalize_vector(view_vector)
+    if normal is None:
+        normal = np.array([1.0, 0.0, 0.0])
+    u_axis, v_axis = projection_basis(normal, roll)
+    return np.column_stack([u_axis, v_axis, normal])
+
+
+def orientation_from_frame(frame: np.ndarray, fallback_roll: float = 0.0) -> tuple[np.ndarray, float]:
+    normal = normalize_vector(frame[:, 2])
+    if normal is None:
+        normal = np.array([1.0, 0.0, 0.0])
+    u_axis = normalize_vector(frame[:, 0] - float(np.dot(frame[:, 0], normal)) * normal)
+    if u_axis is None:
+        return normal, normalize_roll(fallback_roll)
+    base_u, base_v = projection_basis(normal, 0.0)
+    roll = math.degrees(math.atan2(float(np.dot(u_axis, base_v)), float(np.dot(u_axis, base_u))))
+    return normal, normalize_roll(roll)
+
+
+def local_orientation_delta(
+    old_view: np.ndarray,
+    old_roll: float,
+    new_view: np.ndarray,
+    new_roll: float,
+) -> np.ndarray:
+    old_frame = orientation_frame(old_view, old_roll)
+    new_frame = orientation_frame(new_view, new_roll)
+    return old_frame.T @ new_frame
+
+
+def apply_local_orientation_delta(view_vector: np.ndarray, roll: float, delta: np.ndarray) -> tuple[np.ndarray, float]:
+    frame = orientation_frame(view_vector, roll)
+    return orientation_from_frame(frame @ delta, fallback_roll=roll)
+
+
 def parse_rotation_command(text: str, model: CrystalModel) -> tuple[RotationCommand | None, list[str]]:
     text = normalize_text(str(text or ""))
     if not text:
@@ -1758,7 +1827,7 @@ class CrystalLibrary:
 
     def reload(self) -> None:
         self.definitions = {name: CrystalDefinition.from_dict(definition.to_dict()) for name, definition in DEFAULT_CRYSTALS.items()}
-        for path in (GLOBAL_LIBRARY_PATH, LOCAL_LIBRARY_PATH):
+        for path in (BUNDLED_LIBRARY_PATH, LEGACY_LIBRARY_PATH, USER_LIBRARY_PATH):
             self.definitions.update(self._load_path(path))
         self._refresh_legacy_cif_imports()
 
@@ -1773,7 +1842,7 @@ class CrystalLibrary:
         return (name or "").strip() in self.definitions
 
     def path_for_scope(self, scope: str) -> Path:
-        return GLOBAL_LIBRARY_PATH if scope == "Global user library" else LOCAL_LIBRARY_PATH
+        return USER_LIBRARY_PATH
 
     def save(self, definition: CrystalDefinition, scope: str) -> CrystalDefinition:
         definition = CrystalDefinition.from_dict(definition.to_dict())
@@ -1813,7 +1882,7 @@ class CrystalLibrary:
         target_path = self.path_for_scope(scope)
         target_saved = self._load_path(target_path)
         if original_name and original_name not in DEFAULT_NAMES and definition.name != original_name:
-            for path in (GLOBAL_LIBRARY_PATH, LOCAL_LIBRARY_PATH):
+            for path in (USER_LIBRARY_PATH, LEGACY_LIBRARY_PATH):
                 saved = target_saved if path == target_path else self._load_path(path)
                 if original_name not in saved:
                     continue
@@ -1835,7 +1904,7 @@ class CrystalLibrary:
         if name in DEFAULT_NAMES:
             return False
         removed = False
-        for path in (GLOBAL_LIBRARY_PATH, LOCAL_LIBRARY_PATH):
+        for path in (USER_LIBRARY_PATH, LEGACY_LIBRARY_PATH):
             saved = self._load_path(path)
             if name not in saved:
                 continue
@@ -1928,9 +1997,9 @@ class CrystalBuilder:
                     new_value_mode="add-unique",
                 ).props("outlined dense")
                 self.scope_select = ui.select(
-                    ["Project local library", "Global user library"],
+                    [USER_LIBRARY_SCOPE],
                     label="Save target",
-                    value="Project local library",
+                    value=USER_LIBRARY_SCOPE,
                 ).props("outlined dense")
                 self.a_input = ui.number("a", value=0.35, min=0.0001, step=0.001, suffix="nm").props("outlined dense")
                 self.b_input = ui.number("b", value=0.35, min=0.0001, step=0.001, suffix="nm").props("outlined dense")
@@ -2643,26 +2712,22 @@ class PanelController:
     async def sync_from_scene(self) -> None:
         if self.scene is None:
             return
-        camera = await self.scene.get_camera()
-        position = camera.get("position", {})
-        vector = np.array(
-            [
-                float(position.get("x", 1.0)),
-                float(position.get("y", 0.0)),
-                float(position.get("z", 0.0)),
-            ],
-            dtype=float,
-        )
-        unit = normalize_vector(vector)
+        old_view = self.state.view_vector.copy()
+        old_roll = float(self.state.roll)
+        unit, roll = await self.live_scene_orientation()
         if unit is None:
             ui.notify("Could not read the 3D camera direction", type="warning")
             return
         self.state.view_vector = unit
+        if roll is not None:
+            self.state.roll = roll
         self.redraw_diffraction()
-        self.simulator.refresh_combo_panels()
+        self.simulator.propagate_bound_motion(self.state.panel_id, old_view, old_roll, self.state.view_vector, self.state.roll)
         self.simulator.set_status(f"Panel {self.state.panel_id}: diffraction synced to current 3D view")
 
     def apply(self, initial: bool = False, rotation_text_override: str | None = None) -> None:
+        old_view = self.state.view_vector.copy()
+        old_roll = float(self.state.roll)
         if self.crystal_select is not None and self.crystal_select.value != CUSTOM_SENTINEL:
             self.state.crystal_name = self.crystal_select.value or self.state.crystal_name
         self.state.zone_text = self.zone_input.value if self.zone_input is not None else self.state.zone_text
@@ -2723,7 +2788,16 @@ class PanelController:
             snap_message = f"Panel {self.state.panel_id}: snapped back to {zone[0].label}"
         self.redraw_scene(model)
         self.redraw_diffraction(model)
-        self.simulator.refresh_combo_panels()
+        if initial:
+            self.simulator.refresh_combo_panels()
+        else:
+            self.simulator.propagate_bound_motion(
+                self.state.panel_id,
+                old_view,
+                old_roll,
+                self.state.view_vector,
+                self.state.roll,
+            )
         if not initial:
             self.simulator.set_status(
                 "; ".join(errors[:3]) if errors else (rotation_message or snap_message or f"Panel {self.state.panel_id} updated")
@@ -2846,13 +2920,37 @@ class PanelController:
                     dtype=float,
                 )
             )
+            up = camera.get("up", {})
+            up_vector = normalize_vector(
+                np.array(
+                    [
+                        float(up.get("x", 0.0)),
+                        float(up.get("y", 0.0)),
+                        float(up.get("z", 1.0)),
+                    ],
+                    dtype=float,
+                )
+            )
             previous = normalize_vector(self.state.view_vector)
             if unit is not None and previous is not None:
                 angle_change = math.degrees(math.acos(min(max(float(np.dot(unit, previous)), -1.0), 1.0)))
                 if angle_change > 1.0:
+                    old_view = self.state.view_vector.copy()
+                    old_roll = float(self.state.roll)
                     self.state.view_vector = unit
+                    self.state.roll = roll_from_view_and_up(
+                        unit,
+                        up_vector if up_vector is not None else np.array([0.0, 0.0, 1.0]),
+                        self.state.roll,
+                    )
                     self.redraw_diffraction(self.current_model)
-                    self.simulator.refresh_combo_panels()
+                    self.simulator.propagate_bound_motion(
+                        self.state.panel_id,
+                        old_view,
+                        old_roll,
+                        self.state.view_vector,
+                        self.state.roll,
+                    )
 
     def set_scale_bar_from_distance(
         self,
@@ -3140,6 +3238,7 @@ class ComboPanelController:
         self.source_list_container = None
         self.diffraction = None
         self.download_dialog = None
+        self.bind_checkbox = None
 
     def build(self) -> None:
         self.simulator.repair_combo_sources(self.state)
@@ -3160,6 +3259,11 @@ class ComboPanelController:
                 ui.button("Remove", on_click=self.remove_selected_source).props("outline dense").classes(
                     "combo-action-button combo-remove-button"
                 )
+                self.bind_checkbox = ui.checkbox(
+                    "Bind crystal motion",
+                    value=self.state.bind_motion,
+                    on_change=self.on_bind_motion_changed,
+                ).props("dense").classes("combo-bind-checkbox")
                 ui.button(icon="photo_camera", on_click=self.open_download_dialog).props("flat round dense").classes(
                     "combo-download-button"
                 ).tooltip("Download combo diffraction")
@@ -3272,6 +3376,11 @@ class ComboPanelController:
         except (TypeError, ValueError):
             self.state.selected_panel_id = None
 
+    def on_bind_motion_changed(self) -> None:
+        self.state.bind_motion = bool(self.bind_checkbox.value) if self.bind_checkbox is not None else False
+        state_text = "enabled" if self.state.bind_motion else "disabled"
+        self.simulator.set_status(f"Combo C{self.state.combo_id}: bind all crystal motion {state_text}")
+
     def add_selected_source(self) -> None:
         self.on_source_selected()
         panel_id = self.state.selected_panel_id
@@ -3322,6 +3431,9 @@ class ComboPanelController:
                 self.state.selected_panel_id = next(iter(options), None)
             self.source_select.value = self.state.selected_panel_id
             self.source_select.update()
+        if self.bind_checkbox is not None:
+            self.bind_checkbox.value = self.state.bind_motion
+            self.bind_checkbox.update()
         self.refresh_source_list()
         self.redraw_diffraction()
 
@@ -3603,6 +3715,7 @@ Compare a real-space crystal view with its electron diffraction pattern. Each or
 
 ### Combo panels
 Use `Add combo panel` to overlay diffraction patterns from multiple ordinary panels. This is useful for multiphase comparisons.
+Enable `Bind crystal motion` inside a combo panel after manually setting an orientation relationship; later Apply, Sync, or auto-sync motion from any listed panel is applied as the same view-frame motion to the other listed panels.
 
 ### Display controls
 - `Show scale bar` toggles scale bars in both crystal and diffraction panels.
@@ -3904,7 +4017,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             await event.file.save(temp_path)
             definition = definition_from_cif(temp_path)
             definition.name = Path(upload_name).stem or definition.name
-            saved = self.library.save(definition, "Project local library")
+            saved = self.library.save(definition, USER_LIBRARY_SCOPE)
         except ValueError as exc:
             message = str(exc)
             self.set_status(f"CIF import failed: {message}")
@@ -4080,8 +4193,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             .combo-toolbar {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 34px minmax(148px, 1fr) auto auto 30px 26px;
-                grid-template-areas: "combo-number combo-select combo-add combo-remove combo-download combo-close";
+                grid-template-columns: 34px minmax(132px, 1fr) auto auto minmax(112px, auto) 30px 26px;
+                grid-template-areas: "combo-number combo-select combo-add combo-remove combo-bind combo-download combo-close";
                 gap: 4px;
                 align-items: center;
                 margin-bottom: 6px;
@@ -4106,6 +4219,19 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
             }
             .combo-remove-button {
                 grid-area: combo-remove;
+            }
+            .combo-bind-checkbox {
+                grid-area: combo-bind;
+                min-height: 34px;
+                align-items: center;
+                color: #dce9fb;
+            }
+            .combo-bind-checkbox .q-checkbox__label {
+                font-size: 11px;
+                white-space: nowrap;
+            }
+            .combo-bind-checkbox .q-checkbox__inner {
+                font-size: 24px;
             }
             .combo-download-button {
                 grid-area: combo-download;
@@ -4514,7 +4640,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     justify-self: start;
                 }
                 .combo-toolbar {
-                    grid-template-columns: 42px minmax(180px, 1fr) auto auto 30px 28px;
+                    grid-template-columns: 42px minmax(150px, 1fr) auto auto minmax(112px, auto) 30px 28px;
                 }
             }
             @container comparison-panel (max-width: 500px) {
@@ -4543,7 +4669,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     grid-template-columns: 34px minmax(0, 1fr) 30px 28px;
                     grid-template-areas:
                         "combo-number combo-select combo-download combo-close"
-                        "combo-number combo-add combo-remove .";
+                        "combo-number combo-add combo-remove ."
+                        "combo-number combo-bind combo-bind .";
                 }
                 .combo-action-button {
                     width: 100%;
@@ -4627,7 +4754,7 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     justify-self: start;
                 }
                 .combo-toolbar {
-                    grid-template-columns: 42px minmax(180px, 1fr) auto auto 30px 28px;
+                    grid-template-columns: 42px minmax(150px, 1fr) auto auto minmax(112px, auto) 30px 28px;
                 }
                 .combo-toolbar .q-space {
                     display: none;
@@ -4688,7 +4815,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
                     grid-template-columns: 34px minmax(0, 1fr) 30px 28px;
                     grid-template-areas:
                         "combo-number combo-select combo-download combo-close"
-                        "combo-number combo-add combo-remove .";
+                        "combo-number combo-add combo-remove ."
+                        "combo-number combo-bind combo-bind .";
                 }
                 .combo-action-button {
                     width: 100%;
@@ -4982,6 +5110,47 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
         for controller in self.combo_controllers:
             controller.refresh()
 
+    def controller_by_panel_id(self, panel_id: int) -> PanelController | None:
+        return next((controller for controller in self.controllers if controller.state.panel_id == panel_id), None)
+
+    def propagate_bound_motion(
+        self,
+        source_panel_id: int,
+        old_view: np.ndarray,
+        old_roll: float,
+        new_view: np.ndarray,
+        new_roll: float,
+    ) -> None:
+        bound_ids: set[int] = set()
+        for combo_state in self.combo_panel_states:
+            if combo_state.bind_motion and source_panel_id in combo_state.source_panel_ids:
+                bound_ids.update(combo_state.source_panel_ids)
+        bound_ids.discard(source_panel_id)
+        if not bound_ids:
+            self.refresh_combo_panels()
+            return
+
+        # Propagate the motion in the driver's view frame, not in the driver's
+        # crystal coordinates. This preserves orientation relationships such as
+        # panel 1 [100] parallel to panel 2 [110]: an in-plane spin in panel 1
+        # becomes an in-plane spin around panel 2's current beam direction.
+        delta = local_orientation_delta(old_view, old_roll, new_view, new_roll)
+        if np.allclose(delta, np.eye(3), atol=1e-6):
+            self.refresh_combo_panels()
+            return
+
+        for panel_id in sorted(bound_ids):
+            state = self.panel_state_by_id(panel_id)
+            if state is None:
+                continue
+            state.view_vector, state.roll = apply_local_orientation_delta(state.view_vector, state.roll, delta)
+            controller = self.controller_by_panel_id(panel_id)
+            if controller is not None:
+                model = self.model_for(state.crystal_name)
+                controller.redraw_scene(model)
+                controller.redraw_diffraction(model)
+        self.refresh_combo_panels()
+
     def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
         try:
             from pymatgen.analysis.diffraction.tem import TEMCalculator
@@ -5113,7 +5282,32 @@ def index() -> None:
 
 
 def main() -> None:
-    port = int(os.environ.get("PORT", os.environ.get("NICEGUI_PORT", "8080")))
+    is_hosted = os.environ.get("RENDER") == "true" or os.environ.get("PORT") is not None
+    is_desktop = bool(getattr(sys, "frozen", False)) or os.environ.get("CRYSDIS_DESKTOP") == "1"
+    if is_hosted:
+        ui.run(
+            title="CrysDiS",
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", "8080")),
+            reload=False,
+            show=False,
+        )
+        return
+
+    if is_desktop:
+        use_native_window = os.environ.get("CRYSDIS_NATIVE", "auto").lower() not in {"0", "false", "no"}
+        native_available = importlib.util.find_spec("webview") is not None
+        ui.run(
+            title="CrysDiS",
+            host="127.0.0.1",
+            port=find_open_port(),
+            reload=False,
+            show=not (use_native_window and native_available),
+            native=use_native_window and native_available,
+        )
+        return
+
+    port = int(os.environ.get("NICEGUI_PORT", "8080"))
     host = os.environ.get("HOST", "0.0.0.0")
     ui.run(title="CrysDiS", host=host, port=port, reload=False, show=False)
 
