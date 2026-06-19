@@ -31,7 +31,6 @@ python -m PyInstaller \
   --icon "assets/CrysDiS.icns" \
   --osx-bundle-identifier "edu.umich.hepeng.CrysDiS" \
   --add-data "assets:assets" \
-  --add-data "data:data" \
   --add-data "custom_crystals_local.json:." \
   CrysDiS.py
 
