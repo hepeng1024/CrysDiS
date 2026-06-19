@@ -5282,18 +5282,8 @@ def index() -> None:
 
 
 def main() -> None:
-    is_hosted = os.environ.get("RENDER") == "true" or os.environ.get("PORT") is not None
-    is_desktop = bool(getattr(sys, "frozen", False)) or os.environ.get("CRYSDIS_DESKTOP") == "1"
-    if is_hosted:
-        ui.run(
-            title="CrysDiS",
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT", "8080")),
-            reload=False,
-            show=False,
-        )
-        return
-
+    is_frozen = bool(getattr(sys, "frozen", False))
+    is_desktop = is_frozen or os.environ.get("CRYSDIS_DESKTOP") == "1"
     if is_desktop:
         use_native_window = os.environ.get("CRYSDIS_NATIVE", "auto").lower() not in {"0", "false", "no"}
         native_available = importlib.util.find_spec("webview") is not None
@@ -5304,6 +5294,19 @@ def main() -> None:
             reload=False,
             show=not (use_native_window and native_available),
             native=use_native_window and native_available,
+        )
+        return
+
+    port_env = os.environ.get("PORT")
+    is_render = os.environ.get("RENDER") == "true"
+    is_hosted = is_render or (port_env is not None and os.name != "nt")
+    if is_hosted:
+        ui.run(
+            title="CrysDiS",
+            host="0.0.0.0",
+            port=int(port_env or "8080"),
+            reload=False,
+            show=False,
         )
         return
 

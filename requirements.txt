@@ -4,3 +4,4 @@ plotly>=6.0
 matplotlib>=3.8
 pymatgen>=2024.0
 periodictable>=2.0
+platformdirs

@@ -11,6 +11,17 @@ dependencies = [
     "matplotlib>=3.8",
     "pymatgen>=2024.0",
     "periodictable>=2.0",
+    "platformdirs",
+]
+
+[project.optional-dependencies]
+desktop = [
+    "pywebview",
+]
+
+package = [
+    "pyinstaller",
+    "pywebview",
 ]
 
 [project.scripts]

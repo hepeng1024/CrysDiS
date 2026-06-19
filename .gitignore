@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.tmp/
 venv/
 env/
 tem_env/
@@ -8,12 +9,16 @@ tem_env/
 .mypy_cache/
 dist/
 build/
+*.spec
 *.egg-info/
 .env
 *.png
 *.jpg
 *.jpeg
 *.gif
+!assets/
+!assets/*.ico
+!assets/*.png
 *:Zone.Identifier
 data/*
 outputs/*
