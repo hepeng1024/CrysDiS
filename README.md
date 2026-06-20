@@ -160,6 +160,8 @@ http://127.0.0.1:8080
 - CIF files are uploaded through the browser and parsed by the running CrysDiS app.
 - Bundled structures are read from `custom_crystals_local.json`.
 - User edits and CIF imports are saved to the operating system's CrysDiS app-data folder.
+- Desktop package image exports are saved to the selected export folder, or to `Downloads/CrysDiS` by default when that folder is available.
+- Hosted web exports use the browser's normal download behavior instead of saving files on the server.
 - On a shared hosted deployment, saved custom structures may be visible to other users of that same deployment account.
 - For sensitive unpublished data, prefer the local desktop package, a private lab server, a university VM, a VPN-protected service, or a private cloud app with authentication.
 

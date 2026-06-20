@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import importlib.util
 import json
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from nicegui import native, ui
+from nicegui import app, native, ui
 
 
 try:
@@ -36,6 +37,37 @@ def app_data_dir() -> Path:
     if user_data_dir is not None:
         return Path(user_data_dir("CrysDiS", appauthor=False))
     return Path.home() / ".crysdis"
+
+
+def default_export_dir() -> Path:
+    downloads_dir = Path.home() / "Downloads"
+    if downloads_dir.exists() and downloads_dir.is_dir():
+        return downloads_dir / "CrysDiS"
+    return app_data_dir() / "exports"
+
+
+def is_frozen_app() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def is_desktop_mode() -> bool:
+    return is_frozen_app() or os.environ.get("CRYSDIS_DESKTOP") == "1"
+
+
+def is_hosted_mode() -> bool:
+    port_env = os.environ.get("PORT")
+    return not is_desktop_mode() and (os.environ.get("RENDER") == "true" or (port_env is not None and os.name != "nt"))
+
+
+def direct_file_exports_enabled() -> bool:
+    return is_desktop_mode() and not is_hosted_mode()
+
+
+def decode_png_data_url(data_url: str) -> bytes:
+    prefix = "data:image/png;base64,"
+    if not isinstance(data_url, str) or not data_url.startswith(prefix):
+        raise ValueError("Plotly did not return a PNG data URL")
+    return base64.b64decode(data_url[len(prefix) :], validate=True)
 
 
 def find_open_port(host: str = "127.0.0.1") -> int:
@@ -2560,6 +2592,13 @@ class PanelController:
             diffraction_checkbox = ui.checkbox("Diffraction pattern", value=True).props("dense")
             transparent_checkbox = ui.checkbox("Transparent background", value=False).props("dense")
             dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
+            if self.simulator.direct_file_exports_enabled():
+                export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
+
+                async def choose_folder() -> None:
+                    await self.simulator.choose_export_folder(export_folder_label)
+
+                ui.button("Choose export folder", icon="folder_open", on_click=choose_folder).props("outline dense")
             with ui.row().classes("justify-end full-width"):
                 ui.button("Cancel", on_click=self.download_dialog.close).props("flat dense")
                 ui.button(
@@ -2585,21 +2624,24 @@ class PanelController:
             ui.notify("Choose at least one image to download", type="warning")
             return
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
+        direct_export = self.simulator.direct_file_exports_enabled()
+        saved_paths: list[Path] = []
         crystal_downloaded = False
         if include_crystal:
             try:
                 live_view, live_roll = await self.live_scene_orientation()
                 transparent_suffix = "transparent_" if transparent_background else ""
-                ui.download(
-                    self.render_crystal_png(
-                        dpi,
-                        transparent_background=transparent_background,
-                        view_vector=live_view,
-                        roll=live_roll,
-                    ),
-                    f"panel_{self.state.panel_id}_crystal_{transparent_suffix}{round(dpi)}dpi.png",
-                    media_type="image/png",
+                filename = f"panel_{self.state.panel_id}_crystal_{transparent_suffix}{round(dpi)}dpi.png"
+                image_bytes = self.render_crystal_png(
+                    dpi,
+                    transparent_background=transparent_background,
+                    view_vector=live_view,
+                    roll=live_roll,
                 )
+                if direct_export:
+                    saved_paths.append(self.simulator.save_exported_image(image_bytes, filename))
+                else:
+                    ui.download(image_bytes, filename, media_type="image/png")
                 crystal_downloaded = True
             except Exception as exc:
                 ui.notify(f"Crystal export failed: {exc}", type="negative")
@@ -2608,7 +2650,10 @@ class PanelController:
         if not include_diffraction:
             if self.download_dialog is not None:
                 self.download_dialog.close()
-            self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded image export")
+            if direct_export:
+                self.simulator.announce_saved_exports(saved_paths)
+            else:
+                self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded image export")
             return
 
         selector = f".comparison-panel-{self.state.panel_id}"
@@ -2618,6 +2663,7 @@ class PanelController:
         const dpi = {float(dpi):.6f};
         const scale = Math.max(1, dpi / 150);
         const transparentBackground = {json.dumps(bool(transparent_background))};
+        const directExport = {json.dumps(bool(direct_export))};
 
         function saveDataUrl(dataUrl, filename) {{
             const link = document.createElement('a');
@@ -2657,21 +2703,46 @@ class PanelController:
                 }}
             }}
             const transparentSuffix = transparentBackground ? 'transparent_' : '';
-            saveDataUrl(dataUrl, `${{panelName}}_diffraction_${{transparentSuffix}}${{Math.round(dpi)}}dpi.png`);
-            return true;
+            const filename = `${{panelName}}_diffraction_${{transparentSuffix}}${{Math.round(dpi)}}dpi.png`;
+            if (directExport) {{
+                return {{filename, dataUrl}};
+            }}
+            saveDataUrl(dataUrl, filename);
+            return {{downloaded: true}};
         }}
 
         return await downloadDiffraction();
         """
         try:
-            ok = await ui.run_javascript(script, timeout=20.0)
+            result = await ui.run_javascript(script, timeout=20.0)
         except Exception as exc:
             ui.notify(f"Download failed: {exc}", type="negative")
             return
-        if ok or crystal_downloaded:
+        diffraction_downloaded = False
+        if direct_export:
+            if isinstance(result, dict) and result.get("dataUrl") and result.get("filename"):
+                try:
+                    image_bytes = decode_png_data_url(str(result["dataUrl"]))
+                    saved_paths.append(self.simulator.save_exported_image(image_bytes, str(result["filename"])))
+                except Exception as exc:
+                    ui.notify(f"Diffraction export failed: {exc}", type="negative")
+                    if not saved_paths:
+                        return
+            elif not saved_paths:
+                ui.notify("Could not capture the selected image", type="warning")
+                return
+            else:
+                ui.notify("Could not capture the selected image", type="warning")
+        else:
+            diffraction_downloaded = bool(result and (result is True or (isinstance(result, dict) and result.get("downloaded"))))
+
+        if saved_paths or diffraction_downloaded or crystal_downloaded:
             if self.download_dialog is not None:
                 self.download_dialog.close()
-            self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded image export")
+            if direct_export:
+                self.simulator.announce_saved_exports(saved_paths)
+            else:
+                self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded image export")
         else:
             ui.notify("Could not capture the selected image", type="warning")
 
@@ -3285,6 +3356,13 @@ class ComboPanelController:
                 ui.button(icon="close", on_click=self.download_dialog.close).props("flat round dense").tooltip("Close")
             transparent_checkbox = ui.checkbox("Transparent background", value=False).props("dense")
             dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
+            if self.simulator.direct_file_exports_enabled():
+                export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
+
+                async def choose_folder() -> None:
+                    await self.simulator.choose_export_folder(export_folder_label)
+
+                ui.button("Choose export folder", icon="folder_open", on_click=choose_folder).props("outline dense")
             with ui.row().classes("justify-end full-width"):
                 ui.button("Cancel", on_click=self.download_dialog.close).props("flat dense")
                 ui.button(
@@ -3299,6 +3377,7 @@ class ComboPanelController:
 
     async def download_diffraction_image(self, dpi: float, transparent_background: bool = False) -> None:
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
+        direct_export = self.simulator.direct_file_exports_enabled()
         selector = f".combo-panel-{self.state.combo_id}"
         script = f"""
         const root = document.querySelector({json.dumps(selector)});
@@ -3306,6 +3385,7 @@ class ComboPanelController:
         const dpi = {float(dpi):.6f};
         const scale = Math.max(1, dpi / 150);
         const transparentBackground = {json.dumps(bool(transparent_background))};
+        const directExport = {json.dumps(bool(direct_export))};
 
         function saveDataUrl(dataUrl, filename) {{
             const link = document.createElement('a');
@@ -3345,21 +3425,40 @@ class ComboPanelController:
                 }}
             }}
             const transparentSuffix = transparentBackground ? 'transparent_' : '';
-            saveDataUrl(dataUrl, `${{panelName}}_diffraction_${{transparentSuffix}}${{Math.round(dpi)}}dpi.png`);
-            return true;
+            const filename = `${{panelName}}_diffraction_${{transparentSuffix}}${{Math.round(dpi)}}dpi.png`;
+            if (directExport) {{
+                return {{filename, dataUrl}};
+            }}
+            saveDataUrl(dataUrl, filename);
+            return {{downloaded: true}};
         }}
 
         return await downloadDiffraction();
         """
         try:
-            ok = await ui.run_javascript(script, timeout=20.0)
+            result = await ui.run_javascript(script, timeout=20.0)
         except Exception as exc:
             ui.notify(f"Download failed: {exc}", type="negative")
             return
-        if ok:
+        saved_paths: list[Path] = []
+        if direct_export:
+            if not (isinstance(result, dict) and result.get("dataUrl") and result.get("filename")):
+                ui.notify("Could not capture the combo diffraction pattern", type="warning")
+                return
+            try:
+                image_bytes = decode_png_data_url(str(result["dataUrl"]))
+                saved_paths.append(self.simulator.save_exported_image(image_bytes, str(result["filename"])))
+            except Exception as exc:
+                ui.notify(f"Combo diffraction export failed: {exc}", type="negative")
+                return
+        downloaded = bool(result and (result is True or (isinstance(result, dict) and result.get("downloaded"))))
+        if saved_paths or downloaded:
             if self.download_dialog is not None:
                 self.download_dialog.close()
-            self.simulator.set_status(f"Combo C{self.state.combo_id}: downloaded diffraction export")
+            if direct_export:
+                self.simulator.announce_saved_exports(saved_paths)
+            else:
+                self.simulator.set_status(f"Combo C{self.state.combo_id}: downloaded diffraction export")
         else:
             ui.notify("Could not capture the combo diffraction pattern", type="warning")
 
@@ -3620,6 +3719,7 @@ class SimulatorApp:
         self.show_zone_axis_input = None
         self.vector_colors = VECTOR_COLORS.copy()
         self.plane_colors = PLANE_COLORS.copy()
+        self.selected_export_dir: Path | None = None
         self.builder: CrystalBuilder | None = None
 
     def build(self) -> None:
@@ -4441,6 +4541,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 border-radius: 8px;
                 gap: 8px;
             }
+            .export-folder-label {
+                max-width: 100%;
+                color: #B8C0CC;
+                font-size: 12px;
+                line-height: 1.35;
+                overflow-wrap: anywhere;
+            }
             .intro-card {
                 width: min(860px, calc(100vw - 40px));
                 max-height: min(820px, calc(100vh - 40px));
@@ -4845,6 +4952,66 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if self.log_box is not None:
             self.log_box.value = "\n".join(self.status_history)
             self.log_box.update()
+
+    def direct_file_exports_enabled(self) -> bool:
+        return direct_file_exports_enabled()
+
+    def ensure_export_dir(self) -> Path:
+        folder = self.selected_export_dir or default_export_dir()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            folder = USER_DATA_DIR / "exports"
+            folder.mkdir(parents=True, exist_ok=True)
+        self.selected_export_dir = folder
+        return folder
+
+    def export_dir_text(self) -> str:
+        return str(self.ensure_export_dir())
+
+    async def choose_export_folder(self, label: Any | None = None) -> None:
+        window = app.native.main_window
+        if window is None:
+            ui.notify(f"Export folder: {self.export_dir_text()}", type="info")
+            return
+        try:
+            import webview
+
+            dialog_type = webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG
+            result = await window.create_file_dialog(dialog_type=dialog_type, directory=str(self.ensure_export_dir()))
+        except Exception as exc:
+            ui.notify(f"Could not open folder picker: {exc}", type="negative")
+            return
+        if not result:
+            ui.notify("Export cancelled", type="info")
+            self.set_status("Export cancelled")
+            return
+        folder = Path(result[0] if isinstance(result, (list, tuple)) else result)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            ui.notify(f"Could not use export folder: {exc}", type="negative")
+            return
+        self.selected_export_dir = folder
+        if label is not None:
+            label.text = f"Export folder: {folder}"
+            label.update()
+        self.set_status(f"Export folder: {folder}")
+
+    def save_exported_image(self, image_bytes: bytes, filename: str) -> Path:
+        path = self.ensure_export_dir() / filename
+        path.write_bytes(image_bytes)
+        return path
+
+    def announce_saved_exports(self, paths: list[Path]) -> None:
+        if not paths:
+            return
+        if len(paths) == 1:
+            message = f"Saved image to: {paths[0]}"
+        else:
+            message = f"Saved {len(paths)} images to: {paths[0].parent}"
+        ui.notify(message, type="positive")
+        self.set_status(message)
 
     def show_indices(self) -> bool:
         return bool(getattr(getattr(self, "show_indices_input", None), "value", False))
@@ -5282,9 +5449,7 @@ def index() -> None:
 
 
 def main() -> None:
-    is_frozen = bool(getattr(sys, "frozen", False))
-    is_desktop = is_frozen or os.environ.get("CRYSDIS_DESKTOP") == "1"
-    if is_desktop:
+    if is_desktop_mode():
         use_native_window = os.environ.get("CRYSDIS_NATIVE", "auto").lower() not in {"0", "false", "no"}
         native_available = importlib.util.find_spec("webview") is not None
         ui.run(
@@ -5298,9 +5463,7 @@ def main() -> None:
         return
 
     port_env = os.environ.get("PORT")
-    is_render = os.environ.get("RENDER") == "true"
-    is_hosted = is_render or (port_env is not None and os.name != "nt")
-    if is_hosted:
+    if is_hosted_mode():
         ui.run(
             title="CrysDiS",
             host="0.0.0.0",
