@@ -4,6 +4,12 @@
 
 The easiest way to try CrysDiS is the hosted web app. Desktop packages are useful when users want a double-click local app.
 
+## Introduction Slides
+
+A short visual introduction to CrysDiS is available here:
+
+- [CrysDiS introduction slides](docs/CrysDiS_intro.pdf)
+
 ## Launch Online
 
 Hosted app:
