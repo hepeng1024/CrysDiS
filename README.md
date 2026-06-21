@@ -20,19 +20,19 @@ https://crysdis.onrender.com
 
 ## Download Desktop Packages
 
-Desktop packages are available from the GitHub **Releases** page. For version `v0.1.0`, download the file matching your operating system.
+Desktop packages are available from the GitHub **Releases** page. For version `v0.1.1`, download the file matching your operating system.
 
 Suggested release assets:
 
 ```text
-CrysDiS-Windows-v0.1.0.zip
+CrysDiS-Windows-v0.1.1.zip
 CrysDiS-Linux-v0.1.0.tar.gz
-CrysDiS-macOS-arm64-v0.1.0.zip
+CrysDiS-macOS-arm64-v0.1.1.zip
 ```
 
 ### Windows
 
-1. Download `CrysDiS-Windows-v0.1.0.zip`.
+1. Download `CrysDiS-Windows-v0.1.1.zip`.
 2. Extract/unzip the folder.
 3. Open the extracted `CrysDiS` folder.
 4. Double-click:
@@ -67,7 +67,7 @@ After installing the launcher, search for **CrysDiS** in your Linux application 
 
 ### macOS
 
-1. Download `CrysDiS-macOS-arm64-v0.1.0.zip`.
+1. Download `CrysDiS-macOS-arm64-v0.1.1.zip`.
 2. Unzip it.
 3. Double-click:
 
