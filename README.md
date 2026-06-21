@@ -33,9 +33,10 @@ CrysDiS-macOS-arm64-v0.1.1.zip
 ### Windows
 
 1. Download `CrysDiS-Windows-v0.1.1.zip`.
-2. Extract/unzip the folder.
-3. Open the extracted `CrysDiS` folder.
-4. Double-click:
+2. Before extracting, right-click the zip file → Properties → General → Unblock → Apply → OK.
+3. Extract/unzip the folder.
+4. Open the extracted `CrysDiS` folder.
+5. Double-click:
 
 ```text
 CrysDiS.exe
