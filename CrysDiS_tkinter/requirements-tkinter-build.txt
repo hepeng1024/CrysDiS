@@ -1,0 +1,4 @@
+# Build-time dependencies for creating executable bundles
+-r requirements-tkinter-runtime.txt
+pyinstaller>=6.0
+pyinstaller-hooks-contrib>=2024.0

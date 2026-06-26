@@ -1,0 +1,13 @@
+name: crysdis-tkinter
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - tk
+  - numpy
+  - matplotlib
+  - pillow
+  - platformdirs
+  - pymatgen
+  - pyinstaller
+  - pyinstaller-hooks-contrib

@@ -1,0 +1,8 @@
+# Runtime dependencies for CrysDiS Classic / tkinter
+# tkinter itself is part of the Python standard library, but on Linux it may
+# require the system package python3-tk if you use system Python.
+numpy>=1.26
+matplotlib>=3.8
+pillow>=10.0
+platformdirs>=4.0
+pymatgen>=2024.5
