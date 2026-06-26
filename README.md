@@ -2,7 +2,9 @@
 
 **CrysDiS** stands for **Crystal Diffraction Simulator**. It is a NiceGUI-based crystal-structure and electron-diffraction simulator that can run as a hosted web app, a local browser app, or an operating-system-specific desktop-style package.
 
-The easiest way to try CrysDiS is the hosted web app. Desktop packages are useful when users want a double-click local app.
+The easiest way to try CrysDiS is the hosted web app. However, it may be very laggy and disconnect easily. The most robust way is to run the Python code directly (see Run From Source below). Desktop packages are useful when users want a double-click local app, which is convenient and performs much better than the hosted web version.
+
+The tkinter version is also provided. It has essentially the same features as the NiceGui version, but with a more classic, nostalgic desktop interface. It is suitable for heavy multi-panel crystal/diffraction comparison.
 
 ## Introduction Slides
 
@@ -28,6 +30,14 @@ Suggested release assets:
 CrysDiS-Windows-v0.1.1.zip
 CrysDiS-Linux-v0.1.0.tar.gz
 CrysDiS-macOS-arm64-v0.1.1.zip
+```
+
+Optional tkinter version:
+
+```text
+CrysDiS_tkinter-Windows-v0.1.0.zip
+CrysDiS_tkinter-Linux-v0.1.0.tar.gz
+CrysDiS_tkinter-macOS-arm64-v0.1.0.zip
 ```
 
 ### Windows
