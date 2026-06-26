@@ -1,0 +1,36 @@
+name: Build macOS CrysDiS Tkinter
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-macos-tkinter:
+    name: Build macOS tkinter app
+    runs-on: macos-15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        working-directory: CrysDiS_tkinter
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-tkinter-runtime.txt
+          python -m pip install -r requirements-tkinter-build.txt
+
+      - name: Build macOS tkinter app
+        working-directory: CrysDiS_tkinter
+        run: |
+          bash package_macos_tkinter.sh
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CrysDiS-Tkinter-macOS-arm64
+          path: CrysDiS_tkinter/dist/CrysDiS-Tkinter-macOS.zip
