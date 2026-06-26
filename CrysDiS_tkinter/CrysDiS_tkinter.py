@@ -124,6 +124,7 @@ SIMULATION_METHODS = (
 DEFAULT_VOLTAGE_KV = 500.0
 DEFAULT_THICKNESS_NM = 10.0
 DEFAULT_MAX_HKL = 7
+DEFAULT_ZONE_AXIS_SEARCH_MAX = 18
 DEFAULT_CAMERA_LENGTH_MM = 200.0
 DIFFRACTION_BASE_LIMIT_NM_INV = 16.0
 DEFAULT_SPOT_INTENSITY_THRESHOLD = 0.001
@@ -1554,7 +1555,11 @@ def view_from_vector(vector: np.ndarray) -> tuple[float, float]:
     return elev, azim
 
 
-def integer_zone_axis_from_view(model: CrystalModel, view_vector: np.ndarray, max_index: int = 6) -> tuple[int, int, int]:
+def integer_zone_axis_from_view(
+    model: CrystalModel,
+    view_vector: np.ndarray,
+    max_index: int = DEFAULT_ZONE_AXIS_SEARCH_MAX,
+) -> tuple[int, int, int]:
     view = normalize_vector(view_vector)
     if view is None:
         return (1, 0, 0)
@@ -1580,7 +1585,7 @@ def integer_zone_axis_from_view(model: CrystalModel, view_vector: np.ndarray, ma
 def zone_axis_label_from_view(
     model: CrystalModel,
     view_vector: np.ndarray,
-    max_index: int = 6,
+    max_index: int = DEFAULT_ZONE_AXIS_SEARCH_MAX,
     use_hex_four_index: bool = False,
 ) -> str:
     axis = integer_zone_axis_from_view(model, view_vector, max_index=max_index)
@@ -4783,7 +4788,12 @@ class CrystalDiffractionSimulator(tk.Tk):
             coords.append(site.fractional)
         return Structure(lattice, species, coords)
 
-    def integer_zone_axis_from_view(self, model: CrystalModel, view_vector: np.ndarray, max_index: int = 6) -> tuple[int, int, int]:
+    def integer_zone_axis_from_view(
+        self,
+        model: CrystalModel,
+        view_vector: np.ndarray,
+        max_index: int = DEFAULT_ZONE_AXIS_SEARCH_MAX,
+    ) -> tuple[int, int, int]:
         return integer_zone_axis_from_view(model, view_vector, max_index=max_index)
 
     def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:

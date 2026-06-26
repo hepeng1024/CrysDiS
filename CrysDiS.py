@@ -93,6 +93,7 @@ SIMULATION_METHOD = SIMULATION_METHOD_PYMATGEN
 DEFAULT_VOLTAGE_KV = 500.0
 DEFAULT_THICKNESS_NM = 10.0
 DEFAULT_MAX_HKL = 7
+DEFAULT_ZONE_AXIS_SEARCH_MAX = 18
 DEFAULT_CAMERA_LENGTH_MM = 200.0
 DIFFRACTION_BASE_LIMIT_NM_INV = 16.0
 DEFAULT_SPOT_INTENSITY_THRESHOLD = 0.001
@@ -905,7 +906,11 @@ def hcp_three_index_direction_to_four(axis: tuple[int, int, int]) -> tuple[int, 
     return reduce_integer_tuple((2 * u - v, 2 * v - u, -u - v, 3 * w))
 
 
-def integer_zone_axis_from_view(model: CrystalModel, view_vector: np.ndarray, max_index: int = 6) -> tuple[int, int, int]:
+def integer_zone_axis_from_view(
+    model: CrystalModel,
+    view_vector: np.ndarray,
+    max_index: int = DEFAULT_ZONE_AXIS_SEARCH_MAX,
+) -> tuple[int, int, int]:
     view = normalize_vector(view_vector)
     if view is None:
         return (1, 0, 0)
@@ -932,7 +937,7 @@ def integer_zone_axis_from_view(model: CrystalModel, view_vector: np.ndarray, ma
 def zone_axis_label_from_view(
     model: CrystalModel,
     view_vector: np.ndarray,
-    max_index: int = 6,
+    max_index: int = DEFAULT_ZONE_AXIS_SEARCH_MAX,
     use_hex_four_index: bool = False,
 ) -> str:
     axis = integer_zone_axis_from_view(model, view_vector, max_index=max_index)
