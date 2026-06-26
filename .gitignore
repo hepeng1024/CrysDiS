@@ -16,12 +16,19 @@ build/
 *.jpg
 *.jpeg
 *.gif
-!assets/
-!assets/*.ico
-!assets/*.png
+
 *:Zone.Identifier
 data/*
 outputs/*
 !data/.gitkeep
 !outputs/.gitkeep
 old_stuff/
+
+# Keep app icons for packaged releases
+!assets/
+!assets/*.png
+!assets/*.ico
+
+!CrysDiS_tkinter/assets/
+!CrysDiS_tkinter/assets/*.png
+!CrysDiS_tkinter/assets/*.ico
