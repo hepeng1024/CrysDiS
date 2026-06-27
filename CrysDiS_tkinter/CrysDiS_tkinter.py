@@ -125,6 +125,7 @@ DEFAULT_VOLTAGE_KV = 500.0
 DEFAULT_THICKNESS_NM = 10.0
 DEFAULT_MAX_HKL = 7
 DEFAULT_ZONE_AXIS_SEARCH_MAX = 18
+_ZONE_AXIS_CANDIDATE_CACHE: dict[tuple[tuple[float, ...], int], tuple[np.ndarray, np.ndarray]] = {}
 DEFAULT_CAMERA_LENGTH_MM = 200.0
 DIFFRACTION_BASE_LIMIT_NM_INV = 16.0
 DEFAULT_SPOT_INTENSITY_THRESHOLD = 0.001
@@ -1197,6 +1198,36 @@ def reduce_integer_vector(values: np.ndarray) -> tuple[int, int, int]:
     return tuple(int(value) for value in reduced[:3])
 
 
+def zone_axis_candidate_table(model: CrystalModel, max_index: int) -> tuple[np.ndarray, np.ndarray]:
+    limit = max(1, int(max_index))
+    lattice_key = tuple(float(value) for value in np.round(np.asarray(model.lattice, dtype=float).ravel(), 10))
+    key = (lattice_key, limit)
+    cached = _ZONE_AXIS_CANDIDATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    axes: list[tuple[int, int, int]] = []
+    vectors: list[np.ndarray] = []
+    for u, v, w in product(range(-limit, limit + 1), repeat=3):
+        if u == v == w == 0:
+            continue
+        candidate_axis = reduce_integer_vector(np.array([u, v, w], dtype=float))
+        if candidate_axis != (u, v, w):
+            continue
+        candidate = normalize_vector(direction_to_cart(candidate_axis, model))
+        if candidate is None:
+            continue
+        axes.append(candidate_axis)
+        vectors.append(candidate)
+
+    if not axes:
+        axes = [(1, 0, 0)]
+        vectors = [np.array([1.0, 0.0, 0.0], dtype=float)]
+    table = (np.array(axes, dtype=int), np.array(vectors, dtype=float))
+    _ZONE_AXIS_CANDIDATE_CACHE[key] = table
+    return table
+
+
 def hcp_three_index_direction_to_four(axis: tuple[int, int, int]) -> tuple[int, int, int, int]:
     u, v, w = axis
     return reduce_integer_tuple((2 * u - v, 2 * v - u, -u - v, 3 * w))
@@ -1563,23 +1594,10 @@ def integer_zone_axis_from_view(
     view = normalize_vector(view_vector)
     if view is None:
         return (1, 0, 0)
-    best_axis = (1, 0, 0)
-    best_score = -1.0
-    limit = max(1, int(max_index))
-    for u, v, w in product(range(-limit, limit + 1), repeat=3):
-        if u == v == w == 0:
-            continue
-        candidate_axis = reduce_integer_vector(np.array([u, v, w], dtype=float))
-        if candidate_axis != (u, v, w):
-            continue
-        candidate = normalize_vector(direction_to_cart(candidate_axis, model))
-        if candidate is None:
-            continue
-        score = abs(float(np.dot(view, candidate)))
-        if score > best_score:
-            best_score = score
-            best_axis = candidate_axis
-    return best_axis
+    axes, candidates = zone_axis_candidate_table(model, max_index)
+    scores = np.abs(candidates @ view)
+    best = int(np.argmax(scores))
+    return tuple(int(value) for value in axes[best])
 
 
 def zone_axis_label_from_view(
@@ -4360,7 +4378,7 @@ class CrystalDiffractionSimulator(tk.Tk):
             return
         state.elev = float(panel.crystal_ax.elev)
         state.azim = float(panel.crystal_ax.azim)
-        state.roll = float(getattr(panel.crystal_ax, "roll", 0.0))
+        state.roll = -float(getattr(panel.crystal_ax, "roll", 0.0))
 
     def refresh_diffraction_after_drag(self, panel_id: int) -> None:
         self._pending_diffraction_jobs.pop(panel_id, None)
@@ -5003,7 +5021,7 @@ class CrystalDiffractionSimulator(tk.Tk):
 
     def set_axis_view(self, axis, state: PanelState) -> None:
         if hasattr(axis, "roll"):
-            axis.view_init(elev=state.elev, azim=state.azim, roll=state.roll)
+            axis.view_init(elev=state.elev, azim=state.azim, roll=-state.roll)
         else:
             axis.view_init(elev=state.elev, azim=state.azim)
 
