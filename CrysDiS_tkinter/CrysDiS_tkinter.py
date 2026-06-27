@@ -5,6 +5,7 @@ import sys
 import tkinter as tk
 import warnings
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -412,6 +413,14 @@ class RotationCommand:
     angle_degrees: float
 
 
+def crystal_definition_key(definition: CrystalDefinition) -> str:
+    return json.dumps(definition.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def crystal_model_key(model: CrystalModel) -> str:
+    return crystal_definition_key(model.definition)
+
+
 @dataclass
 class PanelState:
     panel_id: int
@@ -737,6 +746,11 @@ def dominant_color(definition: CrystalDefinition) -> str:
 
 def atomic_form_factor(element: str, g_nm_inv: float) -> float:
     symbol = element.strip().capitalize()
+    return cached_atomic_form_factor(symbol, round(max(float(g_nm_inv), 0.0), 10))
+
+
+@lru_cache(maxsize=100_000)
+def cached_atomic_form_factor(symbol: str, g_nm_inv: float) -> float:
     g_ang_inv = max(float(g_nm_inv), 0.0) / 10.0
     s_value = 0.5 * g_ang_inv
     if symbol in CROMER_MANN:
@@ -1752,6 +1766,10 @@ def parse_rotation_command(text: str, model: CrystalModel) -> tuple[RotationComm
             angle = -angle
         return RotationCommand(axis=None, axis_label=f"view axis {direction}", angle_degrees=angle), []
 
+    bare_in_plane = re.fullmatch(rf"\s*({angle_pattern})\s*", text)
+    if bare_in_plane:
+        return RotationCommand(axis=None, axis_label="view axis ccw", angle_degrees=float(bare_in_plane.group(1))), []
+
     axis_text = ""
     angle_text = ""
     if "/" in text:
@@ -2519,6 +2537,7 @@ class OrdinaryPanelFrame(tk.LabelFrame):
         default_color = state.diffraction_color or app.default_diffraction_color_for_model(app.model_for(state.crystal))
         self.diff_color_var = tk.StringVar(value=app.display_color_name(default_color))
         self.crystal_combo: ttk.Combobox | None = None
+        self.crystal_signature: tuple[Any, ...] | None = None
         self._build()
 
     def _build(self) -> None:
@@ -2603,7 +2622,7 @@ class OrdinaryPanelFrame(tk.LabelFrame):
 
         if self.crystal_combo is not None:
             self.crystal_combo.bind("<<ComboboxSelected>>", lambda _event: self.app.on_crystal_selected(self.column_index))
-        for variable in (self.zone_var, self.plane_var, self.vector_var, self.rotation_var):
+        for variable in (self.zone_var, self.plane_var, self.vector_var):
             variable.trace_add("write", lambda *_args, panel_id=self.state.panel_id: self.app.schedule_panel_apply(panel_id))
         self.diff_color_var.trace_add(
             "write",
@@ -2970,6 +2989,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         self.model_cache: dict[str, CrystalModel] = {}
         self.reciprocal_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self.spot_cache: dict[tuple[Any, ...], np.ndarray] = {}
+        self.pymatgen_tem_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self.diffraction_cmaps: dict[str, LinearSegmentedColormap] = {}
         self.states: list[PanelState] = []
         self.combo_states: list[ComboPanelState] = []
@@ -3034,6 +3054,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         self.bind("<Configure>", self.on_root_configure, add="+")
         self.rebuild_diffraction_cmaps()
         self.show_landing()
+        self.after(600, self.prewarm_builtin_zone_axis_cache)
 
     def set_window_icon(self) -> None:
         if not APP_ICON_PATH.exists():
@@ -3567,8 +3588,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         ttk.Button(actions, text="Apply", command=self.apply_advanced_settings).pack(side=tk.RIGHT, padx=(0, 8))
 
     def apply_advanced_settings(self) -> None:
-        self.reciprocal_cache.clear()
-        self.spot_cache.clear()
+        self.clear_scientific_caches()
         self.redraw_all()
         self.status_var.set("Advanced settings applied")
 
@@ -3906,6 +3926,24 @@ class CrystalDiffractionSimulator(tk.Tk):
         self.method_var.set(fallback)
         return fallback
 
+    def prewarm_builtin_zone_axis_cache(self) -> None:
+        for definition in DEFAULT_CRYSTALS.values():
+            try:
+                model = self.model_for(definition.name)
+                zone_axis_candidate_table(model, DEFAULT_ZONE_AXIS_SEARCH_MAX)
+            except Exception:
+                continue
+
+    def clear_scientific_caches(self) -> None:
+        self.reciprocal_cache.clear()
+        self.spot_cache.clear()
+        self.pymatgen_tem_cache.clear()
+
+    @staticmethod
+    def trim_cache(cache: dict[Any, Any], max_entries: int) -> None:
+        if len(cache) > max_entries:
+            cache.clear()
+
     def rebuild_diffraction_cmaps(self) -> None:
         theme = self.current_theme()
         self.diffraction_cmaps = {
@@ -3955,7 +3993,7 @@ class CrystalDiffractionSimulator(tk.Tk):
 
     def model_for(self, name: str) -> CrystalModel:
         definition = self.library.get(name)
-        cache_key = json.dumps(definition.to_dict(), sort_keys=True)
+        cache_key = crystal_definition_key(definition)
         if cache_key in self.model_cache:
             return self.model_cache[cache_key]
         if definition.name == "FCC":
@@ -4004,8 +4042,7 @@ class CrystalDiffractionSimulator(tk.Tk):
             else (self.library.save_edited(definition, original_name) if original_name else self.library.save(definition))
         )
         self.model_cache.clear()
-        self.reciprocal_cache.clear()
-        self.spot_cache.clear()
+        self.clear_scientific_caches()
         self.refresh_crystal_options(saved.name, column)
         self.refresh_crystal_list_dialog()
         return saved
@@ -4085,8 +4122,7 @@ class CrystalDiffractionSimulator(tk.Tk):
             messagebox.showwarning("Remove Crystal", f"Could not remove {name}.", parent=self)
             return
         self.model_cache.clear()
-        self.reciprocal_cache.clear()
-        self.spot_cache.clear()
+        self.clear_scientific_caches()
         for index, state in enumerate(self.states):
             if state.crystal != name:
                 continue
@@ -4435,8 +4471,7 @@ class CrystalDiffractionSimulator(tk.Tk):
 
     def refresh_diffractions(self, _event=None, clear_cache: bool = False) -> None:
         if clear_cache:
-            self.reciprocal_cache.clear()
-            self.spot_cache.clear()
+            self.clear_scientific_caches()
         for state in self.states:
             self.draw_diffraction(state.panel_id)
             panel = self.ordinary_panels.get(state.panel_id)
@@ -4464,6 +4499,26 @@ class CrystalDiffractionSimulator(tk.Tk):
             panel.crystal_canvas.draw_idle()
             panel.diffraction_canvas.draw_idle()
 
+    def crystal_scene_signature(self, state: PanelState, model: CrystalModel) -> tuple[Any, ...]:
+        view_key: tuple[float, ...] | None = None
+        roll_key: float | None = None
+        if self.show_real_scale_bar_var.get():
+            view_key = tuple(float(value) for value in np.round(camera_vector_from_view(state.elev, state.azim), 5))
+            roll_key = round(float(state.roll), 3)
+        return (
+            crystal_model_key(model),
+            state.plane_text,
+            state.vector_text,
+            self.theme_var.get(),
+            bool(self.show_annotations_var.get()),
+            bool(self.show_real_scale_bar_var.get()),
+            tuple(self.plane_colors),
+            tuple(self.vector_colors),
+            round(float(state.real_magnification), 4),
+            view_key,
+            roll_key,
+        )
+
     def draw_crystal(self, panel_id: int) -> None:
         state = self.panel_state_by_id(panel_id)
         panel = self.ordinary_panels.get(panel_id)
@@ -4473,6 +4528,11 @@ class CrystalDiffractionSimulator(tk.Tk):
         style = self.style_for_model(model)
         theme = self.current_theme()
         axis = panel.crystal_ax
+        signature = self.crystal_scene_signature(state, model)
+        if signature == panel.crystal_signature:
+            self.set_axis_view(axis, state)
+            panel.status_var.set(self.panel_status_text(state))
+            return
         axis.clear()
         axis.set_proj_type("ortho")
         axis.set_facecolor(theme["axis_bg"])
@@ -4527,6 +4587,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         axis.axis("off")
         if self.show_real_scale_bar_var.get():
             self.draw_real_space_scale_bar(axis, model, limit, state)
+        panel.crystal_signature = signature
         panel.status_var.set(self.panel_status_text(state))
 
     def panel_status_text(self, state: PanelState) -> str:
@@ -4622,6 +4683,13 @@ class CrystalDiffractionSimulator(tk.Tk):
             return NAMED_COLORS[color.lower()]
         return self.resolve_color(self.default_diffraction_color_for_model(model), self.style_for_model(model)["diff"])
 
+    def diffraction_spots_for_state(self, state: PanelState, model: CrystalModel | None = None) -> np.ndarray:
+        model = model or self.model_for(state.crystal)
+        view_vector = camera_vector_from_view(state.elev, state.azim)
+        if self.current_simulation_method() == SIMULATION_METHOD_PYMATGEN:
+            return self.compute_pymatgen_tem_spots(model, view_vector, state.roll)
+        return self.compute_ewald_spots(model, view_vector, state.roll)
+
     def draw_diffraction(self, panel_id: int) -> None:
         state = self.panel_state_by_id(panel_id)
         panel = self.ordinary_panels.get(panel_id)
@@ -4634,11 +4702,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         axis.set_facecolor(theme["diff_bg"])
         view_vector = camera_vector_from_view(state.elev, state.azim)
         color = self.diffraction_color_for_state(state, model)
-        method = self.current_simulation_method()
-        if method == SIMULATION_METHOD_PYMATGEN:
-            self.draw_spot_diffraction(axis, self.compute_pymatgen_tem_spots(model, view_vector, state.roll), color, model=model)
-        else:
-            self.draw_spot_diffraction(axis, self.compute_ewald_spots(model, view_vector, state.roll), color, model=model)
+        self.draw_spot_diffraction(axis, self.diffraction_spots_for_state(state, model), color, model=model)
         if self.show_zone_axis_var.get():
             zone_label = zone_axis_label_from_view(
                 model,
@@ -4688,18 +4752,12 @@ class CrystalDiffractionSimulator(tk.Tk):
         limit = self.current_diffraction_limit()
         has_data = False
         legend_entries: list[tuple[str, str]] = []
-        method = self.current_simulation_method()
         for panel_id in reversed(state.source_panel_ids):
             source = self.panel_state_by_id(panel_id)
             if source is None:
                 continue
             model = self.model_for(source.crystal)
-            view = camera_vector_from_view(source.elev, source.azim)
-            spots = (
-                self.compute_pymatgen_tem_spots(model, view, source.roll)
-                if method == SIMULATION_METHOD_PYMATGEN
-                else self.compute_ewald_spots(model, view, source.roll)
-            )
+            spots = self.diffraction_spots_for_state(source, model)
             if not len(spots):
                 continue
             has_data = True
@@ -4748,7 +4806,7 @@ class CrystalDiffractionSimulator(tk.Tk):
             view = np.array([1.0, 0.0, 0.0])
         cache_key = (
             "ewald",
-            model.name,
+            crystal_model_key(model),
             self.current_max_hkl(),
             round(self.current_voltage_kv(), 4),
             round(self.current_thickness_nm(), 4),
@@ -4787,9 +4845,8 @@ class CrystalDiffractionSimulator(tk.Tk):
         display_intensity = np.log1p(compression * raw_intensity) / math.log1p(compression)
         visible = (display_intensity > self.current_spot_intensity_threshold()) & valid_curvature
         result = np.column_stack((x_plot[visible], y_plot[visible], display_intensity[visible], hkl[visible, 0], hkl[visible, 1], hkl[visible, 2]))
-        if len(self.spot_cache) > 256:
-            self.spot_cache.clear()
         self.spot_cache[cache_key] = result
+        self.trim_cache(self.spot_cache, 512)
         return result
 
     def pymatgen_structure_from_model(self, model: CrystalModel) -> Any:
@@ -4814,58 +4871,105 @@ class CrystalDiffractionSimulator(tk.Tk):
     ) -> tuple[int, int, int]:
         return integer_zone_axis_from_view(model, view_vector, max_index=max_index)
 
-    def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
+    def pymatgen_tem_reflections(self, model: CrystalModel, zone_axis: tuple[int, int, int]) -> np.ndarray | None:
         if not PYMATGEN_AVAILABLE:
-            self.status_var.set("Pymatgen is not installed; using Ewald reflections instead")
-            return self.compute_ewald_spots(model, view_vector, roll)
+            return None
+        max_order = self.current_max_hkl()
+        camera_length = max(int(round(self.current_camera_length_mm() / 10.0)), 1)
+        cache_key = (
+            crystal_model_key(model),
+            zone_axis,
+            max_order,
+            round(self.current_voltage_kv(), 4),
+            camera_length,
+        )
+        cached = self.pymatgen_tem_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             from pymatgen.analysis.diffraction.tem import TEMCalculator
 
             structure = self.pymatgen_structure_from_model(model)
-            zone_axis = self.integer_zone_axis_from_view(model, view_vector)
             calculator = TEMCalculator(
                 symprec=None,
                 voltage=self.current_voltage_kv(),
                 beam_direction=zone_axis,
-                camera_length=max(int(round(self.current_camera_length_mm() / 10.0)), 1),
+                camera_length=camera_length,
             )
-            max_order = self.current_max_hkl()
             dots = calculator.tem_dots(structure, TEMCalculator.generate_points(-max_order, max_order))
         except Exception as exc:
             self.status_var.set(f"Pymatgen TEM calculation failed: {exc}")
-            return np.empty((0, 6), dtype=float)
+            return None
 
-        normal = normalize_vector(view_vector)
-        if normal is None:
-            normal = np.array([1.0, 0.0, 0.0])
-        u_axis, v_axis = projection_basis(normal, roll)
+        rows = [[int(dot.hkl[0]), int(dot.hkl[1]), int(dot.hkl[2]), max(float(dot.intensity), 0.0)] for dot in dots]
+        reflections = np.array(rows, dtype=float) if rows else np.empty((0, 4), dtype=float)
+        self.pymatgen_tem_cache[cache_key] = reflections
+        self.trim_cache(self.pymatgen_tem_cache, 128)
+        return reflections
+
+    def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
+        if not PYMATGEN_AVAILABLE:
+            self.status_var.set("Pymatgen is not installed; using Ewald reflections instead")
+            return self.compute_ewald_spots(model, view_vector, roll)
+        view = normalize_vector(view_vector)
+        if view is None:
+            view = np.array([1.0, 0.0, 0.0])
+        zone_axis = self.integer_zone_axis_from_view(model, view)
+        cache_key = (
+            "pymatgen",
+            crystal_model_key(model),
+            self.current_max_hkl(),
+            round(self.current_voltage_kv(), 4),
+            round(self.current_camera_length_mm(), 4),
+            round(self.current_spot_intensity_threshold(), 6),
+            round(self.current_intensity_compression_factor(), 4),
+            tuple(np.round(view, 5)),
+            round(float(roll), 3),
+            zone_axis,
+        )
+        cached = self.spot_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        reflections = self.pymatgen_tem_reflections(model, zone_axis)
+        if reflections is None:
+            return np.empty((0, 6), dtype=float)
+        if not len(reflections):
+            return np.array([[0.0, 0.0, 1.0, 0, 0, 0]], dtype=float)
+
+        hkl = reflections[:, :3].astype(int)
+        raw_intensity = reflections[:, 3].astype(float)
+        u_axis, v_axis = projection_basis(view, roll)
         detector_scale = self.current_detector_scale_mm_per_nm_inv()
         compression = self.current_intensity_compression_factor()
         rows = [[0.0, 0.0, 1.0, 0, 0, 0]]
-        for dot in dots:
-            h, k, l = (int(value) for value in dot.hkl)
-            if h == k == l == 0:
-                continue
-            raw_intensity = max(float(dot.intensity), 0.0)
-            display_intensity = math.log1p(compression * raw_intensity) / math.log1p(compression)
-            if display_intensity <= self.current_spot_intensity_threshold():
-                continue
-            g_vector = np.array([h, k, l], dtype=float) @ model.reciprocal
-            rows.append(
-                [
-                    detector_scale * float(np.dot(g_vector, u_axis)),
-                    detector_scale * float(np.dot(g_vector, v_axis)),
-                    display_intensity,
-                    h,
-                    k,
-                    l,
-                ]
+        display_intensity = np.log1p(compression * np.maximum(raw_intensity, 0.0)) / math.log1p(compression)
+        nonzero = ~np.all(hkl == 0, axis=1)
+        visible = (display_intensity > self.current_spot_intensity_threshold()) & nonzero
+        g_vectors = hkl[visible].astype(float) @ model.reciprocal
+        if len(g_vectors):
+            x_coord = detector_scale * (g_vectors @ u_axis)
+            y_coord = detector_scale * (g_vectors @ v_axis)
+            rows.extend(
+                np.column_stack(
+                    (
+                        x_coord,
+                        y_coord,
+                        display_intensity[visible],
+                        hkl[visible, 0],
+                        hkl[visible, 1],
+                        hkl[visible, 2],
+                    )
+                ).tolist()
             )
-        return np.array(rows, dtype=float)
+        result = np.array(rows, dtype=float)
+        self.spot_cache[cache_key] = result
+        self.trim_cache(self.spot_cache, 512)
+        return result
 
     def reciprocal_points_for_model(self, model: CrystalModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         max_order = self.current_max_hkl()
-        cache_key = (json.dumps(model.definition.to_dict(), sort_keys=True), max_order)
+        cache_key = (crystal_model_key(model), max_order)
         if cache_key in self.reciprocal_cache:
             return self.reciprocal_cache[cache_key]
         hkl_values = []
@@ -4890,6 +4994,7 @@ class CrystalDiffractionSimulator(tk.Tk):
             np.array(structure_intensity, dtype=float),
         )
         self.reciprocal_cache[cache_key] = result
+        self.trim_cache(self.reciprocal_cache, 64)
         return result
 
     def draw_indices(self, axis, spots: np.ndarray, model: CrystalModel | None = None) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import importlib.util
@@ -427,6 +428,14 @@ def atomic_site_from_dict(data: dict[str, Any]) -> AtomicSite:
         label=str(data.get("label", "") or ""),
         color=str(data.get("color", "") or ""),
     )
+
+
+def crystal_definition_key(definition: CrystalDefinition) -> str:
+    return json.dumps(definition.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def crystal_model_key(model: CrystalModel) -> str:
+    return crystal_definition_key(model.definition)
 
 
 def default_crystals() -> dict[str, CrystalDefinition]:
@@ -1300,6 +1309,10 @@ def parse_rotation_command(text: str, model: CrystalModel) -> tuple[RotationComm
             angle = -angle
         return RotationCommand(axis=None, axis_label=f"view axis {direction}", angle_degrees=angle), []
 
+    bare_in_plane = re.fullmatch(rf"\s*({angle_pattern})\s*", text)
+    if bare_in_plane:
+        return RotationCommand(axis=None, axis_label="view axis ccw", angle_degrees=float(bare_in_plane.group(1))), []
+
     axis_text = ""
     angle_text = ""
     if "/" in text:
@@ -1434,6 +1447,11 @@ def electron_form_factor_zero_limit(element: str) -> float:
 
 def atomic_form_factor(element: str, g_nm_inv: float) -> float:
     symbol = element.strip().capitalize()
+    return cached_atomic_form_factor(symbol, round(max(float(g_nm_inv), 0.0), 10))
+
+
+@lru_cache(maxsize=100_000)
+def cached_atomic_form_factor(symbol: str, g_nm_inv: float) -> float:
     g_ang_inv = max(float(g_nm_inv), 0.0) / 10.0
     s = 0.5 * g_ang_inv
     if s <= MOTT_BETHE_S_TOL:
@@ -2299,11 +2317,13 @@ class PanelController:
         self.vector_input = None
         self.rotation_input = None
         self.download_dialog = None
+        self.close_button = None
         self.scale_bar_line = None
         self.scale_bar_label = None
         self.scale_bar_container = None
         self.scale_timer = None
         self.current_model: CrystalModel | None = None
+        self.scene_signature: tuple[Any, ...] | None = None
 
     def build(self) -> None:
         with ui.card().classes(f"comparison-panel comparison-panel-{self.state.panel_id}") as self.card:
@@ -2331,7 +2351,7 @@ class PanelController:
                 self.rotation_input = ui.input(
                     "Rotation", value=self.state.rotation_text
                 ).props("outlined dense").classes("panel-rotation").tooltip(
-                    "Use 110/45 or 110 45. Use 45 ccw or 45 cw for in-plane rotation."
+                    "Use 110/45 or 110 45. Use 45, 45 ccw, or 45 cw for in-plane rotation."
                 )
                 self.rotation_input.on("keydown.enter", self.apply_from_browser)
                 ui.button("Apply", on_click=self.apply_from_browser).props("unelevated dense").classes(
@@ -2346,10 +2366,10 @@ class PanelController:
                 ui.button(icon="edit", on_click=self.open_builder).props("flat round dense").classes("panel-edit-button").tooltip(
                     "Edit crystal"
                 )
-                if len(self.simulator.panel_states) > 1:
-                    ui.button(icon="close", on_click=lambda: self.simulator.remove_panel(self.state.panel_id)).props(
-                        "flat round dense"
-                    ).classes("panel-close-button").tooltip("Remove panel")
+                self.close_button = ui.button(
+                    icon="close",
+                    on_click=lambda: self.simulator.remove_panel(self.state.panel_id),
+                ).props("flat round dense").classes("panel-close-button").tooltip("Remove panel")
 
             with ui.element("div").classes("visual-stack"):
                 with ui.element("div").classes("scene-wrap"):
@@ -2367,6 +2387,13 @@ class PanelController:
             self.scale_timer = ui.timer(0.7, self.update_scene_scale_bar)
 
         self.apply(initial=True)
+        self.update_close_button()
+
+    def update_close_button(self) -> None:
+        if self.close_button is None:
+            return
+        self.close_button.visible = len(self.simulator.panel_states) > 1
+        self.close_button.update()
 
     def on_crystal_changed(self) -> None:
         if self.crystal_select.value == CUSTOM_SENTINEL:
@@ -2902,29 +2929,32 @@ class PanelController:
             return
         model = model or self.simulator.model_for(self.state.crystal_name)
         self.current_model = model
-        self.scene.clear()
-        with self.scene:
-            for start, end in model.display_edges:
-                self.scene.line(start.tolist(), end.tolist()).material(color="#7A8796", opacity=0.72)
+        signature = self.scene_content_signature(model)
+        if signature != self.scene_signature:
+            self.scene.clear()
+            with self.scene:
+                for start, end in model.display_edges:
+                    self.scene.line(start.tolist(), end.tolist()).material(color="#7A8796", opacity=0.72)
 
-            for atom in model.display_atoms:
-                radius = 0.072 * (0.45 + 0.55 * max(atom.occupancy, 0.12) ** (1.0 / 3.0))
-                self.scene.sphere(radius=radius, width_segments=32, height_segments=16).move(*atom.position.tolist()).material(
-                    color=color_for_site(atom), opacity=0.58 + 0.42 * atom.occupancy
+                for atom in model.display_atoms:
+                    radius = 0.072 * (0.45 + 0.55 * max(atom.occupancy, 0.12) ** (1.0 / 3.0))
+                    self.scene.sphere(radius=radius, width_segments=32, height_segments=16).move(*atom.position.tolist()).material(
+                        color=color_for_site(atom), opacity=0.58 + 0.42 * atom.occupancy
+                    )
+
+                planes, plane_errors = parse_indices(self.state.plane_text, model, "plane", allow_multiple=True)
+                vectors, vector_errors = parse_indices(
+                    self.state.vector_text,
+                    model,
+                    "direction",
+                    allow_multiple=True,
+                    allow_reciprocal=True,
                 )
-
-            planes, plane_errors = parse_indices(self.state.plane_text, model, "plane", allow_multiple=True)
-            vectors, vector_errors = parse_indices(
-                self.state.vector_text,
-                model,
-                "direction",
-                allow_multiple=True,
-                allow_reciprocal=True,
-            )
-            self.draw_planes(model, planes)
-            self.draw_vectors(model, vectors)
-            if plane_errors or vector_errors:
-                self.simulator.set_status("; ".join((plane_errors + vector_errors)[:3]))
+                self.draw_planes(model, planes)
+                self.draw_vectors(model, vectors)
+                if plane_errors or vector_errors:
+                    self.simulator.set_status("; ".join((plane_errors + vector_errors)[:3]))
+            self.scene_signature = signature
 
         view = normalize_vector(self.state.view_vector)
         if view is None:
@@ -3045,6 +3075,16 @@ class PanelController:
                         self.state.view_vector,
                         self.state.roll,
                     )
+
+    def scene_content_signature(self, model: CrystalModel) -> tuple[Any, ...]:
+        return (
+            crystal_model_key(model),
+            self.state.plane_text,
+            self.state.vector_text,
+            bool(self.simulator.show_crystal_annotations()),
+            tuple(self.simulator.plane_palette()),
+            tuple(self.simulator.vector_palette()),
+        )
 
     def set_scale_bar_from_distance(
         self,
@@ -3175,10 +3215,7 @@ class PanelController:
         if self.diffraction is None:
             return
         model = model or self.simulator.model_for(self.state.crystal_name)
-        if self.simulator.current_simulation_method() == SIMULATION_METHOD_PYMATGEN:
-            spots = self.simulator.compute_pymatgen_tem_spots(model, self.state.view_vector, self.state.roll)
-        else:
-            spots = self.simulator.compute_ewald_spots(model, self.state.view_vector, self.state.roll)
+        spots = self.simulator.diffraction_spots_for_state(self.state, model)
         spot_color = dominant_color(model.definition)
         limit = self.simulator.current_diffraction_limit()
         zone_label = (
@@ -3546,18 +3583,22 @@ class ComboPanelController:
 
     def refresh(self) -> None:
         self.simulator.repair_combo_sources(self.state)
-        options = self.source_options()
-        if self.source_select is not None:
-            self.source_select.options = options
-            if self.state.selected_panel_id not in options:
-                self.state.selected_panel_id = next(iter(options), None)
-            self.source_select.value = self.state.selected_panel_id
-            self.source_select.update()
+        self.refresh_source_options()
         if self.bind_checkbox is not None:
             self.bind_checkbox.value = self.state.bind_motion
             self.bind_checkbox.update()
         self.refresh_source_list()
         self.redraw_diffraction()
+
+    def refresh_source_options(self) -> None:
+        options = self.source_options()
+        if self.source_select is None:
+            return
+        self.source_select.options = options
+        if self.state.selected_panel_id not in options:
+            self.state.selected_panel_id = next(iter(options), None)
+        self.source_select.value = self.state.selected_panel_id
+        self.source_select.update()
 
     def refresh_source_list(self) -> None:
         if self.source_list_container is None:
@@ -3625,10 +3666,7 @@ class ComboPanelController:
         data: list[dict[str, Any]] = []
         for source in reversed(sources):
             model = self.simulator.model_for(source.crystal_name)
-            if self.simulator.current_simulation_method() == SIMULATION_METHOD_PYMATGEN:
-                spots = self.simulator.compute_pymatgen_tem_spots(model, source.view_vector, source.roll)
-            else:
-                spots = self.simulator.compute_ewald_spots(model, source.view_vector, source.roll)
+            spots = self.simulator.diffraction_spots_for_state(source, model)
             if not len(spots):
                 continue
             intensity = spots[:, 2]
@@ -3705,6 +3743,9 @@ class SimulatorApp:
     def __init__(self) -> None:
         self.library = CrystalLibrary()
         self.model_cache: dict[tuple[str, str], CrystalModel] = {}
+        self.reciprocal_table_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        self.diffraction_spot_cache: dict[tuple[Any, ...], np.ndarray] = {}
+        self.pymatgen_tem_cache: dict[tuple[Any, ...], np.ndarray] = {}
         self.panel_states = [PanelState(panel_id=1)]
         self.combo_panel_states: list[ComboPanelState] = []
         self.layout_items: list[tuple[str, int]] = [("panel", 1)]
@@ -3794,6 +3835,18 @@ class SimulatorApp:
         self.build_crystal_list_dialog()
         self.update_add_combo_button()
         self.build_panels()
+        ui.timer(0.5, self.prewarm_builtin_zone_axis_cache, once=True, immediate=False)
+
+    async def prewarm_builtin_zone_axis_cache(self) -> None:
+        await asyncio.to_thread(self._prewarm_builtin_zone_axis_cache)
+
+    def _prewarm_builtin_zone_axis_cache(self) -> None:
+        for definition in DEFAULT_CRYSTALS.values():
+            try:
+                model = make_model(definition)
+                zone_axis_candidate_table(model, DEFAULT_ZONE_AXIS_SEARCH_MAX)
+            except Exception:
+                continue
 
     def open_intro_dialog(self) -> None:
         if self.intro_dialog is not None:
@@ -4118,6 +4171,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             ui.notify(f"Could not delete {name}", type="warning")
             return
         self.model_cache.clear()
+        self.clear_scientific_caches()
         for state in self.panel_states:
             if state.crystal_name == name:
                 state.crystal_name = "FCC"
@@ -4206,7 +4260,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 font-size: 12px;
             }
             .app-shell {
-                width: calc(100vw - 20px);
+                width: calc(100vw - 32px);
                 max-width: 1920px;
                 margin: 2px auto 16px auto;
                 --panel-visual-height: clamp(285px, calc((100vh - 240px) / 2), 360px);
@@ -4232,13 +4286,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .panel-grid {
                 display: grid;
                 grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 8px;
+                gap: 6px;
                 align-items: start;
             }
             .comparison-panel {
                 width: 100%;
                 min-width: 0;
-                padding: 6px;
+                padding: 5px;
                 container-type: inline-size;
                 container-name: comparison-panel;
             }
@@ -4249,15 +4303,15 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .panel-toolbar {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 22px minmax(104px, 1.3fr) minmax(58px, 0.7fr) minmax(58px, 0.7fr) minmax(74px, 0.8fr) minmax(74px, 0.8fr) minmax(52px, auto) minmax(48px, auto) 26px 26px 22px;
+                grid-template-columns: 20px minmax(98px, 1.3fr) minmax(54px, 0.7fr) minmax(54px, 0.7fr) minmax(68px, 0.8fr) minmax(68px, 0.8fr) minmax(48px, auto) minmax(44px, auto) 24px 24px 20px;
                 grid-template-areas: "number crystal zone plane vector rotation apply sync download edit close";
-                gap: 3px;
+                gap: 2px;
                 align-items: center;
                 margin-bottom: 6px;
             }
             .panel-number {
                 grid-area: number;
-                width: 22px;
+                width: 20px;
                 height: 38px;
                 display: flex;
                 align-items: center;
@@ -4289,29 +4343,29 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .panel-close-button {
                 grid-area: close;
-                width: 22px;
+                width: 20px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-edit-button {
                 grid-area: edit;
-                width: 26px;
+                width: 24px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-download-button {
                 grid-area: download;
-                width: 26px;
+                width: 24px;
                 height: 34px;
                 min-height: 34px;
             }
             .panel-apply-button {
                 grid-area: apply;
-                min-width: 52px;
+                min-width: 48px;
             }
             .panel-sync-button {
                 grid-area: sync;
-                min-width: 48px;
+                min-width: 44px;
             }
             .combo-toolbar {
                 width: 100%;
@@ -5137,9 +5191,19 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         # physically shrinks or expands the diffraction pattern.
         return max(0.05, default_detector_half_width_mm())
 
+    def clear_scientific_caches(self) -> None:
+        self.reciprocal_table_cache.clear()
+        self.diffraction_spot_cache.clear()
+        self.pymatgen_tem_cache.clear()
+
+    @staticmethod
+    def trim_cache(cache: dict[Any, Any], max_entries: int) -> None:
+        if len(cache) > max_entries:
+            cache.clear()
+
     def model_for(self, name: str) -> CrystalModel:
         definition = self.library.get(name)
-        cache_key = (definition.name, json.dumps(definition.to_dict(), sort_keys=True))
+        cache_key = (definition.name, crystal_definition_key(definition))
         if cache_key not in self.model_cache:
             self.model_cache[cache_key] = make_model(definition)
         return self.model_cache[cache_key]
@@ -5165,6 +5229,57 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     self.combo_controllers.append(controller)
                     controller.build()
         self.update_add_combo_button()
+        self.update_panel_close_buttons()
+
+    def append_panel_controller(self, state: PanelState) -> None:
+        if self.panels_container is None:
+            return
+        with self.panels_container:
+            controller = PanelController(self, state)
+            self.controllers.append(controller)
+            controller.build()
+
+    def append_combo_controller(self, state: ComboPanelState) -> None:
+        if self.panels_container is None:
+            return
+        with self.panels_container:
+            controller = ComboPanelController(self, state)
+            self.combo_controllers.append(controller)
+            controller.build()
+
+    def delete_panel_controller(self, panel_id: int) -> None:
+        controller = self.controller_by_panel_id(panel_id)
+        if controller is None:
+            return
+        if controller.scale_timer is not None:
+            controller.scale_timer.active = False
+        if controller.card is not None:
+            controller.card.delete()
+        self.controllers = [item for item in self.controllers if item.state.panel_id != panel_id]
+
+    def delete_combo_controller(self, combo_id: int) -> None:
+        controller = self.combo_controller_by_id(combo_id)
+        if controller is None:
+            return
+        if controller.card is not None:
+            controller.card.delete()
+        self.combo_controllers = [item for item in self.combo_controllers if item.state.combo_id != combo_id]
+
+    def delete_invalid_combo_controllers(self) -> None:
+        valid_ids = {state.combo_id for state in self.combo_panel_states}
+        for controller in list(self.combo_controllers):
+            if controller.state.combo_id not in valid_ids:
+                if controller.card is not None:
+                    controller.card.delete()
+                self.combo_controllers.remove(controller)
+
+    def update_panel_close_buttons(self) -> None:
+        for controller in self.controllers:
+            controller.update_close_button()
+
+    def refresh_combo_source_options(self) -> None:
+        for controller in self.combo_controllers:
+            controller.refresh_source_options()
 
     def add_panel(self) -> None:
         defaults = [
@@ -5173,50 +5288,68 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             ("HCP", "0001", "", ""),
         ]
         crystal, zone, plane, vector = defaults[(self.next_panel_id - 1) % len(defaults)]
-        self.panel_states.append(
-            PanelState(
-                panel_id=self.next_panel_id,
-                crystal_name=crystal,
-                zone_text=zone,
-                plane_text=plane,
-                vector_text=vector,
-                diffraction_color=DEFAULT_DIFFRACTION_COLORS.get(crystal, "#31F7F1"),
-            )
+        state = PanelState(
+            panel_id=self.next_panel_id,
+            crystal_name=crystal,
+            zone_text=zone,
+            plane_text=plane,
+            vector_text=vector,
+            diffraction_color=DEFAULT_DIFFRACTION_COLORS.get(crystal, "#31F7F1"),
         )
+        self.panel_states.append(state)
         self.layout_items.append(("panel", self.next_panel_id))
         self.next_panel_id += 1
-        self.build_panels()
+        self.append_panel_controller(state)
+        self.update_panel_close_buttons()
+        self.update_add_combo_button()
+        self.refresh_combo_source_options()
         self.set_status("Added a comparison panel")
 
     def add_combo_panel(self) -> None:
         if len(self.panel_states) < 2:
             ui.notify("Add at least two panels before creating a combo panel", type="warning")
             return
-        self.combo_panel_states.append(
-            ComboPanelState(
-                combo_id=self.next_combo_id,
-                source_panel_ids=[state.panel_id for state in self.panel_states],
-                selected_panel_id=self.panel_states[0].panel_id,
-            )
+        state = ComboPanelState(
+            combo_id=self.next_combo_id,
+            source_panel_ids=[state.panel_id for state in self.panel_states],
+            selected_panel_id=self.panel_states[0].panel_id,
         )
+        self.combo_panel_states.append(state)
         self.layout_items.append(("combo", self.next_combo_id))
         self.next_combo_id += 1
-        self.build_panels()
+        self.append_combo_controller(state)
+        self.update_add_combo_button()
         self.set_status("Added a combo panel")
 
     def remove_panel(self, panel_id: int) -> None:
         if len(self.panel_states) <= 1:
             return
+        affected_combo_ids = {
+            state.combo_id
+            for state in self.combo_panel_states
+            if panel_id in state.source_panel_ids or state.selected_panel_id == panel_id
+        }
         self.panel_states = [state for state in self.panel_states if state.panel_id != panel_id]
         self.layout_items = [item for item in self.layout_items if item != ("panel", panel_id)]
+        self.delete_panel_controller(panel_id)
         self.repair_all_combo_sources()
-        self.build_panels()
+        self.repair_layout_items()
+        self.delete_invalid_combo_controllers()
+        for controller in self.combo_controllers:
+            if controller.state.combo_id in affected_combo_ids:
+                controller.refresh()
+            else:
+                controller.refresh_source_options()
+        self.update_panel_close_buttons()
+        self.update_add_combo_button()
         self.set_status(f"Removed panel {panel_id}")
 
     def remove_combo_panel(self, combo_id: int) -> None:
         self.combo_panel_states = [state for state in self.combo_panel_states if state.combo_id != combo_id]
         self.layout_items = [item for item in self.layout_items if item != ("combo", combo_id)]
-        self.build_panels()
+        self.delete_combo_controller(combo_id)
+        self.repair_layout_items()
+        self.update_add_combo_button()
         self.set_status(f"Removed combo panel C{combo_id}")
 
     def repair_layout_items(self) -> None:
@@ -5280,6 +5413,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
 
     def refresh_library(self, selected_name: str, target_panel_id: int | None = None) -> None:
         self.model_cache.clear()
+        self.clear_scientific_caches()
         for state in self.panel_states:
             if state.crystal_name == CUSTOM_SENTINEL or state.crystal_name not in self.library.definitions:
                 state.crystal_name = selected_name
@@ -5291,6 +5425,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def refresh_diffractions(self, clear_cache: bool = False) -> None:
         if clear_cache:
             self.model_cache.clear()
+            self.clear_scientific_caches()
         for controller in self.controllers:
             controller.redraw_diffraction()
         self.refresh_combo_panels()
@@ -5302,6 +5437,41 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
 
     def controller_by_panel_id(self, panel_id: int) -> PanelController | None:
         return next((controller for controller in self.controllers if controller.state.panel_id == panel_id), None)
+
+    def combo_controller_by_id(self, combo_id: int) -> ComboPanelController | None:
+        return next((controller for controller in self.combo_controllers if controller.state.combo_id == combo_id), None)
+
+    def diffraction_spot_cache_key(self, state: PanelState, model: CrystalModel) -> tuple[Any, ...]:
+        method = self.current_simulation_method()
+        view = normalize_vector(state.view_vector)
+        if view is None:
+            view = np.array(state.view_vector, dtype=float)
+        return (
+            method,
+            crystal_model_key(model),
+            self.current_max_hkl(),
+            round(self.current_voltage_kv(), 5),
+            round(self.current_thickness_nm(), 5),
+            round(self.current_camera_length_mm(), 5),
+            round(self.current_spot_intensity_threshold(), 8),
+            round(self.current_intensity_compression_factor(), 5),
+            tuple(float(value) for value in np.round(view, 6)),
+            round(float(state.roll), 5),
+        )
+
+    def diffraction_spots_for_state(self, state: PanelState, model: CrystalModel | None = None) -> np.ndarray:
+        model = model or self.model_for(state.crystal_name)
+        key = self.diffraction_spot_cache_key(state, model)
+        cached = self.diffraction_spot_cache.get(key)
+        if cached is not None:
+            return cached
+        if self.current_simulation_method() == SIMULATION_METHOD_PYMATGEN:
+            spots = self.compute_pymatgen_tem_spots(model, state.view_vector, state.roll)
+        else:
+            spots = self.compute_ewald_spots(model, state.view_vector, state.roll)
+        self.diffraction_spot_cache[key] = spots
+        self.trim_cache(self.diffraction_spot_cache, 512)
+        return spots
 
     def propagate_bound_motion(
         self,
@@ -5341,59 +5511,87 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 controller.redraw_diffraction(model)
         self.refresh_combo_panels()
 
-    def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
+    def pymatgen_tem_reflections(self, model: CrystalModel, zone_axis: tuple[int, int, int]) -> np.ndarray | None:
+        max_order = self.current_max_hkl()
+        camera_length = max(int(round(self.current_camera_length_mm() / 10.0)), 1)
+        cache_key = (
+            crystal_model_key(model),
+            zone_axis,
+            max_order,
+            round(self.current_voltage_kv(), 5),
+            camera_length,
+        )
+        cached = self.pymatgen_tem_cache.get(cache_key)
+        if cached is not None:
+            return cached
         try:
             from pymatgen.analysis.diffraction.tem import TEMCalculator
 
             structure = pymatgen_structure_from_model(model)
-            zone_axis = integer_zone_axis_from_view(model, view_vector)
             calculator_class = occupancy_aware_tem_calculator_class(TEMCalculator)
             calculator = calculator_class(
                 symprec=None,
                 voltage=self.current_voltage_kv(),
                 beam_direction=zone_axis,
-                camera_length=max(int(round(self.current_camera_length_mm() / 10.0)), 1),
+                camera_length=camera_length,
             )
-            max_order = self.current_max_hkl()
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 dots = calculator.tem_dots(structure, TEMCalculator.generate_points(-max_order, max_order))
         except Exception as exc:
             self.set_status(f"Pymatgen TEM calculation failed: {exc}")
-            return np.empty((0, 6), dtype=float)
+            return None
 
-        threshold = self.current_spot_intensity_threshold()
-        rows = [[0.0, 0.0, 1.0, 0, 0, 0]]
-        normal = normalize_vector(view_vector)
-        if normal is None:
-            normal = normalize_vector(direction_to_cart(zone_axis, model))
-        if normal is None:
-            normal = np.array([1.0, 0.0, 0.0])
-        u_axis, v_axis = projection_basis(normal, roll)
-        detector_scale = self.current_detector_scale_mm_per_nm_inv()
-        compression = self.current_intensity_compression_factor()
-        for dot in dots:
-            h, k, l = (int(value) for value in dot.hkl)
-            if h == k == l == 0:
-                continue
-            raw_intensity = max(float(dot.intensity), 0.0)
-            display_intensity = math.log1p(compression * raw_intensity) / math.log1p(compression)
-            if display_intensity <= threshold:
-                continue
-            g_vector = np.array([h, k, l], dtype=float) @ model.reciprocal
-            x_coord = detector_scale * float(np.dot(g_vector, u_axis))
-            y_coord = detector_scale * float(np.dot(g_vector, v_axis))
-            rows.append(
-                [
-                    x_coord,
-                    y_coord,
-                    display_intensity,
-                    h,
-                    k,
-                    l,
-                ]
-            )
-        return np.array(rows, dtype=float)
+        rows = [[int(dot.hkl[0]), int(dot.hkl[1]), int(dot.hkl[2]), max(float(dot.intensity), 0.0)] for dot in dots]
+        reflections = np.array(rows, dtype=float) if rows else np.empty((0, 4), dtype=float)
+        self.pymatgen_tem_cache[cache_key] = reflections
+        self.trim_cache(self.pymatgen_tem_cache, 128)
+        return reflections
+
+    def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
+        zone_axis = integer_zone_axis_from_view(model, view_vector)
+        reflections = self.pymatgen_tem_reflections(model, zone_axis)
+        if reflections is None:
+            return np.empty((0, 6), dtype=float)
+        if not len(reflections):
+            return np.array([[0.0, 0.0, 1.0, 0, 0, 0]], dtype=float)
+
+        try:
+            hkl = reflections[:, :3].astype(int)
+            raw_intensity = reflections[:, 3].astype(float)
+            threshold = self.current_spot_intensity_threshold()
+            normal = normalize_vector(view_vector)
+            if normal is None:
+                normal = normalize_vector(direction_to_cart(zone_axis, model))
+            if normal is None:
+                normal = np.array([1.0, 0.0, 0.0])
+            u_axis, v_axis = projection_basis(normal, roll)
+            detector_scale = self.current_detector_scale_mm_per_nm_inv()
+            compression = self.current_intensity_compression_factor()
+            display_intensity = np.log1p(compression * np.maximum(raw_intensity, 0.0)) / math.log1p(compression)
+            nonzero = ~np.all(hkl == 0, axis=1)
+            visible = (display_intensity > threshold) & nonzero
+            g_vectors = hkl[visible].astype(float) @ model.reciprocal
+            rows = [[0.0, 0.0, 1.0, 0, 0, 0]]
+            if len(g_vectors):
+                x_coord = detector_scale * (g_vectors @ u_axis)
+                y_coord = detector_scale * (g_vectors @ v_axis)
+                rows.extend(
+                    np.column_stack(
+                        (
+                            x_coord,
+                            y_coord,
+                            display_intensity[visible],
+                            hkl[visible, 0],
+                            hkl[visible, 1],
+                            hkl[visible, 2],
+                        )
+                    ).tolist()
+                )
+            return np.array(rows, dtype=float)
+        except Exception as exc:
+            self.set_status(f"Pymatgen TEM projection failed: {exc}")
+            return np.empty((0, 6), dtype=float)
 
     def compute_ewald_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
         hkl, reciprocal_points, structure_intensity = self.reciprocal_points_for_model(model)
@@ -5443,6 +5641,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
 
     def reciprocal_points_for_model(self, model: CrystalModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         max_order = self.current_max_hkl()
+        cache_key = (crystal_model_key(model), max_order)
+        cached = self.reciprocal_table_cache.get(cache_key)
+        if cached is not None:
+            return cached
         hkl_values = []
         reciprocal_points = []
         intensities = []
@@ -5459,11 +5661,14 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             hkl_values.append([h, k, l])
             reciprocal_points.append(g_vector)
             intensities.append(intensity)
-        return (
+        table = (
             np.array(hkl_values, dtype=int),
             np.array(reciprocal_points, dtype=float),
             np.array(intensities, dtype=float),
         )
+        self.reciprocal_table_cache[cache_key] = table
+        self.trim_cache(self.reciprocal_table_cache, 64)
+        return table
 
 
 @ui.page("/")
