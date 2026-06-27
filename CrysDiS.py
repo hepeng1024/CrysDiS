@@ -8,7 +8,9 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import warnings
@@ -45,6 +47,57 @@ def default_export_dir() -> Path:
     if downloads_dir.exists() and downloads_dir.is_dir():
         return downloads_dir / "CrysDiS"
     return app_data_dir() / "exports"
+
+
+def normalize_export_path(path_text: str) -> Path:
+    cleaned = str(path_text or "").strip().strip('"').strip("'")
+    return Path(os.path.expandvars(os.path.expanduser(cleaned)))
+
+
+def system_export_folder_dialog(start_dir: Path) -> tuple[Path | None, bool]:
+    start_dir = Path(start_dir).expanduser()
+    if sys.platform.startswith("linux"):
+        linux_dialogs = [
+            ("zenity", ["zenity", "--file-selection", "--directory", "--filename", f"{start_dir}{os.sep}"]),
+            ("kdialog", ["kdialog", "--getexistingdirectory", str(start_dir)]),
+            ("yad", ["yad", "--file-selection", "--directory", "--filename", f"{start_dir}{os.sep}"]),
+        ]
+        for executable, command in linux_dialogs:
+            if shutil.which(executable) is None:
+                continue
+            try:
+                result = subprocess.run(command, capture_output=True, text=True)
+            except OSError:
+                continue
+            folder_text = result.stdout.strip()
+            if result.returncode == 0 and folder_text:
+                return normalize_export_path(folder_text), True
+            if result.returncode != 0 and result.stderr.strip():
+                continue
+            return None, True
+
+    if sys.platform.startswith(("linux", "darwin", "win")):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+            except tk.TclError:
+                pass
+            folder_text = filedialog.askdirectory(
+                initialdir=str(start_dir),
+                title="Choose CrysDiS export folder",
+                mustexist=False,
+            )
+            root.destroy()
+            return (normalize_export_path(folder_text), True) if folder_text else (None, True)
+        except Exception:
+            return None, False
+
+    return None, False
 
 
 def is_frozen_app() -> bool:
@@ -5046,34 +5099,74 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def export_dir_text(self) -> str:
         return str(self.ensure_export_dir())
 
-    async def choose_export_folder(self, label: Any | None = None) -> None:
-        window = app.native.main_window
-        if window is None:
-            ui.notify(f"Export folder: {self.export_dir_text()}", type="info")
-            return
+    def set_export_folder(self, folder: Path, label: Any | None = None) -> bool:
         try:
-            import webview
-
-            dialog_type = webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG
-            result = await window.create_file_dialog(dialog_type=dialog_type, directory=str(self.ensure_export_dir()))
-        except Exception as exc:
-            ui.notify(f"Could not open folder picker: {exc}", type="negative")
-            return
-        if not result:
-            ui.notify("Export cancelled", type="info")
-            self.set_status("Export cancelled")
-            return
-        folder = Path(result[0] if isinstance(result, (list, tuple)) else result)
-        try:
+            folder = Path(folder).expanduser()
             folder.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             ui.notify(f"Could not use export folder: {exc}", type="negative")
-            return
+            return False
         self.selected_export_dir = folder
         if label is not None:
             label.text = f"Export folder: {folder}"
             label.update()
         self.set_status(f"Export folder: {folder}")
+        ui.notify(f"Export folder: {folder}", type="positive")
+        return True
+
+    def open_export_folder_path_dialog(self, label: Any | None = None) -> None:
+        dialog = ui.dialog()
+        with dialog, ui.card().classes("download-card"):
+            with ui.row().classes("items-center justify-between full-width"):
+                ui.label("Choose export folder").classes("text-h6")
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense").tooltip("Close")
+            ui.label(
+                "Enter a folder path for Linux browser mode. The folder will be created if it does not exist."
+            ).classes("text-caption text-grey-4")
+            path_input = ui.input("Folder path", value=self.export_dir_text()).props("outlined dense").classes("full-width")
+
+            def apply_path() -> None:
+                path_text = str(path_input.value or "").strip()
+                if not path_text:
+                    ui.notify("Enter a folder path", type="warning")
+                    return
+                if self.set_export_folder(normalize_export_path(path_text), label):
+                    dialog.close()
+
+            path_input.on("keydown.enter", lambda _: apply_path())
+            with ui.row().classes("justify-end full-width"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                ui.button("Use folder", icon="folder_open", on_click=apply_path).props("unelevated dense")
+        dialog.open()
+
+    async def choose_export_folder(self, label: Any | None = None) -> None:
+        window = app.native.main_window
+        if window is not None:
+            try:
+                import webview
+
+                dialog_type = webview.FileDialog.FOLDER if hasattr(webview, "FileDialog") else webview.FOLDER_DIALOG
+                result = await window.create_file_dialog(dialog_type=dialog_type, directory=str(self.ensure_export_dir()))
+            except Exception as exc:
+                ui.notify(f"Could not open folder picker: {exc}", type="warning")
+            else:
+                if not result:
+                    ui.notify("Export cancelled", type="info")
+                    self.set_status("Export cancelled")
+                    return
+                folder = Path(result[0] if isinstance(result, (list, tuple)) else result)
+                self.set_export_folder(folder, label)
+                return
+
+        folder, picker_was_shown = await asyncio.to_thread(system_export_folder_dialog, self.ensure_export_dir())
+        if folder is not None:
+            self.set_export_folder(folder, label)
+            return
+        if picker_was_shown:
+            ui.notify("Export cancelled", type="info")
+            self.set_status("Export cancelled")
+            return
+        self.open_export_folder_path_dialog(label)
 
     def save_exported_image(self, image_bytes: bytes, filename: str) -> Path:
         path = self.ensure_export_dir() / filename
