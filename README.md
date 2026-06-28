@@ -22,27 +22,27 @@ https://crysdis.onrender.com
 
 ## Download Desktop Packages
 
-Desktop packages are available from the GitHub **Releases** page. For version `v0.1.1`, download the file matching your operating system.
+Desktop packages are available from the GitHub **Releases** page. For version `v0.1.2`, download the file matching your operating system.
 
 Suggested release assets:
 
 ```text
-CrysDiS-Windows-v0.1.1.zip
-CrysDiS-Linux-v0.1.0.tar.gz
-CrysDiS-macOS-arm64-v0.1.1.zip
+CrysDiS-Windows-v0.1.2.zip
+CrysDiS-Linux-v0.1.2.tar.gz
+CrysDiS-macOS-arm64-v0.1.2.zip
 ```
 
 Optional tkinter version:
 
 ```text
-CrysDiS_tkinter-Windows-v0.1.0.zip
-CrysDiS_tkinter-Linux-v0.1.0.tar.gz
-CrysDiS_tkinter-macOS-arm64-v0.1.0.zip
+CrysDiS_tkinter-Windows-v0.1.2.zip
+CrysDiS_tkinter-Linux-v0.1.2.tar.gz
+CrysDiS_tkinter-macOS-arm64-v0.1.2.zip
 ```
 
 ### Windows
 
-1. Download `CrysDiS-Windows-v0.1.1.zip`.
+1. Download `CrysDiS-Windows-v0.1.2.zip`.
 2. Before extracting, right-click the zip file → Properties → General → Unblock → Apply → OK.
 3. Extract/unzip the folder.
 4. Open the extracted `CrysDiS` folder.
@@ -54,11 +54,11 @@ CrysDiS.exe
 
 ### Linux
 
-1. Download `CrysDiS-Linux-v0.1.0.tar.gz`.
+1. Download `CrysDiS-Linux-v0.1.2.tar.gz`.
 2. Extract it:
 
 ```bash
-tar -xzf CrysDiS-Linux-v0.1.0.tar.gz
+tar -xzf CrysDiS-Linux-v0.1.2.tar.gz
 cd CrysDiS
 ```
 
@@ -78,7 +78,7 @@ After installing the launcher, search for **CrysDiS** in your Linux application 
 
 ### macOS
 
-1. Download `CrysDiS-macOS-arm64-v0.1.1.zip`.
+1. Download `CrysDiS-macOS-arm64-v0.1.2.zip`.
 2. Unzip it.
 3. Double-click:
 
