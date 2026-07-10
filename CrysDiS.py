@@ -43,10 +43,7 @@ def app_data_dir() -> Path:
 
 
 def default_export_dir() -> Path:
-    downloads_dir = Path.home() / "Downloads"
-    if downloads_dir.exists() and downloads_dir.is_dir():
-        return downloads_dir / "CrysDiS"
-    return app_data_dir() / "exports"
+    return Path.home() / "Downloads"
 
 
 def normalize_export_path(path_text: str) -> Path:
@@ -165,6 +162,10 @@ CAMERA_LENGTH_OPTIONS = ("80 mm", "100 mm", "150 mm", "200 mm", "300 mm", "500 m
 REAL_SCENE_FOV_DEGREES = 1.0
 REAL_SCENE_FIT_FRACTION = 0.9
 REAL_SCENE_ASPECT = 440.0 / 280.0
+REAL_SCENE_ATOM_RADIUS = 0.072
+REAL_SCENE_ATOM_MIN_RADIUS_SCALE = 0.38
+REAL_SCENE_ATOM_SPACING_FRACTION = 0.35
+CRYSTAL_EXPORT_ATOM_MARKER_SIZE = 160.0
 IDEAL_HCP_CA = math.sqrt(8.0 / 3.0)
 SYMMETRY_SITE_TOL = 5e-3
 
@@ -430,6 +431,7 @@ class CrystalModel:
     display_origin: np.ndarray
     display_edges: list[tuple[np.ndarray, np.ndarray]]
     display_atoms: list[DisplayAtom]
+    atom_radius_scale: float
     scale_nm: float
     limit: float
 
@@ -791,6 +793,26 @@ def fractional_to_display(frac: np.ndarray, lattice: np.ndarray, center: np.ndar
     return (frac @ lattice - center) / scale_nm
 
 
+def occupancy_radius_factor(occupancy: float) -> float:
+    return 0.45 + 0.55 * max(float(occupancy), 0.12) ** (1.0 / 3.0)
+
+
+def atom_radius_scale_for_display(atoms: list[DisplayAtom]) -> float:
+    if len(atoms) < 2:
+        return 1.0
+    positions = np.array([atom.position for atom in atoms], dtype=float)
+    nearest_spacing = math.inf
+    for index, position in enumerate(positions[:-1]):
+        distances = np.linalg.norm(positions[index + 1 :] - position, axis=1)
+        distances = distances[distances > 1e-6]
+        if len(distances):
+            nearest_spacing = min(nearest_spacing, float(np.min(distances)))
+    if not math.isfinite(nearest_spacing):
+        return 1.0
+    spacing_scale = nearest_spacing * REAL_SCENE_ATOM_SPACING_FRACTION / REAL_SCENE_ATOM_RADIUS
+    return min(1.0, max(REAL_SCENE_ATOM_MIN_RADIUS_SCALE, spacing_scale))
+
+
 def mixed_occupancy_display_sites(sites: list[AtomicSite], tolerance: float = 1e-6) -> list[AtomicSite]:
     grouped: dict[tuple[int, int, int], list[AtomicSite]] = {}
     for site in sites:
@@ -885,6 +907,7 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
     all_points = [point for edge in display_edges for point in edge]
     all_points.extend(atom.position for atom in display_atoms)
     limit = max(1.25, float(np.max(np.abs(np.array(all_points)))) * 1.35 if all_points else 1.25)
+    atom_radius_scale = atom_radius_scale_for_display(display_atoms)
     return CrystalModel(
         definition=definition,
         expanded_sites=model_sites,
@@ -894,6 +917,7 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
         display_origin=display_origin,
         display_edges=display_edges,
         display_atoms=display_atoms,
+        atom_radius_scale=atom_radius_scale,
         scale_nm=scale_nm,
         limit=limit,
     )
@@ -2575,8 +2599,8 @@ class PanelController:
         atom_edge_color = (0.0, 0.0, 0.0, 0.28) if transparent_background else "#0B0F14"
         for atom in atoms:
             x, y = project(atom.position)
-            radius_factor = 0.45 + 0.55 * max(atom.occupancy, 0.12) ** (1.0 / 3.0)
-            size = 160.0 * radius_factor * radius_factor
+            radius_factor = model.atom_radius_scale * occupancy_radius_factor(atom.occupancy)
+            size = CRYSTAL_EXPORT_ATOM_MARKER_SIZE * radius_factor * radius_factor
             ax.scatter(
                 [x],
                 [y],
@@ -2990,7 +3014,7 @@ class PanelController:
                     self.scene.line(start.tolist(), end.tolist()).material(color="#7A8796", opacity=0.72)
 
                 for atom in model.display_atoms:
-                    radius = 0.072 * (0.45 + 0.55 * max(atom.occupancy, 0.12) ** (1.0 / 3.0))
+                    radius = REAL_SCENE_ATOM_RADIUS * model.atom_radius_scale * occupancy_radius_factor(atom.occupancy)
                     self.scene.sphere(radius=radius, width_segments=32, height_segments=16).move(*atom.position.tolist()).material(
                         color=color_for_site(atom), opacity=0.58 + 0.42 * atom.occupancy
                     )
@@ -3870,7 +3894,7 @@ class SimulatorApp:
             ui.button("Advanced", icon="tune", on_click=lambda: self.advanced_dialog.open()).props("flat dense")
             ui.button("Crystal list", icon="format_list_bulleted", on_click=self.open_crystal_list).props("flat dense")
             ui.button("Load CIF", icon="upload_file", on_click=lambda: self.cif_dialog.open()).props("flat dense")
-            ui.button("Crystal builder", icon="add_box", on_click=lambda: self.builder.open(mode="new")).props("flat dense")
+            ui.button("New crystal", icon="add_box", on_click=lambda: self.builder.open(mode="new")).props("flat dense")
             self.add_combo_button = ui.button(
                 "Add combo panel",
                 icon="join_inner",
