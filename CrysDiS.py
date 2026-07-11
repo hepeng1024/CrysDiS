@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from nicegui import app, native, ui
+from nicegui import app, core, native, ui
 
 
 try:
@@ -178,98 +178,145 @@ LATTICE_SYSTEMS = [
     "triclinic",
 ]
 
-ELEMENTS = [
-    "Ag",
-    "Al",
-    "As",
-    "Au",
-    "Bi",
+FALLBACK_ELEMENTS = [
+    "H",
+    "He",
+    "Li",
+    "Be",
+    "B",
     "C",
-    "Cd",
-    "Co",
-    "Cr",
-    "Cu",
-    "Fe",
-    "Ga",
-    "Ge",
-    "Hf",
-    "Hg",
-    "In",
-    "Ir",
-    "Mg",
-    "Mn",
-    "Mo",
     "N",
-    "Nb",
-    "Ni",
     "O",
-    "Os",
-    "Pb",
-    "Pd",
-    "Pt",
-    "Re",
-    "Rh",
-    "Ru",
-    "Sb",
-    "Sc",
+    "F",
+    "Ne",
+    "Na",
+    "Mg",
+    "Al",
     "Si",
-    "Sn",
-    "Ta",
-    "Te",
+    "P",
+    "S",
+    "Cl",
+    "Ar",
+    "K",
+    "Ca",
+    "Sc",
     "Ti",
     "V",
-    "W",
-    "Y",
+    "Cr",
+    "Mn",
+    "Fe",
+    "Co",
+    "Ni",
+    "Cu",
     "Zn",
+    "Ga",
+    "Ge",
+    "As",
+    "Se",
+    "Br",
+    "Kr",
+    "Rb",
+    "Sr",
+    "Y",
     "Zr",
+    "Nb",
+    "Mo",
+    "Tc",
+    "Ru",
+    "Rh",
+    "Pd",
+    "Ag",
+    "Cd",
+    "In",
+    "Sn",
+    "Sb",
+    "Te",
+    "I",
+    "Xe",
+    "Cs",
+    "Ba",
+    "La",
+    "Ce",
+    "Pr",
+    "Nd",
+    "Pm",
+    "Sm",
+    "Eu",
+    "Gd",
+    "Tb",
+    "Dy",
+    "Ho",
+    "Er",
+    "Tm",
+    "Yb",
+    "Lu",
+    "Hf",
+    "Ta",
+    "W",
+    "Re",
+    "Os",
+    "Ir",
+    "Pt",
+    "Au",
+    "Hg",
+    "Tl",
+    "Pb",
+    "Bi",
+    "Po",
+    "At",
+    "Rn",
+    "Fr",
+    "Ra",
+    "Ac",
+    "Th",
+    "Pa",
+    "U",
+    "Np",
+    "Pu",
+    "Am",
+    "Cm",
+    "Bk",
+    "Cf",
+    "Es",
+    "Fm",
+    "Md",
+    "No",
+    "Lr",
+    "Rf",
+    "Db",
+    "Sg",
+    "Bh",
+    "Hs",
+    "Mt",
+    "Ds",
+    "Rg",
+    "Cn",
+    "Nh",
+    "Fl",
+    "Mc",
+    "Lv",
+    "Ts",
+    "Og",
 ]
 
-FALLBACK_ATOMIC_NUMBERS = {
-    "H": 1,
-    "Ag": 47,
-    "C": 6,
-    "N": 7,
-    "O": 8,
-    "Al": 13,
-    "As": 33,
-    "Au": 79,
-    "Bi": 83,
-    "Cd": 48,
-    "Co": 27,
-    "Cr": 24,
-    "Cu": 29,
-    "Fe": 26,
-    "Ga": 31,
-    "Ge": 32,
-    "Hf": 72,
-    "Hg": 80,
-    "In": 49,
-    "Ir": 77,
-    "Mg": 12,
-    "Mn": 25,
-    "Mo": 42,
-    "Nb": 41,
-    "Ni": 28,
-    "Os": 76,
-    "Pb": 82,
-    "Pd": 46,
-    "Pt": 78,
-    "Re": 75,
-    "Rh": 45,
-    "Ru": 44,
-    "Sb": 51,
-    "Sc": 21,
-    "Si": 14,
-    "Sn": 50,
-    "Ta": 73,
-    "Te": 52,
-    "Ti": 22,
-    "V": 23,
-    "W": 74,
-    "Y": 39,
-    "Zn": 30,
-    "Zr": 40,
-}
+
+def elements_from_periodictable() -> list[str]:
+    try:
+        import periodictable
+    except Exception:
+        return FALLBACK_ELEMENTS.copy()
+    symbols: list[str] = []
+    for element in periodictable.elements:
+        number = getattr(element, "number", None)
+        symbol = str(getattr(element, "symbol", "") or "")
+        if number and 1 <= int(number) <= 118 and re.fullmatch(r"[A-Z][a-z]?", symbol):
+            symbols.append(symbol)
+    return symbols or FALLBACK_ELEMENTS.copy()
+
+
+ELEMENTS = elements_from_periodictable()
+
+FALLBACK_ATOMIC_NUMBERS = {symbol: number for number, symbol in enumerate(FALLBACK_ELEMENTS, start=1)}
 
 
 def atomic_numbers_from_periodictable(symbols: list[str]) -> dict[str, int]:
@@ -463,6 +510,7 @@ class PanelState:
     view_vector: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0]))
     roll: float = 0.0
     applied_zone_text: str = ""
+    magnified: bool = False
 
 
 @dataclass
@@ -471,6 +519,7 @@ class ComboPanelState:
     source_panel_ids: list[int] = field(default_factory=list)
     selected_panel_id: int | None = None
     bind_motion: bool = False
+    magnified: bool = False
 
 
 def atomic_site_from_dict(data: dict[str, Any]) -> AtomicSite:
@@ -705,7 +754,8 @@ def normalize_text(text: str) -> str:
 
 def compact_label(values: tuple[int, ...], bracket: str) -> str:
     left, right = ("[", "]") if bracket == "direction" else ("(", ")")
-    return left + "".join(str(value) for value in values) + right
+    separator = " " if any(abs(value) >= 10 for value in values) else ""
+    return left + separator.join(str(value) for value in values) + right
 
 
 def zone_axis_direction_label(values: tuple[int, ...]) -> str:
@@ -2290,9 +2340,14 @@ class CrystalBuilder:
         with self.site_container:
             for index, site in enumerate(sites or [AtomicSite("Ni", 0.0, 0.0, 0.0, 1.0, "")]):
                 with ui.row().classes("site-row"):
-                    element = ui.select(ELEMENTS, label="Atom", value=site.element, with_input=True, new_value_mode="add-unique").props(
-                        "outlined dense"
-                    )
+                    element_options = ELEMENTS if site.element in ELEMENTS else [*ELEMENTS, site.element]
+                    element = ui.select(
+                        element_options,
+                        label="Atom",
+                        value=site.element,
+                        with_input=True,
+                        new_value_mode="add-unique",
+                    ).props("outlined dense")
                     x = ui.number("x", value=site.x, step=0.01).props("outlined dense")
                     y = ui.number("y", value=site.y, step=0.01).props("outlined dense")
                     z = ui.number("z", value=site.z, step=0.01).props("outlined dense")
@@ -2364,7 +2419,7 @@ class CrystalBuilder:
             ui.notify(str(exc), type="negative")
             return
         self.simulator.set_status(f"Saved edited structure {saved.name} to {self.scope_select.value}")
-        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id)
+        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id, force_default_color=True)
         self.simulator.refresh_crystal_list()
         self.dialog.close()
 
@@ -2376,7 +2431,7 @@ class CrystalBuilder:
             ui.notify(str(exc), type="negative")
             return
         self.simulator.set_status(f"Saved new structure {saved.name} to {self.scope_select.value}")
-        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id)
+        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id, force_default_color=True)
         self.simulator.refresh_crystal_list()
         self.dialog.close()
 
@@ -2395,6 +2450,7 @@ class PanelController:
         self.rotation_input = None
         self.download_dialog = None
         self.close_button = None
+        self.magnify_button = None
         self.scale_bar_line = None
         self.scale_bar_label = None
         self.scale_bar_container = None
@@ -2403,7 +2459,10 @@ class PanelController:
         self.scene_signature: tuple[Any, ...] | None = None
 
     def build(self) -> None:
-        with ui.card().classes(f"comparison-panel comparison-panel-{self.state.panel_id}") as self.card:
+        card_classes = f"comparison-panel comparison-panel-{self.state.panel_id}"
+        if self.state.magnified:
+            card_classes += " panel-magnified"
+        with ui.card().classes(card_classes) as self.card:
             with ui.element("div").classes("panel-toolbar"):
                 ui.label(str(self.state.panel_id)).classes("panel-number")
                 self.crystal_select = ui.select(
@@ -2443,6 +2502,10 @@ class PanelController:
                 ui.button(icon="edit", on_click=self.open_builder).props("flat round dense").classes("panel-edit-button").tooltip(
                     "Edit crystal"
                 )
+                self.magnify_button = ui.button(
+                    icon=self.magnify_icon(),
+                    on_click=self.toggle_magnified,
+                ).props("flat round dense").classes("panel-magnify-button").tooltip("Magnify/shrink panel")
                 self.close_button = ui.button(
                     icon="close",
                     on_click=lambda: self.simulator.remove_panel(self.state.panel_id),
@@ -2465,6 +2528,39 @@ class PanelController:
 
         self.apply(initial=True)
         self.update_close_button()
+        self.update_magnify_button()
+
+    def magnify_icon(self) -> str:
+        return "close_fullscreen" if self.state.magnified else "open_in_full"
+
+    def update_magnify_button(self) -> None:
+        if self.magnify_button is None:
+            return
+        self.magnify_button.props(f"icon={self.magnify_icon()}")
+        self.magnify_button.update()
+
+    def toggle_magnified(self) -> None:
+        self.state.magnified = not self.state.magnified
+        if self.card is not None:
+            if self.state.magnified:
+                self.card.classes(add="panel-magnified")
+            else:
+                self.card.classes(remove="panel-magnified")
+        self.update_magnify_button()
+        self.resize_scene_after_layout()
+
+    def resize_scene_after_layout(self) -> None:
+        if self.scene is None or not core.is_loop_running():
+            return
+        ui.run_javascript(
+            f"""
+            const resizeCrystalScene = () => getElement({self.scene.id})?.resize?.();
+            requestAnimationFrame(() => {{
+                resizeCrystalScene();
+                setTimeout(resizeCrystalScene, 120);
+            }});
+            """
+        )
 
     def update_close_button(self) -> None:
         if self.close_button is None:
@@ -3447,10 +3543,14 @@ class ComboPanelController:
         self.diffraction = None
         self.download_dialog = None
         self.bind_checkbox = None
+        self.magnify_button = None
 
     def build(self) -> None:
         self.simulator.repair_combo_sources(self.state)
-        with ui.card().classes(f"comparison-panel combo-panel combo-panel-{self.state.combo_id}") as self.card:
+        card_classes = f"comparison-panel combo-panel combo-panel-{self.state.combo_id}"
+        if self.state.magnified:
+            card_classes += " panel-magnified"
+        with ui.card().classes(card_classes) as self.card:
             with ui.element("div").classes("combo-toolbar"):
                 ui.label(f"C{self.state.combo_id}").classes("combo-number")
                 options = self.source_options()
@@ -3475,6 +3575,10 @@ class ComboPanelController:
                 ui.button(icon="photo_camera", on_click=self.open_download_dialog).props("flat round dense").classes(
                     "combo-download-button"
                 ).tooltip("Download combo diffraction")
+                self.magnify_button = ui.button(
+                    icon=self.magnify_icon(),
+                    on_click=self.toggle_magnified,
+                ).props("flat round dense").classes("combo-magnify-button").tooltip("Magnify/shrink panel")
                 ui.button(icon="close", on_click=lambda: self.simulator.remove_combo_panel(self.state.combo_id)).props(
                     "flat round dense"
                 ).classes("panel-close-button").tooltip("Remove combo panel")
@@ -3484,6 +3588,25 @@ class ComboPanelController:
                 self.diffraction = ui.plotly(empty_diffraction_figure()).classes("diffraction-plot combo-diffraction-plot")
 
         self.refresh()
+        self.update_magnify_button()
+
+    def magnify_icon(self) -> str:
+        return "close_fullscreen" if self.state.magnified else "open_in_full"
+
+    def update_magnify_button(self) -> None:
+        if self.magnify_button is None:
+            return
+        self.magnify_button.props(f"icon={self.magnify_icon()}")
+        self.magnify_button.update()
+
+    def toggle_magnified(self) -> None:
+        self.state.magnified = not self.state.magnified
+        if self.card is not None:
+            if self.state.magnified:
+                self.card.classes(add="panel-magnified")
+            else:
+                self.card.classes(remove="panel-magnified")
+        self.update_magnify_button()
 
     def open_download_dialog(self) -> None:
         self.download_dialog = ui.dialog()
@@ -3896,7 +4019,11 @@ class SimulatorApp:
             ui.button("Advanced", icon="tune", on_click=lambda: self.advanced_dialog.open()).props("flat dense")
             ui.button("Crystal list", icon="format_list_bulleted", on_click=self.open_crystal_list).props("flat dense")
             ui.button("Load CIF", icon="upload_file", on_click=lambda: self.cif_dialog.open()).props("flat dense")
-            ui.button("New crystal", icon="add_box", on_click=lambda: self.builder.open(mode="new")).props("flat dense")
+            ui.button(
+                "New crystal",
+                icon="add_box",
+                on_click=lambda: self.builder.open(target_panel_id=self.latest_panel_id(), mode="new"),
+            ).props("flat dense")
             self.add_combo_button = ui.button(
                 "Add combo panel",
                 icon="join_inner",
@@ -4129,13 +4256,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         state.diffraction_color = color
         return color
 
-    def set_panel_crystal(self, state: PanelState, crystal_name: str) -> None:
+    def set_panel_crystal(self, state: PanelState, crystal_name: str, force_default_color: bool = False) -> None:
         selected_name = str(crystal_name or state.crystal_name)
         if selected_name == CUSTOM_SENTINEL:
             return
         old_default = self.default_diffraction_color_for_crystal(state.crystal_name)
         current_color = self.normalize_palette_color(state.diffraction_color, old_default)
-        if selected_name != state.crystal_name and current_color == old_default:
+        if force_default_color or (selected_name != state.crystal_name and current_color == old_default):
             state.diffraction_color = self.default_diffraction_color_for_crystal(selected_name)
         else:
             state.diffraction_color = current_color
@@ -4346,7 +4473,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self.clear_scientific_caches()
         for state in self.panel_states:
             if state.crystal_name == name:
-                self.set_panel_crystal(state, "FCC")
+                self.set_panel_crystal(state, "FCC", force_default_color=True)
                 state.zone_text = "100"
                 state.applied_zone_text = ""
                 state.view_vector = np.array([1.0, 0.0, 0.0])
@@ -4376,7 +4503,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-        self.refresh_library(saved.name)
+        self.refresh_library(saved.name, target_panel_id=self.latest_panel_id(), force_default_color=True)
         self.refresh_crystal_list()
         self.set_status(f"Loaded CIF: {saved.name}")
         ui.notify(f"Loaded CIF: {saved.name}", type="positive")
@@ -4468,6 +4595,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 container-type: inline-size;
                 container-name: comparison-panel;
             }
+            .comparison-panel.panel-magnified {
+                grid-column: span 2;
+                --panel-visual-height: clamp(570px, calc(100vh - 240px), 720px);
+            }
             .combo-panel {
                 background: #151f2d;
                 border-color: rgba(130, 178, 245, 0.28);
@@ -4475,8 +4606,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .panel-toolbar {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 20px minmax(98px, 1.3fr) minmax(54px, 0.7fr) minmax(54px, 0.7fr) minmax(68px, 0.8fr) minmax(68px, 0.8fr) minmax(48px, auto) minmax(44px, auto) 24px 24px 20px;
-                grid-template-areas: "number crystal zone plane vector rotation apply sync download edit close";
+                grid-template-columns: 20px minmax(86px, 1.18fr) minmax(50px, 0.64fr) minmax(50px, 0.64fr) minmax(62px, 0.76fr) minmax(58px, 0.7fr) minmax(48px, auto) minmax(44px, auto) 24px 24px 24px 20px;
+                grid-template-areas: "number crystal zone plane vector rotation apply sync download edit magnify close";
                 gap: 2px;
                 align-items: center;
                 margin-bottom: 6px;
@@ -4531,6 +4662,12 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 height: 34px;
                 min-height: 34px;
             }
+            .panel-magnify-button {
+                grid-area: magnify;
+                width: 24px;
+                height: 34px;
+                min-height: 34px;
+            }
             .panel-apply-button {
                 grid-area: apply;
                 min-width: 48px;
@@ -4542,8 +4679,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .combo-toolbar {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 34px minmax(132px, 1fr) auto auto minmax(112px, auto) 30px 26px;
-                grid-template-areas: "combo-number combo-select combo-add combo-remove combo-bind combo-download combo-close";
+                grid-template-columns: 34px minmax(116px, 1fr) auto auto minmax(104px, auto) 30px 30px 26px;
+                grid-template-areas: "combo-number combo-select combo-add combo-remove combo-bind combo-download combo-magnify combo-close";
                 gap: 4px;
                 align-items: center;
                 margin-bottom: 6px;
@@ -4584,6 +4721,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .combo-download-button {
                 grid-area: combo-download;
+            }
+            .combo-magnify-button {
+                grid-area: combo-magnify;
             }
             .combo-toolbar .panel-close-button {
                 grid-area: combo-close;
@@ -5026,7 +5166,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
-                        "number apply sync download edit close";
+                        "number apply sync download edit magnify"
+                        "number close close close close close";
                 }
                 .panel-number {
                     height: 100%;
@@ -5037,12 +5178,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 .panel-apply-button,
                 .panel-sync-button,
                 .panel-download-button,
+                .panel-magnify-button,
                 .panel-edit-button,
                 .panel-toolbar .panel-close-button {
                     justify-self: start;
                 }
                 .combo-toolbar {
-                    grid-template-columns: 42px minmax(150px, 1fr) auto auto minmax(112px, auto) 30px 28px;
+                    grid-template-columns: 42px minmax(150px, 1fr) auto auto minmax(112px, auto) 30px 30px 28px;
                 }
             }
             @container comparison-panel (max-width: 500px) {
@@ -5054,7 +5196,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                         "number vector rotation"
                         "number apply sync"
                         "number download edit"
-                        "number close close";
+                        "number magnify close";
                 }
                 .panel-apply-button,
                 .panel-sync-button {
@@ -5063,16 +5205,17 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     justify-self: stretch;
                 }
                 .panel-download-button,
+                .panel-magnify-button,
                 .panel-edit-button,
                 .panel-toolbar .panel-close-button {
                     justify-self: start;
                 }
                 .combo-toolbar {
-                    grid-template-columns: 34px minmax(0, 1fr) 30px 28px;
+                    grid-template-columns: 34px minmax(0, 1fr) 30px 30px 28px;
                     grid-template-areas:
-                        "combo-number combo-select combo-download combo-close"
-                        "combo-number combo-add combo-remove ."
-                        "combo-number combo-bind combo-bind .";
+                        "combo-number combo-select combo-download combo-magnify combo-close"
+                        "combo-number combo-add combo-remove . ."
+                        "combo-number combo-bind combo-bind combo-bind .";
                 }
                 .combo-action-button {
                     width: 100%;
@@ -5084,7 +5227,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
-                        "number apply sync download edit close";
+                        "number apply sync download edit magnify"
+                        "number close close close close close";
                 }
                 .panel-number {
                     height: 100%;
@@ -5095,6 +5239,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 .panel-apply-button,
                 .panel-sync-button,
                 .panel-download-button,
+                .panel-magnify-button,
                 .panel-edit-button,
                 .panel-toolbar .panel-close-button {
                     justify-self: start;
@@ -5133,6 +5278,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 .panel-grid {
                     grid-template-columns: 1fr;
                 }
+                .comparison-panel.panel-magnified {
+                    grid-column: span 1;
+                    --panel-visual-height: 600px;
+                }
                 .app-shell {
                     --panel-visual-height: 300px;
                 }
@@ -5140,7 +5289,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
-                        "number apply sync download edit close";
+                        "number apply sync download edit magnify"
+                        "number close close close close close";
                 }
                 .panel-number {
                     height: 100%;
@@ -5151,12 +5301,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 .panel-apply-button,
                 .panel-sync-button,
                 .panel-download-button,
+                .panel-magnify-button,
                 .panel-edit-button,
                 .panel-toolbar .panel-close-button {
                     justify-self: start;
                 }
                 .combo-toolbar {
-                    grid-template-columns: 42px minmax(150px, 1fr) auto auto minmax(112px, auto) 30px 28px;
+                    grid-template-columns: 42px minmax(150px, 1fr) auto auto minmax(112px, auto) 30px 30px 28px;
                 }
                 .combo-toolbar .q-space {
                     display: none;
@@ -5167,6 +5318,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     width: calc(100vw - 16px);
                     margin-top: 5px;
                     --panel-visual-height: 230px;
+                }
+                .comparison-panel.panel-magnified {
+                    grid-column: span 1;
+                    --panel-visual-height: 460px;
                 }
                 .advanced-grid,
                 .builder-grid {
@@ -5180,7 +5335,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                         "number vector rotation"
                         "number apply sync"
                         "number download edit"
-                        "number close close";
+                        "number magnify close";
                 }
                 .panel-apply-button,
                 .panel-sync-button {
@@ -5189,6 +5344,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     justify-self: stretch;
                 }
                 .panel-download-button,
+                .panel-magnify-button,
                 .panel-edit-button,
                 .panel-toolbar .panel-close-button {
                     justify-self: start;
@@ -5214,11 +5370,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     overflow: visible;
                 }
                 .combo-toolbar {
-                    grid-template-columns: 34px minmax(0, 1fr) 30px 28px;
+                    grid-template-columns: 34px minmax(0, 1fr) 30px 30px 28px;
                     grid-template-areas:
-                        "combo-number combo-select combo-download combo-close"
-                        "combo-number combo-add combo-remove ."
-                        "combo-number combo-bind combo-bind .";
+                        "combo-number combo-select combo-download combo-magnify combo-close"
+                        "combo-number combo-add combo-remove . ."
+                        "combo-number combo-bind combo-bind combo-bind .";
                 }
                 .combo-action-button {
                     width: 100%;
@@ -5542,8 +5698,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def add_panel(self) -> None:
         defaults = [
             ("FCC", "100", "", ""),
-            ("BCC", "110", "", ""),
-            ("HCP", "0001", "", ""),
+            ("BCC", "100", "", ""),
+            ("HCP", "100", "", ""),
         ]
         crystal, zone, plane, vector = defaults[(self.next_panel_id - 1) % len(defaults)]
         state = PanelState(
@@ -5669,15 +5825,29 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             return self.panel_states[0] if self.panel_states else None
         return next((state for state in self.panel_states if state.panel_id == panel_id), None)
 
-    def refresh_library(self, selected_name: str, target_panel_id: int | None = None) -> None:
+    def latest_panel_id(self) -> int | None:
+        if not self.panel_states:
+            return None
+        return max(self.panel_states, key=lambda state: state.panel_id).panel_id
+
+    def refresh_library(
+        self,
+        selected_name: str,
+        target_panel_id: int | None = None,
+        force_default_color: bool = False,
+    ) -> None:
         self.model_cache.clear()
         self.clear_scientific_caches()
         for state in self.panel_states:
             if state.crystal_name == CUSTOM_SENTINEL or state.crystal_name not in self.library.definitions:
-                self.set_panel_crystal(state, selected_name)
+                self.set_panel_crystal(state, selected_name, force_default_color=True)
         target = self.panel_state_by_id(target_panel_id)
         if target is not None:
-            self.set_panel_crystal(target, selected_name)
+            self.set_panel_crystal(target, selected_name, force_default_color=force_default_color)
+        if force_default_color:
+            for state in self.panel_states:
+                if state.crystal_name == selected_name:
+                    state.diffraction_color = self.default_diffraction_color_for_crystal(selected_name)
         self.build_panels()
 
     def refresh_diffractions(self, clear_cache: bool = False) -> None:
