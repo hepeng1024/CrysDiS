@@ -2927,7 +2927,7 @@ class PanelController:
         old_view = self.state.view_vector.copy()
         old_roll = float(self.state.roll)
         if self.crystal_select is not None and self.crystal_select.value != CUSTOM_SENTINEL:
-            self.state.crystal_name = self.crystal_select.value or self.state.crystal_name
+            self.simulator.set_panel_crystal(self.state, self.crystal_select.value or self.state.crystal_name)
         self.state.zone_text = self.zone_input.value if self.zone_input is not None else self.state.zone_text
         self.state.plane_text = self.plane_input.value if self.plane_input is not None else self.state.plane_text
         self.state.vector_text = self.vector_input.value if self.vector_input is not None else self.state.vector_text
@@ -3293,7 +3293,7 @@ class PanelController:
             return
         model = model or self.simulator.model_for(self.state.crystal_name)
         spots = self.simulator.diffraction_spots_for_state(self.state, model)
-        spot_color = dominant_color(model.definition)
+        spot_color = self.simulator.diffraction_color_for_state(self.state)
         limit = self.simulator.current_diffraction_limit()
         zone_label = (
             zone_axis_label_from_view(
@@ -3747,7 +3747,7 @@ class ComboPanelController:
             if not len(spots):
                 continue
             intensity = spots[:, 2]
-            spot_color = dominant_color(model.definition)
+            spot_color = self.simulator.diffraction_color_for_state(source)
             size_scaling = self.simulator.current_spot_size_scaling_effect()
             marker_size = BASE_DIFFRACTION_MARKER_SIZE + EXTRA_DIFFRACTION_MARKER_SIZE * size_scaling * intensity**1.18
             labels = []
@@ -3843,6 +3843,8 @@ class SimulatorApp:
         self.palette_dialog = None
         self.palette_vector_container = None
         self.palette_plane_container = None
+        self.diffraction_color_dialog = None
+        self.diffraction_color_container = None
         self.cif_dialog = None
         self.crystal_list_dialog = None
         self.crystal_list_container = None
@@ -3951,7 +3953,7 @@ Compare a real-space crystal view with its electron diffraction pattern. Each or
 ### Crystals
 - Built-in examples include FCC Ni, BCC Fe, and HCP Mg.
 - `Load CIF` imports structures from `.cif` files.
-- `Crystal builder` lets you create or edit custom structures, set symmetry, lattice parameters, atom sites, occupancies, and atom colors.
+- `New Crystal` lets you create or edit custom structures, set symmetry, lattice parameters, atom sites, occupancies, and atom colors.
 - `Crystal list` lets you review, edit, or delete available structures.
 
 ### Indices and vectors
@@ -3963,7 +3965,7 @@ Compare a real-space crystal view with its electron diffraction pattern. Each or
 ### Diffraction settings
 - `Show spot indices` labels diffraction spots.
 - `Show current zone` prints the current or nearest zone axis on the diffraction panel.
-- Diffraction spot colors are matched to the dominant atom color of the crystal in that panel. Combo panels keep each source pattern in its own panel color so overlapping phases can be distinguished.
+- Diffraction spot colors default to the panel crystal color and can be reassigned per panel. Combo panels keep each source pattern in its own panel color so overlapping phases can be distinguished.
 - `Advanced` contains simulation method, voltage, thickness, max hkl, camera length, intensity threshold, spot scaling, intensity compression, auto sync, snap-back view, and hexagonal four-index labeling.
 
 ### Combo panels
@@ -3973,7 +3975,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
 ### Display controls
 - `Show scale bar` toggles scale bars in both crystal and diffraction panels.
 - `Show crystal annotations` toggles vector and plane labels in the 3D crystal view.
-- `Palette for vectors/planes` lets you customize, reorder, add, remove, or reset vector and plane colors.
+- `Palette for vectors/planes` lets you customize, reorder, add, remove, or reset vector and plane colors. `Diffraction pattern colors` assigns colors to ordinary panels.
                 """
             ).classes("intro-text")
 
@@ -4062,6 +4064,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                         icon="palette",
                         on_click=self.open_palette_dialog,
                     ).props("outline dense").classes("advanced-palette-button")
+                    ui.button(
+                        "Diffraction pattern colors",
+                        icon="palette",
+                        on_click=self.open_diffraction_color_dialog,
+                    ).props("outline dense").classes("advanced-palette-button")
                 self.log_box = ui.textarea("Log", value="\n".join(self.status_history)).props(
                     "outlined dense readonly rows=5"
                 ).classes("advanced-log")
@@ -4107,6 +4114,94 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if re.fullmatch(r"#?[0-9a-fA-F]{6}", text):
             return ("#" + text.lstrip("#")).upper()
         return fallback
+
+    def default_diffraction_color_for_crystal(self, crystal_name: str) -> str:
+        fallback = DEFAULT_DIFFRACTION_COLORS.get(str(crystal_name or ""), "#31F7F1")
+        try:
+            definition = self.library.get(str(crystal_name or ""))
+        except Exception:
+            return fallback
+        return DEFAULT_DIFFRACTION_COLORS.get(definition.name, dominant_color(definition))
+
+    def diffraction_color_for_state(self, state: PanelState) -> str:
+        fallback = self.default_diffraction_color_for_crystal(state.crystal_name)
+        color = self.normalize_palette_color(state.diffraction_color, fallback)
+        state.diffraction_color = color
+        return color
+
+    def set_panel_crystal(self, state: PanelState, crystal_name: str) -> None:
+        selected_name = str(crystal_name or state.crystal_name)
+        if selected_name == CUSTOM_SENTINEL:
+            return
+        old_default = self.default_diffraction_color_for_crystal(state.crystal_name)
+        current_color = self.normalize_palette_color(state.diffraction_color, old_default)
+        if selected_name != state.crystal_name and current_color == old_default:
+            state.diffraction_color = self.default_diffraction_color_for_crystal(selected_name)
+        else:
+            state.diffraction_color = current_color
+        state.crystal_name = selected_name
+
+    def open_diffraction_color_dialog(self) -> None:
+        self.diffraction_color_dialog = None
+        self.diffraction_color_container = None
+        self.build_diffraction_color_dialog()
+        self.refresh_diffraction_color_dialog()
+        self.diffraction_color_dialog.open()
+
+    def build_diffraction_color_dialog(self) -> None:
+        self.diffraction_color_dialog = ui.dialog()
+        with self.diffraction_color_dialog, ui.card().classes("diffraction-color-card"):
+            with ui.row().classes("items-center justify-between full-width"):
+                ui.label("Diffraction pattern colors").classes("text-h6")
+                ui.button(icon="close", on_click=self.diffraction_color_dialog.close).props("flat round dense").tooltip("Close")
+            with ui.row().classes("palette-actions justify-end full-width"):
+                ui.button("Set to default", on_click=self.reset_all_diffraction_colors).props("flat dense")
+            self.diffraction_color_container = ui.element("div").classes("diffraction-color-list")
+
+    def refresh_diffraction_color_dialog(self) -> None:
+        if self.diffraction_color_container is None:
+            return
+        self.diffraction_color_container.clear()
+        with self.diffraction_color_container:
+            with ui.element("div").classes("diffraction-color-row diffraction-color-header"):
+                ui.label("Panel")
+                ui.label("Crystal")
+                ui.label("Color")
+                ui.label("")
+            for state in self.panel_states:
+                with ui.element("div").classes("diffraction-color-row"):
+                    ui.label(str(state.panel_id)).classes("diffraction-color-panel")
+                    ui.label(state.crystal_name).classes("diffraction-color-crystal")
+                    ui.color_input(
+                        value=self.diffraction_color_for_state(state),
+                        preview=True,
+                        on_change=lambda event, panel_id=state.panel_id: self.set_panel_diffraction_color(panel_id, event.value),
+                    ).props("outlined dense").classes("palette-color-input")
+                    ui.button(
+                        icon="restart_alt",
+                        on_click=lambda _=None, panel_id=state.panel_id: self.reset_panel_diffraction_color(panel_id),
+                    ).props("flat round dense").tooltip("Reset to default")
+
+    def set_panel_diffraction_color(self, panel_id: int, value: str | None) -> None:
+        state = self.panel_state_by_id(panel_id)
+        if state is None:
+            return
+        state.diffraction_color = self.normalize_palette_color(value, self.diffraction_color_for_state(state))
+        self.refresh_diffractions()
+
+    def reset_panel_diffraction_color(self, panel_id: int) -> None:
+        state = self.panel_state_by_id(panel_id)
+        if state is None:
+            return
+        state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
+        self.refresh_diffraction_color_dialog()
+        self.refresh_diffractions()
+
+    def reset_all_diffraction_colors(self) -> None:
+        for state in self.panel_states:
+            state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
+        self.refresh_diffraction_color_dialog()
+        self.refresh_diffractions()
 
     def refresh_palette_dialog(self) -> None:
         self.refresh_palette_list("vector", self.palette_vector_container)
@@ -4251,7 +4346,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self.clear_scientific_caches()
         for state in self.panel_states:
             if state.crystal_name == name:
-                state.crystal_name = "FCC"
+                self.set_panel_crystal(state, "FCC")
                 state.zone_text = "100"
                 state.applied_zone_text = ""
                 state.view_vector = np.array([1.0, 0.0, 0.0])
@@ -4777,6 +4872,52 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 min-width: 0;
             }
             .palette-row .q-btn {
+                min-width: 26px;
+                width: 26px;
+                min-height: 26px;
+                height: 26px;
+                padding: 0;
+            }
+            .diffraction-color-card {
+                width: min(560px, calc(100vw - 40px));
+                border-radius: 8px;
+                gap: 10px;
+            }
+            .diffraction-color-list {
+                width: 100%;
+                max-height: min(460px, calc(100vh - 220px));
+                overflow-y: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            .diffraction-color-row {
+                display: grid;
+                grid-template-columns: 54px minmax(0, 1fr) 150px 28px;
+                gap: 8px;
+                align-items: center;
+                width: 100%;
+            }
+            .diffraction-color-header {
+                color: #9aa7b5;
+                font-size: 11px;
+                font-weight: 700;
+                text-transform: uppercase;
+                letter-spacing: 0;
+            }
+            .diffraction-color-panel {
+                color: #dbeafe;
+                font-weight: 700;
+                font-size: 12px;
+            }
+            .diffraction-color-crystal {
+                min-width: 0;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                font-size: 13px;
+            }
+            .diffraction-color-row .q-btn {
                 min-width: 26px;
                 width: 26px;
                 min-height: 26px;
@@ -5411,7 +5552,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             zone_text=zone,
             plane_text=plane,
             vector_text=vector,
-            diffraction_color=DEFAULT_DIFFRACTION_COLORS.get(crystal, "#31F7F1"),
+            diffraction_color=self.default_diffraction_color_for_crystal(crystal),
         )
         self.panel_states.append(state)
         self.layout_items.append(("panel", self.next_panel_id))
@@ -5533,10 +5674,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self.clear_scientific_caches()
         for state in self.panel_states:
             if state.crystal_name == CUSTOM_SENTINEL or state.crystal_name not in self.library.definitions:
-                state.crystal_name = selected_name
+                self.set_panel_crystal(state, selected_name)
         target = self.panel_state_by_id(target_panel_id)
         if target is not None:
-            target.crystal_name = selected_name
+            self.set_panel_crystal(target, selected_name)
         self.build_panels()
 
     def refresh_diffractions(self, clear_cache: bool = False) -> None:
