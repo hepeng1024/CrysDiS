@@ -2449,12 +2449,22 @@ class CrystalBuilder:
                     "outlined dense"
                 )
 
-            with ui.row().classes("items-center gap-2"):
+            with ui.row().classes("items-center gap-2 flex-wrap"):
                 ui.button("Apply lattice constraints", icon="architecture", on_click=self.apply_lattice_constraints).props(
                     "outline"
                 )
                 ui.button("Add atom site", icon="add", on_click=self.add_site).props("outline")
                 ui.button("Preview symmetry", icon="grain", on_click=self.preview_symmetry).props("outline")
+                ui.button(
+                    "Apply same color to same element",
+                    icon="format_color_fill",
+                    on_click=self.apply_same_color_to_same_element,
+                ).props("outline")
+                ui.button(
+                    "Set element color to default",
+                    icon="restart_alt",
+                    on_click=self.set_element_colors_to_default,
+                ).props("outline")
 
             ui.separator()
             ui.label("Atom sites").classes("text-subtitle2")
@@ -2574,6 +2584,49 @@ class CrystalBuilder:
             ui.notify(str(exc), type="negative")
             return
         ui.notify(f"{space_group_symbol(definition.space_group)} expands to {count} atom site(s)", type="info")
+
+    def apply_same_color_to_same_element(self) -> None:
+        first_colors: dict[str, str] = {}
+        repeated_elements: set[str] = set()
+        updated_count = 0
+        for row in self.site_rows:
+            element = str(row["element"].value or "").strip().capitalize()
+            if not element:
+                continue
+            color = str(row["color"].value or "").strip() or color_for_element(element)
+            if element not in first_colors:
+                first_colors[element] = color
+                continue
+            repeated_elements.add(element)
+            if str(row["color"].value or "").strip() != first_colors[element]:
+                row["color"].value = first_colors[element]
+                row["color"].update()
+                updated_count += 1
+
+        if not repeated_elements:
+            ui.notify("No repeated elements found", type="info")
+            return
+        element_list = ", ".join(sorted(repeated_elements))
+        ui.notify(f"Applied first-row colors to repeated element(s): {element_list}", type="positive")
+        if updated_count:
+            self.simulator.set_status(f"Updated {updated_count} atom-site color(s) for: {element_list}")
+
+    def set_element_colors_to_default(self) -> None:
+        updated_count = 0
+        for row in self.site_rows:
+            element = str(row["element"].value or "").strip().capitalize()
+            if not element:
+                continue
+            default_color = color_for_element(element)
+            if str(row["color"].value or "").strip() != default_color:
+                row["color"].value = default_color
+                row["color"].update()
+                updated_count += 1
+        if updated_count:
+            ui.notify(f"Reset {updated_count} atom-site color(s) to default", type="positive")
+            self.simulator.set_status(f"Reset {updated_count} atom-site color(s) to default element colors")
+        else:
+            ui.notify("Element colors already match defaults", type="info")
 
     def rebuild_site_rows(self, sites: list[AtomicSite]) -> None:
         if self.site_container is None:
