@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import colorsys
 import io
 import importlib.util
 import json
@@ -119,6 +120,36 @@ def decode_png_data_url(data_url: str) -> bytes:
     if not isinstance(data_url, str) or not data_url.startswith(prefix):
         raise ValueError("Plotly did not return a PNG data URL")
     return base64.b64decode(data_url[len(prefix) :], validate=True)
+
+
+def sanitize_export_filename_stem(value: Any, fallback: str = "crysdis_export") -> str:
+    text = str(value or "").strip()
+    if text.lower().endswith(".png"):
+        text = text[:-4]
+    text = re.sub(r"[\\/:*?\"<>|\x00-\x1f]+", "_", text)
+    text = re.sub(r"\s+", "_", text)
+    text = text.strip(" ._")
+    fallback_text = re.sub(r"[\\/:*?\"<>|\x00-\x1f\s]+", "_", str(fallback or "crysdis_export")).strip(" ._")
+    return text or fallback_text or "crysdis_export"
+
+
+def sanitize_export_filename(value: Any, fallback_stem: str = "crysdis_export", extension: str = ".png") -> str:
+    suffix = "." + str(extension or ".png").lstrip(".")
+    text = str(value or "").strip()
+    if text.lower().endswith(suffix.lower()):
+        text = text[: -len(suffix)]
+    return f"{sanitize_export_filename_stem(text, fallback_stem)}{suffix}"
+
+
+def export_image_filename(
+    filename_base: Any,
+    fallback_base: str,
+    dpi: float,
+    transparent_background: bool = False,
+) -> str:
+    stem = sanitize_export_filename_stem(filename_base, fallback_base)
+    transparent_suffix = "_transparent" if transparent_background else ""
+    return sanitize_export_filename(f"{stem}{transparent_suffix}_{round(float(dpi))}dpi", fallback_base)
 
 
 def find_open_port(host: str = "127.0.0.1") -> int:
@@ -336,24 +367,62 @@ def atomic_numbers_from_periodictable(symbols: list[str]) -> dict[str, int]:
 ATOMIC_NUMBERS = atomic_numbers_from_periodictable(sorted({*ELEMENTS, *FALLBACK_ATOMIC_NUMBERS}))
 
 ELEMENT_COLORS = {
-    "Al": "#AEB6BF",
+    "Al": "#FFFB00",
     "C": "#30323D",
-    "Co": "#4D79D8",
-    "Cr": "#4ECDC4",
-    "Cu": "#D9822B",
-    "Fe": "#9B5DE5",
+    "Co": "#0351FA",
+    "Cr": "#FF9100",
+    "Cu": "#ADEC1A",
+    "Fe": "#e81010",
     "Mg": "#F4B942",
-    "Mn": "#C77DFF",
-    "Mo": "#7D8597",
-    "N": "#5C7CFA",
-    "Ni": "#10B7A5",
+    "Mn": "#d9be0f",
+    "Mo": "#88AC07",
+    "N": "#5CAEFA",
+    "Ni": "#ed02e9",
     "O": "#EF476F",
-    "Si": "#F77F00",
-    "Ti": "#8E9AAF",
-    "V": "#63A375",
+    "Si": "#D38A3C",
+    "Ti": "#03fc07",
+    "Zr": "#8F5D12",
+    "Hf": "#F5A9F2",
+    "V": "#6BB891",
+    "Nb": "#5D29EC",
+    "Ta": "#04C02D",
     "W": "#5E6472",
     "Zn": "#8AB6D6",
 }
+
+
+def normalized_hex_color(color: str) -> str | None:
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(color or "").strip())
+    return f"#{match.group(1).upper()}" if match else None
+
+
+def generated_element_color(atomic_number: int, offset: int = 0) -> str:
+    hue = (0.071 + (atomic_number + offset * 17) * 0.618033988749895) % 1.0
+    saturation = 0.58 + 0.22 * (((atomic_number + offset * 3) % 5) / 4.0)
+    value = 0.70 + 0.24 * (((atomic_number * 3 + offset * 5) % 7) / 6.0)
+    red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+    return f"#{int(round(red * 255)):02X}{int(round(green * 255)):02X}{int(round(blue * 255)):02X}"
+
+
+def build_generated_element_colors() -> dict[str, str]:
+    used = {color for color in (normalized_hex_color(color) for color in ELEMENT_COLORS.values()) if color is not None}
+    generated: dict[str, str] = {}
+    for symbol in ELEMENTS:
+        if symbol in ELEMENT_COLORS:
+            continue
+        atomic_number = ATOMIC_NUMBERS.get(symbol, FALLBACK_ATOMIC_NUMBERS.get(symbol, len(generated) + 1))
+        for offset in range(256):
+            color = generated_element_color(int(atomic_number), offset)
+            if color not in used:
+                generated[symbol] = color
+                used.add(color)
+                break
+        else:
+            raise RuntimeError(f"Could not assign a unique color for element {symbol}")
+    return generated
+
+
+GENERATED_ELEMENT_COLORS = build_generated_element_colors()
 
 # Cromer-Mann neutral-atom X-ray form-factor coefficients. They are used here
 # as a practical element-specific kinematic scattering envelope. The active
@@ -397,7 +466,7 @@ def build_cromer_mann_table() -> dict[str, tuple[list[float], list[float], float
 CROMER_MANN = build_cromer_mann_table()
 
 PLANE_COLORS = ["#FF6B6B", "#FFD166", "#06D6A0", "#4DABF7", "#C77DFF", "#F783AC"]
-VECTOR_COLORS = ["#E63946", "#F4A261", "#2A9D8F", "#577590", "#B5179E", "#80ED99"]
+VECTOR_COLORS = ["#E63946", "#F4A261", "#2A9D8F", "#577590", "#B5179E", "#ED80E4"]
 PLANE_FILL_TEXTURE = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg=="
@@ -618,12 +687,15 @@ def space_group_options() -> tuple[str, ...]:
         )
 
 
+@lru_cache(maxsize=512)
 def space_group_symbol(value: str | None) -> str:
     text = str(value or "P1").strip()
     if ":" in text:
         text = text.split(":", 1)[1].strip()
     text = text.strip("'\"")
-    compact = text.replace(" ", "") or "P1"
+    if text in {"", ".", "?"}:
+        return "P1"
+    compact = re.sub(r"\s+", "", text).replace("{", "").replace("}", "") or "P1"
     aliases = {
         "P63/mmc": "P6_3/mmc",
         "P63/m": "P6_3/m",
@@ -632,7 +704,14 @@ def space_group_symbol(value: str | None) -> str:
         "C12/m1": "C2/m",
         "C1m1": "Cm",
     }
-    return aliases.get(compact, compact)
+    compact = aliases.get(compact, compact)
+    try:
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        space_group = SpaceGroup.from_int_number(int(compact)) if compact.isdigit() else SpaceGroup(compact)
+        return str(space_group.symbol)
+    except Exception:
+        return compact
 
 
 def space_group_symbol_from_number(number: int) -> str:
@@ -649,16 +728,24 @@ def cif_block_value(block: dict[str, Any], *keys: str) -> Any:
         value = block.get(key)
         if value is not None:
             return value
+    lower_values = {str(key).lower(): value for key, value in block.items()}
+    for key in keys:
+        value = lower_values.get(key.lower())
+        if value is not None:
+            return value
     return None
 
 
 def declared_space_group_from_cif_block(block: dict[str, Any]) -> str:
-    number = cif_block_value(block, "_symmetry_Int_Tables_number", "_space_group_IT_number")
-    try:
-        if number is not None and int(str(number).strip("'\"")) > 0:
-            return space_group_symbol_from_number(int(str(number).strip("'\"")))
-    except ValueError:
-        pass
+    number = cif_block_value(
+        block,
+        "_symmetry_Int_Tables_number",
+        "_space_group_IT_number",
+        "_space_group.it_number",
+    )
+    number_match = re.match(r"\s*([1-9]\d*)", str(number if number is not None else "").strip("'\""))
+    if number_match:
+        return space_group_symbol_from_number(int(number_match.group(1)))
     symbol = cif_block_value(block, "_symmetry_space_group_name_H-M", "_space_group_name_H-M_alt")
     return space_group_symbol(symbol)
 
@@ -1124,6 +1211,142 @@ def pymatgen_structure_from_model(model: CrystalModel) -> Any:
         raise ValueError("No occupied atom sites are available for pymatgen TEM calculation.")
     return Structure(Lattice(model.lattice * 10.0), species, coords, coords_are_cartesian=False, to_unit_cell=True)
 
+
+def cif_quote(value: Any) -> str:
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return "''"
+    return "'" + text.replace("'", "''") + "'"
+
+
+def cif_number(value: float) -> str:
+    return f"{float(value):.8f}"
+
+
+def cif_formula_sum(definition: CrystalDefinition) -> str:
+    totals: dict[str, float] = {}
+    for site in expanded_sites(definition):
+        occupancy = min(max(float(site.occupancy), 0.0), 1.0)
+        if occupancy <= 0.0:
+            continue
+        element = site.element.strip().capitalize()
+        totals[element] = totals.get(element, 0.0) + occupancy
+    parts = []
+    for element in sorted(totals):
+        amount = totals[element]
+        if math.isclose(amount, 1.0, abs_tol=1e-8):
+            amount_text = ""
+        elif math.isclose(amount, round(amount), abs_tol=1e-8):
+            amount_text = str(int(round(amount)))
+        else:
+            amount_text = f"{amount:.6g}"
+        parts.append(f"{element}{amount_text}")
+    return " ".join(parts) or "?"
+
+
+def space_group_export_metadata(value: str | None) -> tuple[str, int | None, list[str]]:
+    symbol = space_group_symbol(value)
+    if symbol in {"", "1"}:
+        symbol = "P1"
+    try:
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
+        operations = sorted({operation.as_xyz_str() for operation in space_group.symmetry_ops})
+        if "x, y, z" in operations:
+            operations = ["x, y, z", *[operation for operation in operations if operation != "x, y, z"]]
+        return str(space_group.symbol), int(space_group.int_number), operations or ["x, y, z"]
+    except Exception:
+        return symbol or "P1", None, ["x, y, z"]
+
+
+def cif_site_label(site: AtomicSite, element: str, index: int, used_labels: set[str]) -> str:
+    base = str(site.label or "").strip().strip("'\"")
+    base = re.sub(r"[^A-Za-z0-9_.+-]+", "_", base).strip("._")
+    if not base:
+        base = f"{element}{index + 1}"
+    if base[0].isdigit():
+        base = f"{element}{base}"
+    label = base
+    counter = 2
+    while label in used_labels:
+        label = f"{base}_{counter}"
+        counter += 1
+    used_labels.add(label)
+    return label
+
+
+def symmetry_preserving_cif_text_for_definition(definition: CrystalDefinition) -> str:
+    symbol, number, operations = space_group_export_metadata(definition.space_group)
+    block_name = sanitize_export_filename_stem(definition.name, "crystal")
+    lines = [
+        "# generated using CrysDiS",
+        f"data_{block_name}",
+        f"_symmetry_space_group_name_H-M   {cif_quote(symbol)}",
+        f"_space_group_name_H-M_alt   {cif_quote(symbol)}",
+        f"_symmetry_Int_Tables_number   {number if number is not None else '?'}",
+        f"_space_group_IT_number   {number if number is not None else '?'}",
+        f"_cell_length_a   {cif_number(definition.a * 10.0)}",
+        f"_cell_length_b   {cif_number(definition.b * 10.0)}",
+        f"_cell_length_c   {cif_number(definition.c * 10.0)}",
+        f"_cell_angle_alpha   {cif_number(definition.alpha)}",
+        f"_cell_angle_beta   {cif_number(definition.beta)}",
+        f"_cell_angle_gamma   {cif_number(definition.gamma)}",
+        f"_chemical_formula_sum   {cif_quote(cif_formula_sum(definition))}",
+        "loop_",
+        "_space_group_symop_id",
+        "_space_group_symop_operation_xyz",
+    ]
+    for index, operation in enumerate(operations, start=1):
+        lines.append(f"{index} {cif_quote(operation)}")
+    lines.extend(
+        [
+            "loop_",
+            "_atom_site_label",
+            "_atom_site_type_symbol",
+            "_atom_site_fract_x",
+            "_atom_site_fract_y",
+            "_atom_site_fract_z",
+            "_atom_site_occupancy",
+        ]
+    )
+    used_labels: set[str] = set()
+    row_count = 0
+    for index, site in enumerate(definition.sites):
+        occupancy = min(max(float(site.occupancy), 0.0), 1.0)
+        if occupancy <= 0.0:
+            continue
+        element = site.element.strip().capitalize()
+        label = cif_site_label(site, element, index, used_labels)
+        frac = wrap_fractional(site.fractional)
+        lines.append(
+            " ".join(
+                [
+                    cif_quote(label),
+                    cif_quote(element),
+                    cif_number(float(frac[0])),
+                    cif_number(float(frac[1])),
+                    cif_number(float(frac[2])),
+                    cif_number(occupancy),
+                ]
+            )
+        )
+        row_count += 1
+    if row_count == 0:
+        raise ValueError("No occupied atom sites are available for CIF export.")
+    return "\n".join(lines) + "\n"
+
+
+def cif_text_for_definition(definition: CrystalDefinition, preserve_symmetry: bool = False) -> str:
+    if preserve_symmetry:
+        return symmetry_preserving_cif_text_for_definition(definition)
+
+    from pymatgen.io.cif import CifWriter
+
+    model = make_model(definition)
+    structure = pymatgen_structure_from_model(model)
+    writer = CifWriter(structure, symprec=None, significant_figures=8, refine_struct=False)
+    return str(writer)
 
 
 def occupancy_aware_tem_calculator_class(base_calculator_class: type[Any]) -> type[Any]:
@@ -1982,8 +2205,19 @@ def color_for_element(element: str) -> str:
     symbol = element.strip().capitalize()
     if symbol in ELEMENT_COLORS:
         return ELEMENT_COLORS[symbol]
-    palette = ["#2EC4B6", "#E71D36", "#FF9F1C", "#4D96FF", "#9D4EDD", "#6A994E"]
-    return palette[sum(ord(char) for char in symbol) % len(palette)]
+    if symbol in GENERATED_ELEMENT_COLORS:
+        return GENERATED_ELEMENT_COLORS[symbol]
+    used = {
+        color
+        for color in (normalized_hex_color(color) for color in [*ELEMENT_COLORS.values(), *GENERATED_ELEMENT_COLORS.values()])
+        if color is not None
+    }
+    seed = sum((index + 1) * ord(char) for index, char in enumerate(symbol)) or 119
+    for offset in range(256):
+        color = generated_element_color(seed + offset, offset)
+        if color not in used:
+            return color
+    return "#35D0BA"
 
 
 def color_for_site(site: AtomicSite | DisplayAtom) -> str:
@@ -2177,6 +2411,7 @@ class CrystalBuilder:
         self.original_definition_name: str | None = None
         self.save_edit_button = None
         self.save_new_button = None
+        self.export_cif_button = None
         self.repeat_boundary_atoms = True
         self._build()
 
@@ -2236,6 +2471,11 @@ class CrystalBuilder:
                     icon="save_as",
                     on_click=self.save_as_new_structure,
                 ).props("unelevated color=primary")
+                self.export_cif_button = ui.button(
+                    "EXPORT AS CIF",
+                    icon="download",
+                    on_click=self.open_cif_export_dialog,
+                ).props("outline color=primary")
 
     def open(
         self,
@@ -2272,6 +2512,9 @@ class CrystalBuilder:
         if self.save_new_button is not None:
             self.save_new_button.visible = True
             self.save_new_button.update()
+        if self.export_cif_button is not None:
+            self.export_cif_button.visible = True
+            self.export_cif_button.update()
 
     def load_definition(self, definition: CrystalDefinition) -> None:
         self.name_input.value = definition.name if definition.name not in DEFAULT_NAMES else f"{definition.name} custom"
@@ -2406,6 +2649,14 @@ class CrystalBuilder:
         if not definition.sites:
             raise ValueError("add at least one atom site")
         return definition
+
+    def open_cif_export_dialog(self) -> None:
+        try:
+            definition = self.read_definition()
+        except ValueError as exc:
+            ui.notify(str(exc), type="negative")
+            return
+        self.simulator.open_crystal_cif_export_dialog(definition=definition)
 
     def save_edited_structure(self) -> None:
         try:
@@ -2814,6 +3065,16 @@ class PanelController:
             crystal_checkbox = ui.checkbox("Real-space crystal", value=True).props("dense")
             diffraction_checkbox = ui.checkbox("Diffraction pattern", value=True).props("dense")
             transparent_checkbox = ui.checkbox("Transparent background", value=False).props("dense")
+            crystal_filename_input = (
+                ui.input("Crystal file name base", value=f"panel_{self.state.panel_id}_crystal")
+                .props("outlined dense")
+                .classes("full-width")
+            )
+            diffraction_filename_input = (
+                ui.input("Diffraction file name base", value=f"panel_{self.state.panel_id}_diffraction")
+                .props("outlined dense")
+                .classes("full-width")
+            )
             dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
             if self.simulator.direct_file_exports_enabled():
                 export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
@@ -2832,6 +3093,8 @@ class PanelController:
                         bool(diffraction_checkbox.value),
                         float(dpi_input.value or 300),
                         bool(transparent_checkbox.value),
+                        str(crystal_filename_input.value or ""),
+                        str(diffraction_filename_input.value or ""),
                     ),
                 ).props("unelevated dense")
         self.download_dialog.open()
@@ -2842,6 +3105,8 @@ class PanelController:
         include_diffraction: bool,
         dpi: float,
         transparent_background: bool = False,
+        crystal_filename_base: str | None = None,
+        diffraction_filename_base: str | None = None,
     ) -> None:
         if not include_crystal and not include_diffraction:
             ui.notify("Choose at least one image to download", type="warning")
@@ -2850,11 +3115,21 @@ class PanelController:
         direct_export = self.simulator.direct_file_exports_enabled()
         saved_paths: list[Path] = []
         crystal_downloaded = False
+        crystal_filename = export_image_filename(
+            crystal_filename_base,
+            f"panel_{self.state.panel_id}_crystal",
+            dpi,
+            transparent_background,
+        )
+        diffraction_filename = export_image_filename(
+            diffraction_filename_base,
+            f"panel_{self.state.panel_id}_diffraction",
+            dpi,
+            transparent_background,
+        )
         if include_crystal:
             try:
                 live_view, live_roll = await self.live_scene_orientation()
-                transparent_suffix = "transparent_" if transparent_background else ""
-                filename = f"panel_{self.state.panel_id}_crystal_{transparent_suffix}{round(dpi)}dpi.png"
                 image_bytes = self.render_crystal_png(
                     dpi,
                     transparent_background=transparent_background,
@@ -2862,9 +3137,9 @@ class PanelController:
                     roll=live_roll,
                 )
                 if direct_export:
-                    saved_paths.append(self.simulator.save_exported_image(image_bytes, filename))
+                    saved_paths.append(self.simulator.save_exported_image(image_bytes, crystal_filename))
                 else:
-                    ui.download(image_bytes, filename, media_type="image/png")
+                    ui.download(image_bytes, crystal_filename, media_type="image/png")
                 crystal_downloaded = True
             except Exception as exc:
                 ui.notify(f"Crystal export failed: {exc}", type="negative")
@@ -2882,11 +3157,11 @@ class PanelController:
         selector = f".comparison-panel-{self.state.panel_id}"
         script = f"""
         const root = document.querySelector({json.dumps(selector)});
-        const panelName = {json.dumps(f"panel_{self.state.panel_id}")};
         const dpi = {float(dpi):.6f};
         const scale = Math.max(1, dpi / 150);
         const transparentBackground = {json.dumps(bool(transparent_background))};
         const directExport = {json.dumps(bool(direct_export))};
+        const filename = {json.dumps(diffraction_filename)};
 
         function saveDataUrl(dataUrl, filename) {{
             const link = document.createElement('a');
@@ -2925,8 +3200,6 @@ class PanelController:
                     }});
                 }}
             }}
-            const transparentSuffix = transparentBackground ? 'transparent_' : '';
-            const filename = `${{panelName}}_diffraction_${{transparentSuffix}}${{Math.round(dpi)}}dpi.png`;
             if (directExport) {{
                 return {{filename, dataUrl}};
             }}
@@ -3615,6 +3888,11 @@ class ComboPanelController:
                 ui.label(f"Download combo C{self.state.combo_id}").classes("text-h6")
                 ui.button(icon="close", on_click=self.download_dialog.close).props("flat round dense").tooltip("Close")
             transparent_checkbox = ui.checkbox("Transparent background", value=False).props("dense")
+            filename_input = (
+                ui.input("Diffraction file name base", value=f"combo_C{self.state.combo_id}_diffraction")
+                .props("outlined dense")
+                .classes("full-width")
+            )
             dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
             if self.simulator.direct_file_exports_enabled():
                 export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
@@ -3631,21 +3909,33 @@ class ComboPanelController:
                     on_click=lambda: self.download_diffraction_image(
                         float(dpi_input.value or 300),
                         bool(transparent_checkbox.value),
+                        str(filename_input.value or ""),
                     ),
                 ).props("unelevated dense")
         self.download_dialog.open()
 
-    async def download_diffraction_image(self, dpi: float, transparent_background: bool = False) -> None:
+    async def download_diffraction_image(
+        self,
+        dpi: float,
+        transparent_background: bool = False,
+        filename_base: str | None = None,
+    ) -> None:
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
         direct_export = self.simulator.direct_file_exports_enabled()
         selector = f".combo-panel-{self.state.combo_id}"
+        filename = export_image_filename(
+            filename_base,
+            f"combo_C{self.state.combo_id}_diffraction",
+            dpi,
+            transparent_background,
+        )
         script = f"""
         const root = document.querySelector({json.dumps(selector)});
-        const panelName = {json.dumps(f"combo_C{self.state.combo_id}")};
         const dpi = {float(dpi):.6f};
         const scale = Math.max(1, dpi / 150);
         const transparentBackground = {json.dumps(bool(transparent_background))};
         const directExport = {json.dumps(bool(direct_export))};
+        const filename = {json.dumps(filename)};
 
         function saveDataUrl(dataUrl, filename) {{
             const link = document.createElement('a');
@@ -3684,8 +3974,6 @@ class ComboPanelController:
                     }});
                 }}
             }}
-            const transparentSuffix = transparentBackground ? 'transparent_' : '';
-            const filename = `${{panelName}}_diffraction_${{transparentSuffix}}${{Math.round(dpi)}}dpi.png`;
             if (directExport) {{
                 return {{filename, dataUrl}};
             }}
@@ -3997,22 +4285,22 @@ class SimulatorApp:
             ui.button("Intro", icon="help_outline", on_click=self.open_intro_dialog).props("flat dense").classes("intro-button")
             ui.space()
             self.show_zone_axis_input = ui.checkbox(
-                "Show current zone",
+                "Current zone",
                 value=False,
                 on_change=lambda _: self.refresh_diffractions(),
             ).classes("top-checkbox")
             self.show_indices_input = ui.checkbox(
-                "Show spot indices",
+                "Spot indices",
                 value=False,
                 on_change=lambda _: self.refresh_diffractions(),
             ).classes("top-checkbox")
             self.show_crystal_annotations_input = ui.checkbox(
-                "Show crystal annotations",
+                "Crystal annotations",
                 value=True,
                 on_change=lambda _: self.refresh_crystal_scenes(),
             ).classes("top-checkbox")
             self.show_scale_bar_input = ui.checkbox(
-                "Show scale bar",
+                "Scale bar",
                 value=True,
                 on_change=lambda _: self.on_scale_bar_changed(),
             ).classes("top-checkbox")
@@ -4081,7 +4369,7 @@ Compare a real-space crystal view with its electron diffraction pattern. Each or
 - Built-in examples include FCC Ni, BCC Fe, and HCP Mg.
 - `Load CIF` imports structures from `.cif` files.
 - `New Crystal` lets you create or edit custom structures, set symmetry, lattice parameters, atom sites, occupancies, and atom colors.
-- `Crystal list` lets you review, edit, or delete available structures.
+- `Crystal list` lets you review, edit, export, or delete available structures.
 
 ### Indices and vectors
 - Plane indices use entries like `100`, `1-10`, or `0001`.
@@ -4090,8 +4378,8 @@ Compare a real-space crystal view with its electron diffraction pattern. Each or
 - Negative real-space vectors are shifted back into the unit cell for cleaner visualization.
 
 ### Diffraction settings
-- `Show spot indices` labels diffraction spots.
-- `Show current zone` prints the current or nearest zone axis on the diffraction panel.
+- `Spot indices` labels diffraction spots.
+- `Current zone` prints the current or nearest zone axis on the diffraction panel.
 - Diffraction spot colors default to the panel crystal color and can be reassigned per panel. Combo panels keep each source pattern in its own panel color so overlapping phases can be distinguished.
 - `Advanced` contains simulation method, voltage, thickness, max hkl, camera length, intensity threshold, spot scaling, intensity compression, auto sync, snap-back view, and hexagonal four-index labeling.
 
@@ -4100,8 +4388,8 @@ Use `Add combo panel` to overlay diffraction patterns from multiple ordinary pan
 Enable `Bind crystal motion` inside a combo panel after manually setting an orientation relationship; later Apply, Sync, or auto-sync motion from any listed panel is applied as the same view-frame motion to the other listed panels.
 
 ### Display controls
-- `Show scale bar` toggles scale bars in both crystal and diffraction panels.
-- `Show crystal annotations` toggles vector and plane labels in the 3D crystal view.
+- `Scale bar` toggles scale bars in both crystal and diffraction panels.
+- `Crystal annotations` toggles vector and plane labels in the 3D crystal view.
 - `Palette for vectors/planes` lets you customize, reorder, add, remove, or reset vector and plane colors. `Diffraction pattern colors` assigns colors to ordinary panels.
                 """
             ).classes("intro-text")
@@ -4450,6 +4738,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     with ui.column().classes("crystal-list-info"):
                         ui.label(name).classes("crystal-list-name")
                         ui.label(f"{status} · {summary}").classes("crystal-list-meta")
+                    ui.button(
+                        icon="download",
+                        on_click=lambda _=None, n=name: self.open_crystal_cif_export_dialog(n),
+                    ).props("flat round dense").tooltip("Export CIF")
                     ui.button(icon="edit", on_click=lambda _=None, n=name: self.edit_crystal_from_list(n)).props(
                         "flat round dense"
                     ).tooltip("Edit crystal")
@@ -4464,6 +4756,89 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if self.crystal_list_dialog is not None:
             self.crystal_list_dialog.close()
         self.builder.open(self.library.get(name), mode="edit")
+
+    def open_crystal_cif_export_dialog(
+        self,
+        name: str | None = None,
+        definition: CrystalDefinition | None = None,
+    ) -> None:
+        definition = definition or self.library.get(str(name or "FCC"))
+        display_name = str(name or definition.name or "Crystal")
+        dialog = ui.dialog()
+        preserve_label = "Preserve symmetry"
+        p1_label = "Remove symmetry (P1)"
+        default_label = preserve_label if space_group_symbol(definition.space_group) not in {"", "P1", "1"} else p1_label
+        with dialog, ui.card().classes("download-card"):
+            with ui.row().classes("items-center justify-between full-width"):
+                ui.label(f"Export CIF: {display_name}").classes("text-h6")
+                ui.button(icon="close", on_click=dialog.close).props("flat round dense").tooltip("Close")
+            ui.label(f"Crystal: {display_name}").classes("text-caption text-grey-4")
+            filename_input = (
+                ui.input("File name base", value=sanitize_export_filename_stem(definition.name, "crystal"))
+                .props("outlined dense")
+                .classes("full-width")
+            )
+            symmetry_input = ui.select(
+                [preserve_label, p1_label],
+                label="Symmetry",
+                value=default_label,
+            ).props("outlined dense").classes("full-width")
+            if self.direct_file_exports_enabled():
+                export_folder_label = ui.label(f"Export folder: {self.export_dir_text()}").classes("export-folder-label")
+
+                async def choose_folder() -> None:
+                    await self.choose_export_folder(export_folder_label)
+
+                ui.button("Choose export folder", icon="folder_open", on_click=choose_folder).props("outline dense")
+            with ui.row().classes("justify-end full-width"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                ui.button(
+                    "Export",
+                    icon="download",
+                    on_click=lambda: self.export_crystal_cif(
+                        definition,
+                        str(filename_input.value or ""),
+                        symmetry_input.value == preserve_label,
+                        dialog,
+                    ),
+                ).props("unelevated dense")
+        dialog.open()
+
+    def export_crystal_cif(
+        self,
+        definition: CrystalDefinition,
+        filename_base: str | None = None,
+        preserve_symmetry: bool = False,
+        dialog: Any | None = None,
+    ) -> None:
+        filename = sanitize_export_filename(filename_base or definition.name, "crystal", ".cif")
+        try:
+            cif_text = cif_text_for_definition(definition, preserve_symmetry=preserve_symmetry)
+        except Exception as exc:
+            message = f"Could not export {definition.name} as CIF: {exc}"
+            self.set_status(message)
+            ui.notify(message, type="negative")
+            return
+
+        if self.direct_file_exports_enabled():
+            try:
+                path = self.save_exported_text(cif_text, filename, ".cif")
+            except Exception as exc:
+                message = f"Could not save CIF: {exc}"
+                self.set_status(message)
+                ui.notify(message, type="negative")
+                return
+            self.announce_saved_exports([path])
+            if dialog is not None:
+                dialog.close()
+            return
+
+        ui.download(cif_text.encode("utf-8"), filename, media_type="chemical/x-cif")
+        message = f"Downloaded CIF: {filename}"
+        self.set_status(message)
+        ui.notify(message, type="positive")
+        if dialog is not None:
+            dialog.close()
 
     def delete_crystal_from_list(self, name: str) -> None:
         if not self.library.delete(name):
@@ -4938,15 +5313,19 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 overflow-wrap: anywhere;
             }
             .intro-card {
-                width: min(860px, calc(100vw - 40px));
+                width: min(1180px, calc(100vw - 32px));
+                max-width: calc(100vw - 32px);
                 max-height: min(820px, calc(100vh - 40px));
                 border-radius: 8px;
                 overflow-y: auto;
+                overflow-x: hidden;
             }
             .intro-text {
                 color: #e5edf7;
                 font-size: 13px;
                 line-height: 1.42;
+                white-space: normal;
+                overflow-wrap: anywhere;
             }
             .intro-text h3 {
                 margin: 10px 0 5px 0;
@@ -5077,7 +5456,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .crystal-list-row {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 20px minmax(0, 1fr) 34px 34px;
+                grid-template-columns: 20px minmax(0, 1fr) 34px 34px 34px;
                 align-items: center;
                 gap: 8px;
                 padding: 6px 4px;
@@ -5490,17 +5869,22 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self.open_export_folder_path_dialog(label)
 
     def save_exported_image(self, image_bytes: bytes, filename: str) -> Path:
-        path = self.ensure_export_dir() / filename
+        path = self.ensure_export_dir() / sanitize_export_filename(filename)
         path.write_bytes(image_bytes)
+        return path
+
+    def save_exported_text(self, text: str, filename: str, extension: str = ".txt") -> Path:
+        path = self.ensure_export_dir() / sanitize_export_filename(filename, "crysdis_export", extension)
+        path.write_text(text, encoding="utf-8")
         return path
 
     def announce_saved_exports(self, paths: list[Path]) -> None:
         if not paths:
             return
         if len(paths) == 1:
-            message = f"Saved image to: {paths[0]}"
+            message = f"Saved file to: {paths[0]}"
         else:
-            message = f"Saved {len(paths)} images to: {paths[0].parent}"
+            message = f"Saved {len(paths)} files to: {paths[0].parent}"
         ui.notify(message, type="positive")
         self.set_status(message)
 
