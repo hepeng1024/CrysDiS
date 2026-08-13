@@ -2723,7 +2723,16 @@ class CrystalBuilder:
             ui.notify(str(exc), type="negative")
             return
         self.simulator.set_status(f"Saved edited structure {saved.name} to {self.scope_select.value}")
-        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id, force_default_color=True)
+        affected_names = {saved.name}
+        original_name = str(self.original_definition_name or "").strip()
+        if original_name and original_name not in DEFAULT_NAMES:
+            affected_names.add(original_name)
+        self.simulator.refresh_library(
+            saved.name,
+            target_panel_id=self.target_panel_id,
+            force_default_color=True,
+            affected_crystal_names=affected_names,
+        )
         self.simulator.refresh_crystal_list()
         self.dialog.close()
 
@@ -2735,7 +2744,12 @@ class CrystalBuilder:
             ui.notify(str(exc), type="negative")
             return
         self.simulator.set_status(f"Saved new structure {saved.name} to {self.scope_select.value}")
-        self.simulator.refresh_library(saved.name, target_panel_id=self.target_panel_id, force_default_color=True)
+        self.simulator.refresh_library(
+            saved.name,
+            target_panel_id=self.target_panel_id,
+            force_default_color=True,
+            affected_crystal_names=(),
+        )
         self.simulator.refresh_crystal_list()
         self.dialog.close()
 
@@ -4655,7 +4669,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if state is None:
             return
         state.diffraction_color = self.normalize_palette_color(value, self.diffraction_color_for_state(state))
-        self.refresh_diffractions()
+        self.redraw_panel_diffractions({panel_id})
+        self.refresh_combo_panels_for_sources({panel_id})
 
     def reset_panel_diffraction_color(self, panel_id: int) -> None:
         state = self.panel_state_by_id(panel_id)
@@ -4663,7 +4678,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             return
         state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
         self.refresh_diffraction_color_dialog()
-        self.refresh_diffractions()
+        self.redraw_panel_diffractions({panel_id})
+        self.refresh_combo_panels_for_sources({panel_id})
 
     def reset_all_diffraction_colors(self) -> None:
         for state in self.panel_states:
@@ -4899,6 +4915,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             return
         self.model_cache.clear()
         self.clear_scientific_caches()
+        affected_panel_ids: set[int] = set()
         for state in self.panel_states:
             if state.crystal_name == name:
                 self.set_panel_crystal(state, "FCC", force_default_color=True)
@@ -4906,7 +4923,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 state.applied_zone_text = ""
                 state.view_vector = np.array([1.0, 0.0, 0.0])
                 state.roll = 0.0
-        self.build_panels()
+                affected_panel_ids.add(state.panel_id)
+        self.refresh_panel_crystal_select_options()
+        self.redraw_panel_controllers(affected_panel_ids)
+        if affected_panel_ids:
+            self.refresh_combo_panels_for_sources(affected_panel_ids)
         self.refresh_crystal_list()
         self.set_status(f"Deleted crystal: {name}")
         ui.notify(f"Deleted crystal: {name}", type="positive")
@@ -6267,25 +6288,94 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             return None
         return max(self.panel_states, key=lambda state: state.panel_id).panel_id
 
+    def refresh_panel_crystal_select_options(self) -> None:
+        options = self.library.options()
+        for controller in self.controllers:
+            if controller.crystal_select is None:
+                continue
+            controller.crystal_select.options = options
+            if controller.state.crystal_name in options:
+                controller.crystal_select.value = controller.state.crystal_name
+            controller.crystal_select.update()
+
+    def sync_panel_inputs_from_state(self, controller: PanelController) -> None:
+        state = controller.state
+        if controller.crystal_select is not None:
+            controller.crystal_select.value = state.crystal_name
+            controller.crystal_select.update()
+        if controller.zone_input is not None:
+            controller.zone_input.value = state.zone_text
+            controller.zone_input.update()
+        if controller.plane_input is not None:
+            controller.plane_input.value = state.plane_text
+            controller.plane_input.update()
+        if controller.vector_input is not None:
+            controller.vector_input.value = state.vector_text
+            controller.vector_input.update()
+        if controller.rotation_input is not None:
+            controller.rotation_input.value = state.rotation_text
+            controller.rotation_input.update()
+
+    def redraw_panel_controllers(self, panel_ids: set[int]) -> None:
+        for panel_id in sorted(panel_ids):
+            controller = self.controller_by_panel_id(panel_id)
+            state = self.panel_state_by_id(panel_id)
+            if controller is None or state is None:
+                continue
+            self.sync_panel_inputs_from_state(controller)
+            model = self.model_for(state.crystal_name)
+            controller.redraw_scene(model)
+            controller.redraw_diffraction(model)
+
+    def redraw_panel_diffractions(self, panel_ids: set[int]) -> None:
+        for panel_id in sorted(panel_ids):
+            controller = self.controller_by_panel_id(panel_id)
+            state = self.panel_state_by_id(panel_id)
+            if controller is None or state is None:
+                continue
+            controller.redraw_diffraction(self.model_for(state.crystal_name))
+
+    def refresh_combo_panels_for_sources(self, panel_ids: set[int]) -> None:
+        self.repair_all_combo_sources()
+        for controller in self.combo_controllers:
+            if set(controller.state.source_panel_ids) & panel_ids:
+                controller.refresh()
+            else:
+                controller.refresh_source_options()
+
     def refresh_library(
         self,
         selected_name: str,
         target_panel_id: int | None = None,
         force_default_color: bool = False,
+        affected_crystal_names: set[str] | tuple[str, ...] | list[str] | None = None,
     ) -> None:
         self.model_cache.clear()
         self.clear_scientific_caches()
+        affected_names = (
+            {str(name) for name in affected_crystal_names if str(name).strip()}
+            if affected_crystal_names is not None
+            else {selected_name}
+        )
+        affected_panel_ids: set[int] = set()
         for state in self.panel_states:
             if state.crystal_name == CUSTOM_SENTINEL or state.crystal_name not in self.library.definitions:
                 self.set_panel_crystal(state, selected_name, force_default_color=True)
-        target = self.panel_state_by_id(target_panel_id)
-        if target is not None:
-            self.set_panel_crystal(target, selected_name, force_default_color=force_default_color)
-        if force_default_color:
-            for state in self.panel_states:
-                if state.crystal_name == selected_name:
-                    state.diffraction_color = self.default_diffraction_color_for_crystal(selected_name)
-        self.build_panels()
+                affected_panel_ids.add(state.panel_id)
+        if target_panel_id is not None:
+            target = self.panel_state_by_id(target_panel_id)
+            if target is not None:
+                self.set_panel_crystal(target, selected_name, force_default_color=force_default_color)
+                affected_panel_ids.add(target.panel_id)
+        for state in self.panel_states:
+            if state.crystal_name in affected_names:
+                if force_default_color:
+                    state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
+                affected_panel_ids.add(state.panel_id)
+        self.refresh_panel_crystal_select_options()
+        self.redraw_panel_controllers(affected_panel_ids)
+        if affected_panel_ids:
+            self.refresh_combo_panels_for_sources(affected_panel_ids)
 
     def refresh_diffractions(self, clear_cache: bool = False) -> None:
         if clear_cache:
@@ -6338,6 +6428,21 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self.trim_cache(self.diffraction_spot_cache, 512)
         return spots
 
+    def bound_motion_panel_ids(self, source_panel_id: int) -> set[int]:
+        connected = {source_panel_id}
+        pending = [source_panel_id]
+        while pending:
+            panel_id = pending.pop()
+            for combo_state in self.combo_panel_states:
+                if not combo_state.bind_motion or panel_id not in combo_state.source_panel_ids:
+                    continue
+                for candidate_id in combo_state.source_panel_ids:
+                    if candidate_id in connected or self.panel_state_by_id(candidate_id) is None:
+                        continue
+                    connected.add(candidate_id)
+                    pending.append(candidate_id)
+        return connected
+
     def propagate_bound_motion(
         self,
         source_panel_id: int,
@@ -6346,13 +6451,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         new_view: np.ndarray,
         new_roll: float,
     ) -> None:
-        bound_ids: set[int] = set()
-        for combo_state in self.combo_panel_states:
-            if combo_state.bind_motion and source_panel_id in combo_state.source_panel_ids:
-                bound_ids.update(combo_state.source_panel_ids)
+        bound_ids = self.bound_motion_panel_ids(source_panel_id)
         bound_ids.discard(source_panel_id)
         if not bound_ids:
-            self.refresh_combo_panels()
+            self.refresh_combo_panels_for_sources({source_panel_id})
             return
 
         # Propagate the motion in the driver's view frame, not in the driver's
@@ -6361,9 +6463,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         # becomes an in-plane spin around panel 2's current beam direction.
         delta = local_orientation_delta(old_view, old_roll, new_view, new_roll)
         if np.allclose(delta, np.eye(3), atol=1e-6):
-            self.refresh_combo_panels()
+            self.refresh_combo_panels_for_sources({source_panel_id})
             return
 
+        affected_panel_ids = {source_panel_id, *bound_ids}
         for panel_id in sorted(bound_ids):
             state = self.panel_state_by_id(panel_id)
             if state is None:
@@ -6374,7 +6477,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 model = self.model_for(state.crystal_name)
                 controller.redraw_scene(model)
                 controller.redraw_diffraction(model)
-        self.refresh_combo_panels()
+        self.refresh_combo_panels_for_sources(affected_panel_ids)
 
     def pymatgen_tem_reflections(self, model: CrystalModel, zone_axis: tuple[int, int, int]) -> np.ndarray | None:
         max_order = self.current_max_hkl()
