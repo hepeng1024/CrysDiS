@@ -27,9 +27,9 @@ Desktop packages are available from the GitHub **Releases** page. For version `v
 Suggested release assets:
 
 ```text
-CrysDiS-Windows-v0.1.2.zip
-CrysDiS-Linux-v0.1.2.tar.gz
-CrysDiS-macOS-arm64-v0.1.2.zip
+CrysDiS-Windows-v0.1.3.zip
+CrysDiS-Linux-v0.1.3.tar.gz
+CrysDiS-macOS-arm64-v0.1.3.zip
 ```
 
 Optional tkinter version:
