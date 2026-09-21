@@ -1,3 +1,4 @@
+import colorsys
 import json
 import math
 import re
@@ -202,25 +203,44 @@ DEFAULT_DIFFRACTION_COLORS_BY_THEME = {
     },
 }
 
-ELEMENTS = [
-    "Al",
-    "C",
-    "Co",
-    "Cr",
-    "Cu",
-    "Fe",
-    "Mg",
-    "Mn",
-    "Mo",
-    "N",
-    "Ni",
-    "O",
-    "Si",
-    "Ti",
-    "V",
-    "W",
-    "Zn",
-]
+FALLBACK_ELEMENTS = (
+    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn "
+    "Ga Ge As Se Br Kr Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba "
+    "La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi "
+    "Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt "
+    "Ds Rg Cn Nh Fl Mc Lv Ts Og"
+).split()
+
+
+def elements_from_periodictable() -> list[str]:
+    try:
+        import periodictable
+    except ImportError:
+        return FALLBACK_ELEMENTS.copy()
+    symbols = []
+    for element in periodictable.elements:
+        number = getattr(element, "number", None)
+        symbol = str(getattr(element, "symbol", "") or "")
+        if number and 1 <= int(number) <= 118 and re.fullmatch(r"[A-Z][a-z]?", symbol):
+            symbols.append(symbol)
+    return symbols or FALLBACK_ELEMENTS.copy()
+
+
+ELEMENTS = elements_from_periodictable()
+FALLBACK_ATOMIC_NUMBERS = {symbol: number for number, symbol in enumerate(FALLBACK_ELEMENTS, start=1)}
+
+
+def atomic_numbers_from_periodictable(symbols: list[str]) -> dict[str, int]:
+    numbers = dict(FALLBACK_ATOMIC_NUMBERS)
+    try:
+        import periodictable
+    except ImportError:
+        return numbers
+    for symbol in symbols:
+        number = getattr(getattr(periodictable, symbol, None), "number", None)
+        if number:
+            numbers[symbol] = int(number)
+    return numbers
 
 LATTICE_SYSTEMS = [
     "cubic",
@@ -231,46 +251,65 @@ LATTICE_SYSTEMS = [
     "triclinic",
 ]
 
-ATOMIC_NUMBERS = {
-    "H": 1,
-    "C": 6,
-    "N": 7,
-    "O": 8,
-    "Mg": 12,
-    "Al": 13,
-    "Si": 14,
-    "Ti": 22,
-    "V": 23,
-    "Cr": 24,
-    "Mn": 25,
-    "Fe": 26,
-    "Co": 27,
-    "Ni": 28,
-    "Cu": 29,
-    "Zn": 30,
-    "Mo": 42,
-    "W": 74,
-}
+ATOMIC_NUMBERS = atomic_numbers_from_periodictable(sorted({*ELEMENTS, *FALLBACK_ATOMIC_NUMBERS}))
 
 ELEMENT_COLORS = {
-    "Al": "#AEB6BF",
+    "Al": "#FFFB00",
     "C": "#30323D",
-    "Co": "#4D79D8",
-    "Cr": "#4ECDC4",
-    "Cu": "#D9822B",
-    "Fe": CRYSTAL_STYLES["BCC"]["atom"],
-    "Mg": CRYSTAL_STYLES["HCP"]["atom"],
-    "Mn": "#C77DFF",
-    "Mo": "#7D8597",
-    "N": "#5C7CFA",
-    "Ni": CRYSTAL_STYLES["FCC"]["atom"],
+    "Co": "#0351FA",
+    "Cr": "#FF9100",
+    "Cu": "#ADEC1A",
+    "Fe": "#e81010",
+    "Mg": "#F4B942",
+    "Mn": "#d9be0f",
+    "Mo": "#88AC07",
+    "N": "#5CAEFA",
+    "Ni": "#ed02e9",
     "O": "#EF476F",
-    "Si": "#F77F00",
-    "Ti": "#8E9AAF",
-    "V": "#63A375",
+    "Si": "#D38A3C",
+    "Ti": "#03fc07",
+    "Zr": "#8F5D12",
+    "Hf": "#F5A9F2",
+    "V": "#6BB891",
+    "Nb": "#5D29EC",
+    "Ta": "#04C02D",
     "W": "#5E6472",
     "Zn": "#8AB6D6",
 }
+
+
+def normalized_hex_color(color: str) -> str | None:
+    match = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(color or "").strip())
+    return f"#{match.group(1).upper()}" if match else None
+
+
+def generated_element_color(atomic_number: int, offset: int = 0) -> str:
+    hue = (0.071 + (atomic_number + offset * 17) * 0.618033988749895) % 1.0
+    saturation = 0.58 + 0.22 * (((atomic_number + offset * 3) % 5) / 4.0)
+    value = 0.70 + 0.24 * (((atomic_number * 3 + offset * 5) % 7) / 6.0)
+    red, green, blue = colorsys.hsv_to_rgb(hue, saturation, value)
+    return f"#{int(round(red * 255)):02X}{int(round(green * 255)):02X}{int(round(blue * 255)):02X}"
+
+
+def build_generated_element_colors() -> dict[str, str]:
+    used = {color for color in (normalized_hex_color(color) for color in ELEMENT_COLORS.values()) if color is not None}
+    generated: dict[str, str] = {}
+    for symbol in ELEMENTS:
+        if symbol in ELEMENT_COLORS:
+            continue
+        atomic_number = ATOMIC_NUMBERS.get(symbol, FALLBACK_ATOMIC_NUMBERS.get(symbol, len(generated) + 1))
+        for offset in range(256):
+            color = generated_element_color(int(atomic_number), offset)
+            if color not in used:
+                generated[symbol] = color
+                used.add(color)
+                break
+        else:
+            raise RuntimeError(f"Could not assign a unique color for element {symbol}")
+    return generated
+
+
+GENERATED_ELEMENT_COLORS = build_generated_element_colors()
 
 NAMED_COLORS = {
     "bright cyan": "#31F7F1",
@@ -358,6 +397,7 @@ class CrystalDefinition:
     gamma: float
     space_group: str = "P1"
     sites: list[AtomicSite] | None = None
+    symmetry_operations: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CrystalDefinition":
@@ -373,6 +413,7 @@ class CrystalDefinition:
             gamma=float(data.get("gamma", 90.0)),
             space_group=str(data.get("space_group", data.get("symmetry", "P1")) or "P1"),
             sites=sites,
+            symmetry_operations=list(data.get("symmetry_operations", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -529,18 +570,32 @@ DEFAULT_CRYSTALS = default_crystals()
 DEFAULT_NAMES = set(DEFAULT_CRYSTALS)
 
 
+@lru_cache(maxsize=512)
 def space_group_symbol(value: str | None) -> str:
     text = str(value or "P1").strip()
-    if ":" in text:
-        text = text.split(":", 1)[1].strip()
-    compact = text.replace(" ", "") or "P1"
+    text = re.sub(r"^\d+\s*:\s*", "", text).strip("'\"")
+    if text in {"", ".", "?"}:
+        return "P1"
+    compact = re.sub(r"\s+", "", text).replace("{", "").replace("}", "") or "P1"
     aliases = {
         "P63/mmc": "P6_3/mmc",
         "P63/m": "P6_3/m",
         "P63mc": "P6_3mc",
         "P63cm": "P6_3cm",
+        "C12/m1": "C2/m",
+        "C1m1": "Cm",
     }
-    return aliases.get(compact, compact)
+    compact = aliases.get(compact, compact)
+    try:
+        from pymatgen.symmetry.groups import SpaceGroup
+
+        group = SpaceGroup.from_int_number(int(compact)) if compact.isdigit() else SpaceGroup(compact)
+        symbol = str(group.symbol)
+        if ":" in compact and ":" not in symbol:
+            symbol += ":" + compact.rsplit(":", 1)[1]
+        return symbol
+    except Exception:
+        return compact
 
 
 def snap_fractional_value(value: float) -> float:
@@ -559,33 +614,49 @@ def snap_fractional(frac: np.ndarray) -> np.ndarray:
     return np.array([snap_fractional_value(float(value)) for value in frac], dtype=float)
 
 
+@lru_cache(maxsize=256)
+def parsed_symmetry_operations(operation_texts: tuple[str, ...]) -> tuple[Any, ...]:
+    from pymatgen.core.operations import SymmOp
+
+    operations = []
+    for text in operation_texts:
+        operation = SymmOp.from_xyz_str(text)
+        if len(text.split(",")) != 3 or not np.isclose(abs(np.linalg.det(operation.rotation_matrix)), 1.0):
+            raise ValueError(f"Invalid CIF symmetry operation: {text}")
+        operations.append(operation)
+    return tuple(operations)
+
+
 def expanded_sites(definition: CrystalDefinition) -> list[AtomicSite]:
     sites = definition.sites or []
     symbol = space_group_symbol(definition.space_group)
-    if symbol in {"", "P1", "1"}:
+    if definition.symmetry_operations:
+        operations = parsed_symmetry_operations(tuple(definition.symmetry_operations))
+    elif symbol in {"", "P1", "1"}:
         return [AtomicSite(**asdict(site)) for site in sites]
+    else:
+        try:
+            from pymatgen.symmetry.groups import SpaceGroup
 
-    try:
-        from pymatgen.core import Structure as _PymatgenStructure
-        from pymatgen.symmetry.groups import SpaceGroup
-
-        _ = _PymatgenStructure
-        space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
-        operations = space_group.symmetry_ops
-    except Exception:
-        return [AtomicSite(**asdict(site)) for site in sites]
+            space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
+            operations = space_group.symmetry_ops
+        except Exception:
+            return [AtomicSite(**asdict(site)) for site in sites]
 
     expanded: list[AtomicSite] = []
     seen: set[tuple[str, int, int, int]] = set()
+    # CIF coordinates must use the file's origin/basis and retain their supplied precision.
+    normalize_fractional = wrap_fractional if definition.symmetry_operations else snap_fractional
+    site_tolerance = 1e-6 if definition.symmetry_operations else SYMMETRY_SITE_TOL
     for site in sites:
-        base_frac = snap_fractional(site.fractional)
+        base_frac = normalize_fractional(site.fractional)
         for operation in operations:
-            frac = snap_fractional(np.mod(operation.operate(base_frac), 1.0))
+            frac = normalize_fractional(operation.operate(base_frac))
             key = (
                 site.element.strip().capitalize(),
-                int(round(float(frac[0]) / SYMMETRY_SITE_TOL)),
-                int(round(float(frac[1]) / SYMMETRY_SITE_TOL)),
-                int(round(float(frac[2]) / SYMMETRY_SITE_TOL)),
+                int(round(float(frac[0]) / site_tolerance)),
+                int(round(float(frac[1]) / site_tolerance)),
+                int(round(float(frac[2]) / site_tolerance)),
             )
             if key in seen:
                 continue
@@ -606,8 +677,8 @@ def expanded_sites(definition: CrystalDefinition) -> list[AtomicSite]:
 
 def wrap_fractional(frac: np.ndarray, tolerance: float = 1e-8) -> np.ndarray:
     wrapped = np.mod(np.asarray(frac, dtype=float), 1.0)
-    wrapped[np.isclose(wrapped, 1.0, atol=tolerance)] = 0.0
-    wrapped[np.isclose(wrapped, 0.0, atol=tolerance)] = 0.0
+    wrapped[np.isclose(wrapped, 1.0, atol=tolerance, rtol=0)] = 0.0
+    wrapped[np.isclose(wrapped, 0.0, atol=tolerance, rtol=0)] = 0.0
     return wrapped
 
 
@@ -663,28 +734,35 @@ def fractional_points_match(a: np.ndarray, b: np.ndarray, tolerance: float = SYM
     return bool(np.all(delta <= tolerance))
 
 
-def equivalent_under_symmetry(site: AtomicSite, representative: AtomicSite, operations: list[Any]) -> bool:
+def equivalent_under_symmetry(
+    site: AtomicSite, representative: AtomicSite, operations: list[Any], *, exact: bool = False
+) -> bool:
     if site.element.strip().capitalize() != representative.element.strip().capitalize():
         return False
     if not math.isclose(float(site.occupancy), float(representative.occupancy), abs_tol=1e-5):
         return False
-    target = snap_fractional(wrap_fractional(site.fractional))
-    base = snap_fractional(wrap_fractional(representative.fractional))
+    normalize_fractional = wrap_fractional if exact else snap_fractional
+    target = normalize_fractional(site.fractional)
+    base = normalize_fractional(representative.fractional)
     for operation in operations:
-        frac = snap_fractional(wrap_fractional(operation.operate(base)))
-        if fractional_points_match(frac, target):
+        frac = normalize_fractional(operation.operate(base))
+        if fractional_points_match(frac, target, tolerance=1e-6 if exact else SYMMETRY_SITE_TOL):
             return True
     return False
 
 
 def representative_sites_by_symmetry(definition: CrystalDefinition) -> list[AtomicSite]:
     sites = definition.sites or []
-    operations = symmetry_operations_for_space_group(definition.space_group)
+    operations = (
+        list(parsed_symmetry_operations(tuple(definition.symmetry_operations)))
+        if definition.symmetry_operations else symmetry_operations_for_space_group(definition.space_group)
+    )
     if not operations:
         return [AtomicSite(**asdict(site)) for site in sites]
     representatives: list[AtomicSite] = []
     for site in sites:
-        if any(equivalent_under_symmetry(site, representative, operations) for representative in representatives):
+        if any(equivalent_under_symmetry(site, representative, operations, exact=bool(definition.symmetry_operations))
+               for representative in representatives):
             continue
         representatives.append(AtomicSite(**asdict(site)))
     return representatives
@@ -701,8 +779,19 @@ def color_for_element(element: str) -> str:
     symbol = element.strip().capitalize()
     if symbol in ELEMENT_COLORS:
         return ELEMENT_COLORS[symbol]
-    palette = ["#2EC4B6", "#E71D36", "#FF9F1C", "#4D96FF", "#9D4EDD", "#6A994E"]
-    return palette[sum(ord(char) for char in symbol) % len(palette)]
+    if symbol in GENERATED_ELEMENT_COLORS:
+        return GENERATED_ELEMENT_COLORS[symbol]
+    used = {
+        color
+        for color in (normalized_hex_color(color) for color in [*ELEMENT_COLORS.values(), *GENERATED_ELEMENT_COLORS.values()])
+        if color is not None
+    }
+    seed = sum((index + 1) * ord(char) for index, char in enumerate(symbol)) or 119
+    for offset in range(256):
+        color = generated_element_color(seed + offset, offset)
+        if color not in used:
+            return color
+    return "#35D0BA"
 
 
 def color_for_site(site: AtomicSite) -> str:
@@ -803,18 +892,35 @@ def cif_block_value(block: dict[str, Any], *keys: str) -> Any:
     for key in keys:
         if key in block:
             return block[key]
+    lower_values = {str(key).lower(): value for key, value in block.items()}
+    for key in keys:
+        if key.lower() in lower_values:
+            return lower_values[key.lower()]
     return None
 
 
 def declared_space_group_from_cif_block(block: dict[str, Any]) -> str:
-    number = cif_block_value(block, "_symmetry_Int_Tables_number", "_space_group_IT_number")
-    if number not in (None, "", ".", "?"):
+    setting = cif_block_value(block, "_space_group_IT_coordinate_system_code", "_space_group.IT_coordinate_system_code")
+    setting_suffix = f":{setting}" if setting and str(setting).strip() not in {".", "?"} else ""
+    symbol = cif_block_value(
+        block, "_symmetry_space_group_name_H-M", "_space_group_name_H-M_alt", "_space_group.name_H-M_alt"
+    )
+    if symbol and str(symbol).strip() not in {".", "?"}:
+        symbol = space_group_symbol(symbol)
+        if setting_suffix and ":" not in symbol:
+            symbol = space_group_symbol(symbol + setting_suffix)
         try:
-            return space_group_symbol_from_number(int(str(number).strip("'\"")))
+            from pymatgen.symmetry.groups import SpaceGroup
+
+            SpaceGroup(symbol)
+            return symbol
         except ValueError:
             pass
-    symbol = cif_block_value(block, "_symmetry_space_group_name_H-M", "_space_group_name_H-M_alt")
-    return space_group_symbol(str(symbol).strip("'\"") if symbol not in (None, "", ".", "?") else "P1")
+    number = cif_block_value(block, "_symmetry_Int_Tables_number", "_space_group_IT_number", "_space_group.it_number")
+    number_match = re.match(r"\s*([1-9]\d*)", str(number if number is not None else "").strip("'\""))
+    if number_match:
+        return space_group_symbol(space_group_symbol_from_number(int(number_match.group(1))) + setting_suffix)
+    return space_group_symbol(symbol)
 
 
 def canonical_symmetry_site(group: list[Any]) -> Any:
@@ -874,45 +980,73 @@ def declared_cif_symmetry_operations(block: dict[str, Any], declared_space_group
         "_space_group_symop_operation_xyz",
         "_symmetry_equiv_pos_as_xyz",
         "_space_group_symop.operation_xyz",
+        "_symmetry_equiv.pos_as_xyz",
     )
+    operation_texts = [str(text).strip().strip("'\"") for text in operation_texts if str(text).strip() not in {"", ".", "?"}]
     if operation_texts:
         try:
-            from pymatgen.core.operations import SymmOp
+            return list(parsed_symmetry_operations(tuple(operation_texts)))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Could not read the CIF symmetry operations: {exc}") from exc
 
-            operations = []
-            for text in operation_texts:
-                operation = str(text).strip().strip("'\"")
-                if operation:
-                    operations.append(SymmOp.from_xyz_str(operation))
-            if operations:
-                return operations
-        except Exception:
-            pass
+    from pymatgen.symmetry.groups import SpaceGroup
+
+    hall_symbol = cif_block_value(block, "_space_group_name_Hall", "_symmetry_space_group_name_Hall", "_space_group.name_Hall")
+    if hall_symbol and str(hall_symbol).strip() not in {".", "?"}:
+        hall_key = re.sub(r"\s+", "", str(hall_symbol))
+        for setting in SpaceGroup.SYMM_OPS:
+            if re.sub(r"\s+", "", setting["hall"]) == hall_key:
+                return list(parsed_symmetry_operations(tuple(setting["symops"])))
 
     symbol = space_group_symbol(declared_space_group)
     if symbol in {"", "P1", "1"}:
         return []
     try:
-        from pymatgen.symmetry.groups import SpaceGroup
-
         space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
         return list(space_group.symmetry_ops)
-    except Exception:
-        return []
+    except ValueError as exc:
+        raise ValueError(f"Could not determine CIF symmetry from space group {symbol!r}") from exc
+
+
+@lru_cache(maxsize=256)
+def space_group_for_operations(symbol: str, operation_texts: tuple[str, ...]) -> str:
+    from pymatgen.symmetry.groups import SpaceGroup
+
+    def operation_keys(operations: Any) -> set[tuple[float, ...]]:
+        return {
+            tuple(np.round(operation.rotation_matrix.ravel(), 7))
+            + tuple(np.round(wrap_fractional(operation.translation_vector), 7))
+            for operation in operations
+        }
+
+    operations = parsed_symmetry_operations(operation_texts)
+    if not operations:
+        return symbol
+    try:
+        import spglib
+
+        group_type = spglib.get_spacegroup_type_from_symmetry(
+            [operation.rotation_matrix for operation in operations],
+            [operation.translation_vector for operation in operations],
+        )
+        if group_type is not None:
+            symbol = space_group_symbol_from_number(group_type.number)
+    except (ImportError, ValueError):
+        pass
+    expected = operation_keys(operations)
+    try:
+        candidates = [symbol, *sorted(SpaceGroup.get_settings(symbol))]
+        for candidate in candidates:
+            if operation_keys(SpaceGroup(candidate).symmetry_ops) == expected:
+                return space_group_symbol(candidate)
+    except ValueError:
+        pass
+    # Nonstandard origins/bases may have no matching named setting; retain their operations.
+    return symbol
 
 
 def equivalent_under_operations(site: AtomicSite, representative: AtomicSite, operations: list[Any]) -> bool:
-    if site.element.strip().capitalize() != representative.element.strip().capitalize():
-        return False
-    if not math.isclose(float(site.occupancy), float(representative.occupancy), abs_tol=1e-5):
-        return False
-    target = snap_fractional(site.fractional)
-    base = snap_fractional(representative.fractional)
-    for operation in operations:
-        frac = snap_fractional(np.mod(operation.operate(base), 1.0))
-        if fractional_points_match(frac, target):
-            return True
-    return False
+    return equivalent_under_symmetry(site, representative, operations, exact=True)
 
 
 def reduce_cif_sites_by_declared_symmetry(
@@ -947,16 +1081,14 @@ def atomic_sites_from_cif_block(block: dict[str, Any], declared_space_group: str
         element = element_from_cif_atom(cif_value_at(symbols, index, ""), label)
         if not element:
             continue
-        frac = snap_fractional(
-            wrap_fractional(
-                np.array(
-                    [
-                        parse_cif_float(cif_value_at(xs, index, 0.0)),
-                        parse_cif_float(cif_value_at(ys, index, 0.0)),
-                        parse_cif_float(cif_value_at(zs, index, 0.0)),
-                    ],
-                    dtype=float,
-                )
+        frac = wrap_fractional(
+            np.array(
+                [
+                    parse_cif_float(cif_value_at(xs, index, 0.0)),
+                    parse_cif_float(cif_value_at(ys, index, 0.0)),
+                    parse_cif_float(cif_value_at(zs, index, 0.0)),
+                ],
+                dtype=float,
             )
         )
         sites.append(
@@ -988,7 +1120,7 @@ def atomic_sites_from_structure(structure: Any, representatives_only: bool) -> l
 
     sites: list[AtomicSite] = []
     for site in source_sites:
-        frac = snap_fractional(wrap_fractional(np.asarray(site.frac_coords, dtype=float)))
+        frac = wrap_fractional(np.asarray(site.frac_coords, dtype=float))
         for specie, occupancy in site.species.items():
             element = getattr(specie, "symbol", str(specie)).strip().capitalize()
             sites.append(
@@ -1007,22 +1139,52 @@ def atomic_sites_from_structure(structure: Any, representatives_only: bool) -> l
 
 def definition_from_cif(path: Path) -> CrystalDefinition:
     try:
-        from pymatgen.io.cif import CifParser
+        from pymatgen.io.cif import CifBlock, CifFile, CifParser
         from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
     except Exception as exc:
         raise ValueError(f"pymatgen is required to load CIF files: {exc}") from exc
 
     try:
-        parser = CifParser(str(path))
-        cif_block = next(iter(parser.as_dict().values()), {})
+        blocks = CifFile.from_file(str(path)).data
+        source_block = next(
+            (block for block in blocks.values() if cif_block_value(block.data, "_atom_site_fract_x", "_atom_site.fract_x") is not None),
+            next(iter(blocks.values())),
+        )
+        # Normalize CIF spelling and use the same origin/basis for pymatgen and the model.
+        normalize_tag = lambda key: str(key).lower().replace(".", "_").rstrip("_")
+        cif_block = {normalize_tag(key): value for key, value in source_block.data.items()}
+        declared_space_group = declared_space_group_from_cif_block(cif_block)
+        operations = declared_cif_symmetry_operations(cif_block, declared_space_group)
+        operation_texts = [operation.as_xyz_str() for operation in operations] or ["x, y, z"]
+        operation_tag = "_symmetry_equiv_pos_as_xyz"
+        cif_block[operation_tag] = operation_texts
+        loops = [[normalize_tag(key) for key in loop if normalize_tag(key) != operation_tag] for loop in source_block.loops]
+        sites = atomic_sites_from_cif_block(cif_block, declared_space_group)
+        parser_data = dict(cif_block)
+        if sites:
+            # Exporters may list equivalent sites too; expand each orbit only once.
+            parser_data = {key: value for key, value in parser_data.items() if not key.startswith("_atom_site_")}
+            loops = [[key for key in loop if key in parser_data] for loop in loops]
+            atom_columns = {
+                "_atom_site_label": [site.label for site in sites],
+                "_atom_site_type_symbol": [site.element for site in sites],
+                "_atom_site_fract_x": [str(site.x) for site in sites],
+                "_atom_site_fract_y": [str(site.y) for site in sites],
+                "_atom_site_fract_z": [str(site.z) for site in sites],
+                "_atom_site_occupancy": [str(site.occupancy) for site in sites],
+            }
+            parser_data.update(atom_columns)
+            loops.append(list(atom_columns))
+        parser_block = CifBlock(parser_data, [loop for loop in loops if loop] + [[operation_tag]], source_block.header)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
+            parser = CifParser.from_str(str(parser_block), frac_tolerance=0)
             structure = parser.parse_structures(primitive=False)[0]
     except Exception as exc:
         raise ValueError(f"Could not read CIF file: {exc}") from exc
 
     lattice = structure.lattice
-    declared_space_group = declared_space_group_from_cif_block(cif_block)
+    declared_space_group = space_group_for_operations(declared_space_group, tuple(operation_texts))
     crystal_system = "triclinic"
     try:
         analyzer = SpacegroupAnalyzer(structure, symprec=0.01)
@@ -1030,10 +1192,9 @@ def definition_from_cif(path: Path) -> CrystalDefinition:
     except Exception:
         pass
 
-    sites = atomic_sites_from_cif_block(cif_block, declared_space_group)
     if not sites:
-        representatives_only = space_group_symbol(declared_space_group) not in {"", "P1", "1"}
-        sites = atomic_sites_from_structure(structure, representatives_only=representatives_only)
+        sites = atomic_sites_from_structure(structure, representatives_only=False)
+        sites = reduce_cif_sites_by_declared_symmetry(sites, cif_block, declared_space_group)
 
     if not sites:
         raise ValueError("The CIF file did not contain any atom sites.")
@@ -1049,7 +1210,87 @@ def definition_from_cif(path: Path) -> CrystalDefinition:
         gamma=float(lattice.gamma),
         space_group=declared_space_group,
         sites=sites,
+        symmetry_operations=operation_texts,
     )
+
+
+def cif_filename_stem(name: str) -> str:
+    name = re.sub(r"\.cif$", "", str(name or ""), flags=re.IGNORECASE)
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("._") or "crystal"
+
+
+def cif_text_for_definition(definition: CrystalDefinition, preserve_symmetry: bool = False) -> str:
+    from pymatgen.core import Composition
+    from pymatgen.io.cif import CifBlock
+    from pymatgen.symmetry.groups import SpaceGroup
+
+    cell = [definition.a, definition.b, definition.c, definition.alpha, definition.beta, definition.gamma]
+    if not all(math.isfinite(value) and value > 0 for value in cell) or any(angle >= 180 for angle in cell[3:]):
+        raise ValueError("Enter positive cell lengths and angles between 0 and 180 degrees.")
+    lattice_matrix(definition)
+    expanded = expanded_sites(definition)
+    symbol, number, operation_texts = "P1", 1, ["x, y, z"]
+    sites = expanded
+    if preserve_symmetry:
+        symbol = space_group_symbol(definition.space_group)
+        operations = declared_cif_symmetry_operations(
+            {"_space_group_symop_operation_xyz": definition.symmetry_operations}, symbol
+        )
+        operation_texts = [operation.as_xyz_str() for operation in operations] or ["x, y, z"]
+        try:
+            number = SpaceGroup(symbol).int_number
+        except ValueError:
+            number = "?"
+        sites = representative_sites_by_symmetry(definition)
+
+    atom_tags = [
+        "_atom_site_label", "_atom_site_type_symbol", "_atom_site_fract_x",
+        "_atom_site_fract_y", "_atom_site_fract_z", "_atom_site_occupancy",
+    ]
+    rows = []
+    labels = set()
+    for index, site in enumerate(sites, start=1):
+        if not math.isfinite(site.occupancy) or not np.all(np.isfinite(site.fractional)):
+            raise ValueError("Atom coordinates and occupancies must be finite numbers.")
+        occupancy = min(max(float(site.occupancy), 0.0), 1.0)
+        if occupancy <= 0:
+            continue
+        element = site.element.strip().capitalize()
+        base = re.sub(r"[^A-Za-z0-9_.+-]+", "_", site.label or "").strip("._") or f"{element}{index}"
+        if base[0].isdigit():
+            base = element + base
+        label, counter = base, 2
+        while label in labels:
+            label = f"{base}_{counter}"
+            counter += 1
+        labels.add(label)
+        rows.append([label, element, *(f"{value:.12g}" for value in wrap_fractional(site.fractional)), f"{occupancy:.12g}"])
+    if not rows:
+        raise ValueError("No occupied atom sites are available for CIF export.")
+    totals: dict[str, float] = {}
+    for site in expanded:
+        element = site.element.strip().capitalize()
+        totals[element] = totals.get(element, 0.0) + min(max(float(site.occupancy), 0.0), 1.0)
+    data = {
+        "_symmetry_space_group_name_H-M": symbol,
+        "_space_group_name_H-M_alt": symbol,
+        "_symmetry_Int_Tables_number": str(number),
+        "_space_group_IT_number": str(number),
+        "_cell_length_a": f"{definition.a * 10:.12g}",
+        "_cell_length_b": f"{definition.b * 10:.12g}",
+        "_cell_length_c": f"{definition.c * 10:.12g}",
+        "_cell_angle_alpha": f"{definition.alpha:.12g}",
+        "_cell_angle_beta": f"{definition.beta:.12g}",
+        "_cell_angle_gamma": f"{definition.gamma:.12g}",
+        "_chemical_formula_sum": Composition(totals).formula,
+        "_space_group_symop_id": [str(i) for i in range(1, len(operation_texts) + 1)],
+        "_space_group_symop_operation_xyz": operation_texts,
+        **{tag: [row[i] for row in rows] for i, tag in enumerate(atom_tags)},
+    }
+    if ":" in symbol:
+        data["_space_group_IT_coordinate_system_code"] = symbol.rsplit(":", 1)[1]
+    loops = [["_space_group_symop_id", "_space_group_symop_operation_xyz"], atom_tags]
+    return "# generated using CrysDiS tkinter\n" + str(CifBlock(data, loops, cif_filename_stem(definition.name))) + "\n"
 
 
 class CrystalLibrary:
@@ -1937,8 +2178,7 @@ def make_custom_model(definition: CrystalDefinition) -> CrystalModel:
     atom_colors = []
     atom_occupancies = []
     for site in expanded:
-        base = np.mod(site.fractional.astype(float), 1.0)
-        base[np.isclose(base, 1.0, atol=1e-9)] = 0.0
+        base = wrap_fractional(site.fractional)
         translation_choices = [[0.0, 1.0] if abs(coord) < 1e-8 else [0.0] for coord in base]
         for translation in product(*translation_choices):
             frac = base + np.array(translation, dtype=float)
@@ -2100,6 +2340,7 @@ class CrystalBuilderDialog(tk.Toplevel):
         button_row.grid(row=6, column=0, columnspan=6, sticky="ew", pady=(10, 0))
         ttk.Button(button_row, text="Add site", command=self.add_site).pack(side=tk.LEFT)
         ttk.Button(button_row, text="Delete selected site", command=self.delete_selected_site).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(button_row, text="EXPORT AS CIF", command=self.export_as_cif).pack(side=tk.RIGHT, padx=(8, 0))
         ttk.Button(button_row, text="Save as a new structure", command=self.save_as_new_structure).pack(side=tk.RIGHT)
         if self.mode == "edit":
             ttk.Button(button_row, text="Save edited structure", command=self.save_edited_structure).pack(side=tk.RIGHT, padx=(0, 8))
@@ -2107,31 +2348,21 @@ class CrystalBuilderDialog(tk.Toplevel):
 
     def load_definition(self, definition: CrystalDefinition) -> None:
         self._loading_definition = True
+        self._loaded_space_group = space_group_symbol(definition.space_group)
+        self._loaded_symmetry_operations = list(definition.symmetry_operations)
         self.name_var.set(definition.name if self.mode == "edit" else (definition.name if definition.name not in DEFAULT_NAMES else f"{definition.name} custom"))
         self.system_var.set(definition.lattice_system)
-        self.space_group_var.set(space_group_symbol(definition.space_group))
-        self.a_var.set(f"{definition.a:g}")
-        self.b_var.set(f"{definition.b:g}")
-        self.c_var.set(f"{definition.c:g}")
-        self.alpha_var.set(f"{definition.alpha:g}")
-        self.beta_var.set(f"{definition.beta:g}")
-        self.gamma_var.set(f"{definition.gamma:g}")
+        self.space_group_var.set(self._loaded_space_group)
+        self.a_var.set(f"{definition.a:.15g}")
+        self.b_var.set(f"{definition.b:.15g}")
+        self.c_var.set(f"{definition.c:.15g}")
+        self.alpha_var.set(f"{definition.alpha:.15g}")
+        self.beta_var.set(f"{definition.beta:.15g}")
+        self.gamma_var.set(f"{definition.gamma:.15g}")
         for item in self.site_tree.get_children():
             self.site_tree.delete(item)
         for site in definition.sites or []:
-            self.site_tree.insert(
-                "",
-                "end",
-                values=(
-                    site.element,
-                    f"{site.x:g}",
-                    f"{site.y:g}",
-                    f"{site.z:g}",
-                    f"{site.occupancy:g}",
-                    color_for_site(site),
-                    site.label,
-                ),
-            )
+            self.site_tree.insert("", "end", values=self.site_values(site))
         self._loading_definition = False
 
     def _bind_site_editor_traces(self) -> None:
@@ -2210,10 +2441,10 @@ class CrystalBuilderDialog(tk.Toplevel):
     def site_values(self, site: AtomicSite) -> tuple[str, str, str, str, str, str, str]:
         return (
             site.element,
-            f"{site.x:g}",
-            f"{site.y:g}",
-            f"{site.z:g}",
-            f"{site.occupancy:g}",
+            f"{site.x:.15g}",
+            f"{site.y:.15g}",
+            f"{site.z:.15g}",
+            f"{site.occupancy:.15g}",
             color_for_site(site),
             site.label,
         )
@@ -2248,6 +2479,11 @@ class CrystalBuilderDialog(tk.Toplevel):
         )
 
     def read_definition(self) -> CrystalDefinition:
+        if self._site_update_job is not None:
+            self.after_cancel(self._site_update_job)
+            self._site_update_job = None
+        if self.site_selection and self.site_selection in self.site_tree.get_children():
+            self.site_tree.item(self.site_selection, values=self.site_values(self.read_site_editor()))
         sites = []
         for item in self.site_tree.get_children():
             values = self.site_tree.item(item, "values")
@@ -2264,6 +2500,7 @@ class CrystalBuilderDialog(tk.Toplevel):
             )
         if not sites:
             raise ValueError("add at least one atom site")
+        symbol = space_group_symbol(self.space_group_var.get())
         definition = CrystalDefinition(
             name=self.name_var.get().strip() or "Customized crystal",
             lattice_system=self.system_var.get().strip().lower() or "triclinic",
@@ -2273,11 +2510,20 @@ class CrystalBuilderDialog(tk.Toplevel):
             alpha=float(self.alpha_var.get()),
             beta=float(self.beta_var.get()),
             gamma=float(self.gamma_var.get()),
-            space_group=space_group_symbol(self.space_group_var.get()),
+            space_group=symbol,
             sites=sites,
+            symmetry_operations=list(self._loaded_symmetry_operations) if symbol == self._loaded_space_group else [],
         )
         lattice_matrix(definition)
         return definition
+
+    def export_as_cif(self) -> None:
+        try:
+            definition = self.read_definition()
+        except ValueError as exc:
+            messagebox.showerror("Invalid Crystal", str(exc), parent=self)
+            return
+        self.app.export_crystal_cif(definition, parent=self)
 
     def save_as_new_structure(self) -> None:
         try:
@@ -2622,13 +2868,16 @@ class OrdinaryPanelFrame(tk.LabelFrame):
 
         if self.crystal_combo is not None:
             self.crystal_combo.bind("<<ComboboxSelected>>", lambda _event: self.app.on_crystal_selected(self.column_index))
-        for variable in (self.zone_var, self.plane_var, self.vector_var):
-            variable.trace_add("write", lambda *_args, panel_id=self.state.panel_id: self.app.schedule_panel_apply(panel_id))
+        for variable in (self.plane_var, self.vector_var):
+            variable.trace_add("write", lambda *_args, panel_id=self.state.panel_id: self.app.schedule_panel_update(panel_id))
         self.diff_color_var.trace_add(
             "write",
             lambda *_args, panel_id=self.state.panel_id: self.app.on_panel_color_changed(panel_id),
         )
-        self.bind_all("<Return>", self.app.apply_all_panels)
+
+    def apply_from_keyboard(self, _event=None) -> str:
+        self.app.apply_panel_settings(self.state.panel_id)
+        return "break"
 
     def _label(self, parent: tk.Frame, text: str, row: int, column: int) -> None:
         label = tk.Label(parent, text=text, bg=self.app.current_theme()["window_bg"], fg=self.app.current_theme()["label"])
@@ -2639,6 +2888,8 @@ class OrdinaryPanelFrame(tk.LabelFrame):
         self._label(parent, text, row, column)
         entry = ttk.Entry(parent, textvariable=variable, width=width, style="CrysDis.TEntry")
         entry.grid(row=row, column=column + 1, sticky="ew", padx=(0, 5), pady=1)
+        entry.bind("<Return>", self.apply_from_keyboard)
+        entry.bind("<KP_Enter>", self.apply_from_keyboard)
         return entry
 
     def _combo(
@@ -2690,14 +2941,6 @@ class OrdinaryPanelFrame(tk.LabelFrame):
             )
             if redraw:
                 canvas.draw_idle()
-
-    def sync_state_from_controls(self) -> None:
-        self.state.crystal = self.crystal_var.get()
-        self.state.zone_text = self.zone_var.get()
-        self.state.plane_text = self.plane_var.get()
-        self.state.vector_text = self.vector_var.get()
-        self.state.rotation_text = self.rotation_var.get()
-        self.state.diffraction_color = self.diff_color_var.get().strip()
 
     def set_controls_from_state(self) -> None:
         self.crystal_var.set(self.state.crystal)
@@ -2822,7 +3065,7 @@ class ComboPanelFrame(tk.LabelFrame):
             source = self.app.panel_state_by_id(panel_id)
             if source is None:
                 continue
-            self.source_list.insert(tk.END, f"Panel {source.panel_id}  {source.crystal}  zone {source.zone_text or 'free'}")
+            self.source_list.insert(tk.END, f"Panel {source.panel_id}  {source.crystal}  zone {source.applied_zone_text or 'free'}")
         self.bind_var.set(self.state.bind_motion)
         self.app.draw_combo_diffraction(self.state.combo_id)
 
@@ -3002,7 +3245,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         self.themed_checkbuttons: list[tk.Checkbutton] = []
         self.plane_colors = PLANE_COLORS.copy()
         self.vector_colors = VECTOR_COLORS.copy()
-        self._pending_apply_jobs: dict[int, str] = {}
+        self._pending_live_jobs: dict[int, str] = {}
         self._pending_diffraction_jobs: dict[int, str] = {}
         self._pending_combo_jobs: dict[int, str] = {}
         self._drag_panel_id: int | None = None
@@ -3206,6 +3449,9 @@ class CrystalDiffractionSimulator(tk.Tk):
             self.advanced_log_text = None
 
     def clear_window(self) -> None:
+        for job in self._pending_live_jobs.values():
+            self.after_cancel(job)
+        self._pending_live_jobs.clear()
         if self._layout_resize_job is not None:
             try:
                 self.after_cancel(self._layout_resize_job)
@@ -3914,9 +4160,11 @@ class CrystalDiffractionSimulator(tk.Tk):
 
     def on_panel_color_changed(self, panel_id: int) -> None:
         state = self.panel_state_by_id(panel_id)
-        if state is not None and not self._updating_color_controls:
+        if self._updating_color_controls:
+            return
+        if state is not None:
             state.diffraction_color_user_set = True
-        self.schedule_panel_apply(panel_id)
+        self.schedule_panel_update(panel_id)
 
     def current_simulation_method(self) -> str:
         method = self.method_var.get()
@@ -4068,6 +4316,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         actions.pack(side=tk.TOP, fill=tk.X, pady=(10, 0))
         ttk.Button(actions, text="Edit", command=self.edit_selected_crystal).pack(side=tk.LEFT)
         ttk.Button(actions, text="Remove", command=self.remove_selected_crystal).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="EXPORT AS CIF", command=self.export_selected_crystal).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Close", command=dialog.destroy).pack(side=tk.RIGHT)
         self.refresh_crystal_list_dialog()
 
@@ -4109,6 +4358,70 @@ class CrystalDiffractionSimulator(tk.Tk):
             return
         self.open_crystal_builder(0, crystal_name=name, mode="edit")
 
+    def export_selected_crystal(self) -> None:
+        name = self.selected_crystal_name()
+        if name:
+            self.export_crystal_cif(self.library.get(name), parent=self.crystal_list_dialog)
+
+    def ask_cif_export_options(self, definition: CrystalDefinition, parent: tk.Misc) -> bool | None:
+        dialog = tk.Toplevel(parent)
+        dialog.title(f"Export CIF: {definition.name}")
+        dialog.transient(parent)
+        dialog.resizable(False, False)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        preserve_var = tk.BooleanVar(master=dialog, value=space_group_symbol(definition.space_group) != "P1")
+        ttk.Radiobutton(body, text="Preserve symmetry", variable=preserve_var, value=True).pack(anchor="w", pady=4)
+        ttk.Radiobutton(body, text="Remove symmetry (P1)", variable=preserve_var, value=False).pack(anchor="w", pady=4)
+        result = None
+
+        def accept() -> None:
+            nonlocal result
+            result = bool(preserve_var.get())
+            dialog.destroy()
+
+        actions = ttk.Frame(body)
+        actions.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(actions, text="Continue", command=accept).pack(side=tk.RIGHT)
+        ttk.Button(actions, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=(0, 8))
+        dialog.bind("<Return>", lambda _event: accept())
+        dialog.bind("<Escape>", lambda _event: dialog.destroy())
+        previous_grab = self.grab_current()
+        dialog.grab_set()
+        try:
+            self.wait_window(dialog)
+        finally:
+            if previous_grab is not None and previous_grab.winfo_exists():
+                previous_grab.grab_set()
+        return result
+
+    def export_crystal_cif(self, definition: CrystalDefinition, parent: tk.Misc | None = None) -> None:
+        parent = parent or self
+        preserve = self.ask_cif_export_options(definition, parent)
+        if preserve is None:
+            return
+        try:
+            text = cif_text_for_definition(definition, preserve_symmetry=preserve)
+        except Exception as exc:
+            messagebox.showerror("CIF Export Failed", str(exc), parent=parent)
+            return
+        path = filedialog.asksaveasfilename(
+            parent=parent,
+            title=f"Export CIF: {definition.name}",
+            initialdir=str(Path.home() / "Downloads"),
+            initialfile=f"{cif_filename_stem(definition.name)}.cif",
+            defaultextension=".cif",
+            filetypes=(("CIF files", "*.cif"), ("All files", "*.*")),
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("CIF Export Failed", str(exc), parent=parent)
+            return
+        self.status_var.set(f"Exported CIF ({'symmetry preserved' if preserve else 'P1'}): {path}")
+
     def remove_selected_crystal(self) -> None:
         name = self.selected_crystal_name()
         if not name:
@@ -4129,7 +4442,7 @@ class CrystalDiffractionSimulator(tk.Tk):
             state.crystal = "FCC"
             if index < len(self.controls):
                 self.controls[index]["crystal"].set("FCC")
-            self.apply_panel_settings(state.panel_id)
+            self.draw_panel(state.panel_id)
         self.refresh_crystal_options()
         self.refresh_crystal_list_dialog()
         self.status_var.set(f"Removed custom crystal: {name}")
@@ -4160,7 +4473,8 @@ class CrystalDiffractionSimulator(tk.Tk):
             self.states[target].crystal = selected_name
             color = self.default_diffraction_color_for_model(self.model_for(selected_name))
             self.set_panel_diffraction_color_control(self.states[target], color, user_set=False)
-            self.apply_panel_settings(self.states[target].panel_id)
+            self.update_panel_annotations(self.states[target].panel_id, redraw=False)
+            self.draw_panel(self.states[target].panel_id)
         self.refresh_combo_panels()
 
     def current_voltage_kv(self) -> float:
@@ -4227,17 +4541,54 @@ class CrystalDiffractionSimulator(tk.Tk):
     def current_diffraction_limit(self) -> float:
         return max(0.05, default_detector_half_width_mm())
 
-    def schedule_panel_apply(self, panel_id: int) -> None:
+    def schedule_panel_update(self, panel_id: int) -> None:
         if not self.ordinary_panels:
             return
-        job = self._pending_apply_jobs.get(panel_id)
+        job = self._pending_live_jobs.get(panel_id)
         if job is not None:
             self.after_cancel(job)
-        self._pending_apply_jobs[panel_id] = self.after(550, lambda p=panel_id: self.apply_panel_settings(p))
+        self._pending_live_jobs[panel_id] = self.after(250, lambda p=panel_id: self.update_live_panel_settings(p))
 
-    def apply_all_panels(self, _event=None) -> None:
-        for state in self.states:
-            self.apply_panel_settings(state.panel_id)
+    def update_panel_annotations(self, panel_id: int, *, redraw: bool = True) -> list[str]:
+        state = self.panel_state_by_id(panel_id)
+        panel = self.ordinary_panels.get(panel_id)
+        if state is None or panel is None:
+            return []
+        model = self.model_for(state.crystal)
+        errors: list[str] = []
+        changed = False
+        for variable, attribute, kind in (
+            (panel.plane_var, "plane_text", "plane"),
+            (panel.vector_var, "vector_text", "direction"),
+        ):
+            text = variable.get()
+            _, field_errors = parse_indices(text, model, kind, allow_multiple=True, allow_reciprocal=kind == "direction")
+            errors.extend(field_errors)
+            if not field_errors and text != getattr(state, attribute):
+                setattr(state, attribute, text)
+                changed = True
+        if changed and redraw:
+            # Adding annotations must not reset a mouse-adjusted camera, even before Sync.
+            axis = panel.crystal_ax
+            orientation = (axis.elev, axis.azim, getattr(axis, "roll", 0.0))
+            self.draw_crystal(panel_id)
+            axis.view_init(elev=orientation[0], azim=orientation[1], roll=orientation[2])
+            panel.crystal_canvas.draw_idle()
+        return errors
+
+    def update_live_panel_settings(self, panel_id: int) -> None:
+        self._pending_live_jobs.pop(panel_id, None)
+        state = self.panel_state_by_id(panel_id)
+        panel = self.ordinary_panels.get(panel_id)
+        if state is None or panel is None:
+            return
+        self.update_panel_annotations(panel_id)
+        color = panel.diff_color_var.get().strip()
+        if color != state.diffraction_color:
+            state.diffraction_color = color
+            self.draw_diffraction(panel_id)
+            panel.diffraction_canvas.draw_idle()
+            self.refresh_combo_panels()
 
     def on_crystal_selected(self, column: int) -> None:
         if not self.controls:
@@ -4249,57 +4600,62 @@ class CrystalDiffractionSimulator(tk.Tk):
             return
         self.controls[column]["plane"].set("")
         self.controls[column]["vector"].set("")
+        self.controls[column]["zone"].set("")
+        self.controls[column]["rotation"].set("")
+        self.states[column].applied_zone_text = ""
         color = self.default_diffraction_color_for_model(self.model_for(selected))
         self.set_panel_diffraction_color_control(self.states[column], color, user_set=False)
         self.apply_panel_settings(self.states[column].panel_id)
 
     def apply_panel_settings(self, panel_id: int, initial: bool = False) -> None:
-        pending = self._pending_apply_jobs.pop(panel_id, None)
-        if pending is not None:
-            self.after_cancel(pending)
         state = self.panel_state_by_id(panel_id)
         panel = self.ordinary_panels.get(panel_id)
         if state is None or panel is None:
             return
+        crystal = panel.crystal_var.get()
+        if crystal == CUSTOM_SENTINEL:
+            crystal = "FCC"
+        model = self.model_for(crystal)
+        zone_text = panel.zone_var.get().strip()
+        rotation_text = panel.rotation_var.get().strip()
+        zone, zone_errors = parse_indices(zone_text, model, "direction", allow_multiple=False)
+        rotation_command, rotation_errors = parse_rotation_command(rotation_text, model)
+        # Validate both commands before changing orientation or consuming either input.
+        if zone_text and (
+            zone_errors or len(zone) != 1 or len(split_index_groups(zone_text, allow_multiple=True)) != 1
+            or re.search(r"[^0-9+\-\s,;()\[\]{}<>]", normalize_text(zone_text))
+        ):
+            return
+        if rotation_text and (rotation_errors or rotation_command is None):
+            return
         old_view = camera_vector_from_view(state.elev, state.azim)
         old_roll = state.roll
-        panel.sync_state_from_controls()
-        if state.crystal == CUSTOM_SENTINEL:
-            state.crystal = "FCC"
-            panel.crystal_var.set("FCC")
-        model = self.model_for(state.crystal)
-        errors: list[str] = []
-
-        zone_changed = initial or state.zone_text != state.applied_zone_text
-        zone: list[ParsedIndex] = []
-        if state.zone_text.strip():
-            zone, zone_errors = parse_indices(state.zone_text, model, "direction", allow_multiple=False)
-            if zone_changed:
-                errors.extend(zone_errors)
-                if zone:
-                    state.elev, state.azim = view_from_vector(zone[0].vector)
-                    state.roll = 0.0
-                    state.applied_zone_text = state.zone_text
-                else:
-                    errors.append(f"Panel {panel_id}: keeping previous view")
-
+        new_view, new_roll = old_view.copy(), old_roll
+        if zone:
+            new_view, new_roll = zone[0].vector, 0.0
         rotation_message = ""
-        rotation_command, rotation_errors = parse_rotation_command(state.rotation_text, model)
-        errors.extend(rotation_errors)
         if rotation_command is not None:
-            view = camera_vector_from_view(state.elev, state.azim)
-            axis = rotation_command.axis if rotation_command.axis is not None else view
+            axis = rotation_command.axis if rotation_command.axis is not None else new_view
             if normalize_vector(axis) is None:
-                errors.append(f"Panel {panel_id}: rotation axis has zero length")
-            else:
-                view, state.roll = rotate_orientation(view, state.roll, axis, rotation_command.angle_degrees)
-                state.elev, state.azim = view_from_vector(view)
-                rotation_message = f"Panel {panel_id}: rotated {rotation_command.angle_degrees:g} deg about {rotation_command.axis_label}"
-                state.rotation_text = ""
-                panel.rotation_var.set("")
-
+                return
+            new_view, new_roll = rotate_orientation(new_view, new_roll, axis, rotation_command.angle_degrees)
+            rotation_message = f"Panel {panel_id}: rotated {rotation_command.angle_degrees:g} deg about {rotation_command.axis_label}"
+        if not np.all(np.isfinite(new_view)) or not math.isfinite(new_roll):
+            return
+        pending = self._pending_live_jobs.pop(panel_id, None)
+        if pending is not None:
+            self.after_cancel(pending)
+        state.crystal = crystal
+        state.elev, state.azim = view_from_vector(new_view)
+        state.roll = new_roll
+        state.diffraction_color = panel.diff_color_var.get().strip()
+        if zone:
+            state.applied_zone_text = zone_text
+        state.zone_text = state.rotation_text = ""
+        panel.zone_var.set("")
+        panel.rotation_var.set("")
+        errors = self.update_panel_annotations(panel_id, redraw=False)
         self.draw_panel(panel_id)
-        new_view = camera_vector_from_view(state.elev, state.azim)
         if not initial:
             self.propagate_bound_motion(panel_id, old_view, old_roll, new_view, state.roll)
             self.refresh_combo_panels()
@@ -4328,13 +4684,12 @@ class CrystalDiffractionSimulator(tk.Tk):
         old_view = camera_vector_from_view(state.elev, state.azim)
         old_roll = state.roll
         model = self.model_for(state.crystal)
-        zone, errors = parse_indices(state.zone_text, model, "direction", allow_multiple=False)
+        zone, errors = parse_indices(state.applied_zone_text, model, "direction", allow_multiple=False)
         if not zone:
             self.status_var.set("; ".join(errors[:2]) if errors else f"Panel {panel_id}: no zone axis to reset to")
             return
         state.elev, state.azim = view_from_vector(zone[0].vector)
         state.roll = 0.0
-        state.applied_zone_text = state.zone_text
         self.draw_panel(panel_id)
         self.propagate_bound_motion(panel_id, old_view, old_roll, camera_vector_from_view(state.elev, state.azim), state.roll)
         self.status_var.set(f"Panel {panel_id}: reset to {zone[0].label}")
@@ -4564,8 +4919,8 @@ class CrystalDiffractionSimulator(tk.Tk):
                 alpha=0.85,
             )
         overlay_points = [model.crystal_origin]
-        planes, plane_errors = parse_indices(state.plane_text, model, "plane", allow_multiple=True)
-        vectors, vector_errors = parse_indices(
+        planes, _ = parse_indices(state.plane_text, model, "plane", allow_multiple=True)
+        vectors, _ = parse_indices(
             state.vector_text,
             model,
             "direction",
@@ -4574,8 +4929,6 @@ class CrystalDiffractionSimulator(tk.Tk):
         )
         overlay_points.extend(self.draw_planes(axis, planes, model))
         overlay_points.extend(self.draw_vectors(axis, vectors, model))
-        if plane_errors or vector_errors:
-            self.status_var.set("; ".join((plane_errors + vector_errors)[:3]))
         axis.set_box_aspect([1, 1, 1])
         all_points = np.vstack([model.display_atoms, np.array(overlay_points)])
         base_limit = max(model.limit, float(np.max(np.abs(all_points))) * 1.12)
@@ -4591,7 +4944,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         panel.status_var.set(self.panel_status_text(state))
 
     def panel_status_text(self, state: PanelState) -> str:
-        return f"{state.crystal} | zone {state.zone_text or 'free'} | elev {state.elev:.1f}, azim {state.azim:.1f}, roll {state.roll:.1f}"
+        return f"{state.crystal} | zone {state.applied_zone_text or 'free'} | elev {state.elev:.1f}, azim {state.azim:.1f}, roll {state.roll:.1f}"
 
     def draw_real_space_scale_bar(self, axis, model: CrystalModel, limit: float, state: PanelState) -> None:
         theme = self.current_theme()

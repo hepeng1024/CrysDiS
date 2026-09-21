@@ -506,6 +506,7 @@ class CrystalDefinition:
     space_group: str = "P1"
     repeat_boundary_atoms: bool = True
     sites: list[AtomicSite] = field(default_factory=list)
+    symmetry_operations: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CrystalDefinition":
@@ -522,6 +523,7 @@ class CrystalDefinition:
             space_group=str(data.get("space_group", data.get("symmetry", "P1")) or "P1"),
             repeat_boundary_atoms=bool(data.get("repeat_boundary_atoms", True)),
             sites=sites,
+            symmetry_operations=list(data.get("symmetry_operations", [])),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -571,15 +573,17 @@ class RotationCommand:
 class PanelState:
     panel_id: int
     crystal_name: str = "FCC"
-    zone_text: str = "100"
+    zone_text: str = ""
     plane_text: str = ""
     vector_text: str = ""
     rotation_text: str = ""
     diffraction_color: str = DEFAULT_DIFFRACTION_COLORS["FCC"]
     view_vector: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.0, 0.0]))
     roll: float = 0.0
-    applied_zone_text: str = ""
+    applied_zone_text: str = "100"
     magnified: bool = False
+    vector_colors: list[str] | None = None
+    plane_colors: list[str] | None = None
 
 
 @dataclass
@@ -690,8 +694,7 @@ def space_group_options() -> tuple[str, ...]:
 @lru_cache(maxsize=512)
 def space_group_symbol(value: str | None) -> str:
     text = str(value or "P1").strip()
-    if ":" in text:
-        text = text.split(":", 1)[1].strip()
+    text = re.sub(r"^\d+\s*:\s*", "", text)
     text = text.strip("'\"")
     if text in {"", ".", "?"}:
         return "P1"
@@ -709,7 +712,10 @@ def space_group_symbol(value: str | None) -> str:
         from pymatgen.symmetry.groups import SpaceGroup
 
         space_group = SpaceGroup.from_int_number(int(compact)) if compact.isdigit() else SpaceGroup(compact)
-        return str(space_group.symbol)
+        symbol = str(space_group.symbol)
+        if ":" in compact and ":" not in symbol:
+            symbol += ":" + compact.rsplit(":", 1)[1]
+        return symbol
     except Exception:
         return compact
 
@@ -737,6 +743,22 @@ def cif_block_value(block: dict[str, Any], *keys: str) -> Any:
 
 
 def declared_space_group_from_cif_block(block: dict[str, Any]) -> str:
+    setting = cif_block_value(block, "_space_group_IT_coordinate_system_code", "_space_group.IT_coordinate_system_code")
+    setting_suffix = f":{setting}" if setting and str(setting).strip() not in {".", "?"} else ""
+    symbol = cif_block_value(
+        block, "_symmetry_space_group_name_H-M", "_space_group_name_H-M_alt", "_space_group.name_H-M_alt"
+    )
+    if symbol and str(symbol).strip() not in {".", "?"}:
+        symbol = space_group_symbol(symbol)
+        if setting_suffix and ":" not in symbol:
+            symbol = space_group_symbol(symbol + setting_suffix)
+        try:
+            from pymatgen.symmetry.groups import SpaceGroup
+
+            SpaceGroup(symbol)
+            return symbol
+        except ValueError:
+            pass
     number = cif_block_value(
         block,
         "_symmetry_Int_Tables_number",
@@ -745,8 +767,7 @@ def declared_space_group_from_cif_block(block: dict[str, Any]) -> str:
     )
     number_match = re.match(r"\s*([1-9]\d*)", str(number if number is not None else "").strip("'\""))
     if number_match:
-        return space_group_symbol_from_number(int(number_match.group(1)))
-    symbol = cif_block_value(block, "_symmetry_space_group_name_H-M", "_space_group_name_H-M_alt")
+        return space_group_symbol(space_group_symbol_from_number(int(number_match.group(1))) + setting_suffix)
     return space_group_symbol(symbol)
 
 
@@ -776,35 +797,52 @@ def snap_fractional(frac: np.ndarray) -> np.ndarray:
 
 def wrap_fractional(frac: np.ndarray, tolerance: float = 1e-8) -> np.ndarray:
     wrapped = np.mod(np.asarray(frac, dtype=float), 1.0)
-    wrapped[np.isclose(wrapped, 1.0, atol=tolerance) | np.isclose(wrapped, 0.0, atol=tolerance)] = 0.0
+    wrapped[np.isclose(wrapped, 1.0, atol=tolerance, rtol=0) | np.isclose(wrapped, 0.0, atol=tolerance, rtol=0)] = 0.0
     return wrapped
+
+
+@lru_cache(maxsize=256)
+def parsed_symmetry_operations(operation_texts: tuple[str, ...]) -> tuple[Any, ...]:
+    from pymatgen.core.operations import SymmOp
+
+    operations = []
+    for text in operation_texts:
+        operation = SymmOp.from_xyz_str(text)
+        if len(text.split(",")) != 3 or not np.isclose(abs(np.linalg.det(operation.rotation_matrix)), 1.0):
+            raise ValueError(f"Invalid CIF symmetry operation: {text}")
+        operations.append(operation)
+    return tuple(operations)
 
 
 def expanded_sites(definition: CrystalDefinition) -> list[AtomicSite]:
     symbol = space_group_symbol(definition.space_group)
-    if symbol in {"", "P1", "1"}:
+    if definition.symmetry_operations:
+        operations = parsed_symmetry_operations(tuple(definition.symmetry_operations))
+    elif symbol in {"", "P1", "1"}:
         return [AtomicSite(**asdict(site)) for site in definition.sites]
+    else:
+        try:
+            from pymatgen.symmetry.groups import SpaceGroup
 
-    try:
-        from pymatgen.symmetry.groups import SpaceGroup
-
-        space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
-        operations = space_group.symmetry_ops
-    except Exception:
-        return [AtomicSite(**asdict(site)) for site in definition.sites]
+            space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
+            operations = space_group.symmetry_ops
+        except Exception:
+            return [AtomicSite(**asdict(site)) for site in definition.sites]
 
     expanded: list[AtomicSite] = []
     seen: set[tuple[str, int, int, int]] = set()
+    # Imported coordinates and operations share a setting; do not snap them to ideal sites.
+    normalize_fractional = wrap_fractional if definition.symmetry_operations else snap_fractional
+    site_tolerance = 1e-6 if definition.symmetry_operations else SYMMETRY_SITE_TOL
     for site in definition.sites:
-        base_frac = snap_fractional(site.fractional)
+        base_frac = normalize_fractional(site.fractional)
         for operation in operations:
-            frac = snap_fractional(np.mod(operation.operate(base_frac), 1.0))
-            frac[np.isclose(frac, 1.0, atol=1e-7)] = 0.0
+            frac = normalize_fractional(operation.operate(base_frac))
             key = (
                 site.element.strip().capitalize(),
-                int(round(float(frac[0]) / SYMMETRY_SITE_TOL)),
-                int(round(float(frac[1]) / SYMMETRY_SITE_TOL)),
-                int(round(float(frac[2]) / SYMMETRY_SITE_TOL)),
+                int(round(float(frac[0]) / site_tolerance)),
+                int(round(float(frac[1]) / site_tolerance)),
+                int(round(float(frac[2]) / site_tolerance)),
             )
             if key in seen:
                 continue
@@ -1255,7 +1293,7 @@ def space_group_export_metadata(value: str | None) -> tuple[str, int | None, lis
         operations = sorted({operation.as_xyz_str() for operation in space_group.symmetry_ops})
         if "x, y, z" in operations:
             operations = ["x, y, z", *[operation for operation in operations if operation != "x, y, z"]]
-        return str(space_group.symbol), int(space_group.int_number), operations or ["x, y, z"]
+        return symbol, int(space_group.int_number), operations or ["x, y, z"]
     except Exception:
         return symbol or "P1", None, ["x, y, z"]
 
@@ -1278,6 +1316,8 @@ def cif_site_label(site: AtomicSite, element: str, index: int, used_labels: set[
 
 def symmetry_preserving_cif_text_for_definition(definition: CrystalDefinition) -> str:
     symbol, number, operations = space_group_export_metadata(definition.space_group)
+    if definition.symmetry_operations:
+        operations = [operation.as_xyz_str() for operation in parsed_symmetry_operations(tuple(definition.symmetry_operations))]
     block_name = sanitize_export_filename_stem(definition.name, "crystal")
     lines = [
         "# generated using CrysDiS",
@@ -2016,31 +2056,69 @@ def declared_cif_symmetry_operations(block: dict[str, Any], declared_space_group
         "_space_group_symop_operation_xyz",
         "_symmetry_equiv_pos_as_xyz",
         "_space_group_symop.operation_xyz",
+        "_symmetry_equiv.pos_as_xyz",
     )
+    operation_texts = [str(text).strip().strip("'\"") for text in operation_texts if str(text).strip() not in {"", ".", "?"}]
     if operation_texts:
         try:
-            from pymatgen.core.operations import SymmOp
+            return list(parsed_symmetry_operations(tuple(operation_texts)))
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Could not read the CIF symmetry operations: {exc}") from exc
 
-            operations = []
-            for text in operation_texts:
-                operation = str(text).strip().strip("'\"")
-                if operation:
-                    operations.append(SymmOp.from_xyz_str(operation))
-            if operations:
-                return operations
-        except Exception:
-            pass
+    from pymatgen.symmetry.groups import SpaceGroup
+
+    hall_symbol = cif_block_value(block, "_space_group_name_Hall", "_symmetry_space_group_name_Hall", "_space_group.name_Hall")
+    if hall_symbol and str(hall_symbol).strip() not in {".", "?"}:
+        hall_key = re.sub(r"\s+", "", str(hall_symbol))
+        for setting in SpaceGroup.SYMM_OPS:
+            if re.sub(r"\s+", "", setting["hall"]) == hall_key:
+                return list(parsed_symmetry_operations(tuple(setting["symops"])))
 
     symbol = space_group_symbol(declared_space_group)
     if symbol in {"", "P1", "1"}:
         return []
     try:
-        from pymatgen.symmetry.groups import SpaceGroup
-
         space_group = SpaceGroup.from_int_number(int(symbol)) if symbol.isdigit() else SpaceGroup(symbol)
         return list(space_group.symmetry_ops)
-    except Exception:
-        return []
+    except ValueError as exc:
+        raise ValueError(f"Could not determine CIF symmetry from space group {symbol!r}") from exc
+
+
+@lru_cache(maxsize=256)
+def space_group_for_operations(symbol: str, operation_texts: tuple[str, ...]) -> str:
+    from pymatgen.symmetry.groups import SpaceGroup
+
+    def operation_keys(operations: Any) -> set[tuple[float, ...]]:
+        return {
+            tuple(np.round(operation.rotation_matrix.ravel(), 7))
+            + tuple(np.round(wrap_fractional(operation.translation_vector), 7))
+            for operation in operations
+        }
+
+    operations = parsed_symmetry_operations(operation_texts)
+    if not operations:
+        return symbol
+    try:
+        import spglib
+
+        group_type = spglib.get_spacegroup_type_from_symmetry(
+            [operation.rotation_matrix for operation in operations],
+            [operation.translation_vector for operation in operations],
+        )
+        if group_type is not None:
+            symbol = space_group_symbol_from_number(group_type.number)
+    except (ImportError, ValueError):
+        pass
+    expected = operation_keys(operations)
+    try:
+        candidates = [symbol, *sorted(SpaceGroup.get_settings(symbol))]
+        for candidate in candidates:
+            if operation_keys(SpaceGroup(candidate).symmetry_ops) == expected:
+                return space_group_symbol(candidate)
+    except ValueError:
+        pass
+    # A nonstandard origin/basis may have no matching named setting; keep its operations.
+    return symbol
 
 
 def fractional_points_match(a: np.ndarray, b: np.ndarray, tolerance: float = SYMMETRY_SITE_TOL) -> bool:
@@ -2054,11 +2132,11 @@ def equivalent_under_operations(site: AtomicSite, representative: AtomicSite, op
         return False
     if not math.isclose(float(site.occupancy), float(representative.occupancy), abs_tol=1e-5):
         return False
-    target = snap_fractional(site.fractional)
-    base = snap_fractional(representative.fractional)
+    target = wrap_fractional(site.fractional)
+    base = wrap_fractional(representative.fractional)
     for operation in operations:
-        frac = snap_fractional(np.mod(operation.operate(base), 1.0))
-        if fractional_points_match(frac, target):
+        frac = wrap_fractional(operation.operate(base))
+        if fractional_points_match(frac, target, tolerance=1e-6):
             return True
     return False
 
@@ -2095,16 +2173,14 @@ def atomic_sites_from_cif_block(block: dict[str, Any], declared_space_group: str
         element = element_from_cif_atom(cif_value_at(symbols, index, ""), label)
         if not element:
             continue
-        frac = snap_fractional(
-            wrap_fractional(
-                np.array(
-                    [
-                        parse_cif_float(cif_value_at(xs, index, 0.0)),
-                        parse_cif_float(cif_value_at(ys, index, 0.0)),
-                        parse_cif_float(cif_value_at(zs, index, 0.0)),
-                    ],
-                    dtype=float,
-                )
+        frac = wrap_fractional(
+            np.array(
+                [
+                    parse_cif_float(cif_value_at(xs, index, 0.0)),
+                    parse_cif_float(cif_value_at(ys, index, 0.0)),
+                    parse_cif_float(cif_value_at(zs, index, 0.0)),
+                ],
+                dtype=float,
             )
         )
         sites.append(
@@ -2136,7 +2212,7 @@ def atomic_sites_from_structure(structure: Any, *, representatives_only: bool) -
 
     sites: list[AtomicSite] = []
     for site in source_sites:
-        frac = snap_fractional(wrap_fractional(np.asarray(site.frac_coords, dtype=float)))
+        frac = wrap_fractional(np.asarray(site.frac_coords, dtype=float))
         for specie, occupancy in site.species.items():
             element = getattr(specie, "symbol", str(specie)).strip().capitalize()
             sites.append(
@@ -2155,33 +2231,62 @@ def atomic_sites_from_structure(structure: Any, *, representatives_only: bool) -
 
 def definition_from_cif(path: Path) -> CrystalDefinition:
     try:
-        from pymatgen.io.cif import CifParser
+        from pymatgen.io.cif import CifBlock, CifFile, CifParser
         from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
     except Exception as exc:
         raise ValueError(f"pymatgen is required to load CIF files: {exc}") from exc
 
     try:
-        parser = CifParser(str(path))
-        cif_block = next(iter(parser.as_dict().values()), {})
+        blocks = CifFile.from_file(str(path)).data
+        source_block = next(
+            (block for block in blocks.values() if cif_block_value(block.data, "_atom_site_fract_x", "_atom_site.fract_x") is not None),
+            next(iter(blocks.values())),
+        )
+        # Normalize CIF tag spelling, then give pymatgen the same operations used by the model.
+        normalize_tag = lambda key: str(key).lower().replace(".", "_").rstrip("_")
+        cif_block = {normalize_tag(key): value for key, value in source_block.data.items()}
+        declared_space_group = declared_space_group_from_cif_block(cif_block)
+        operations = declared_cif_symmetry_operations(cif_block, declared_space_group)
+        operation_texts = [operation.as_xyz_str() for operation in operations] or ["x, y, z"]
+        operation_tag = "_symmetry_equiv_pos_as_xyz"
+        cif_block[operation_tag] = operation_texts
+        loops = [[normalize_tag(key) for key in loop if normalize_tag(key) != operation_tag] for loop in source_block.loops]
+        sites = atomic_sites_from_cif_block(cif_block, declared_space_group)
+        parser_data = dict(cif_block)
+        if sites:
+            # Some exporters include equivalent sites as well as symmetry; expand each orbit only once.
+            parser_data = {key: value for key, value in parser_data.items() if not key.startswith("_atom_site_")}
+            loops = [[key for key in loop if key in parser_data] for loop in loops]
+            atom_columns = {
+                "_atom_site_label": [site.label for site in sites],
+                "_atom_site_type_symbol": [site.element for site in sites],
+                "_atom_site_fract_x": [str(site.x) for site in sites],
+                "_atom_site_fract_y": [str(site.y) for site in sites],
+                "_atom_site_fract_z": [str(site.z) for site in sites],
+                "_atom_site_occupancy": [str(site.occupancy) for site in sites],
+            }
+            parser_data.update(atom_columns)
+            loops.append(list(atom_columns))
+        parser_block = CifBlock(parser_data, [loop for loop in loops if loop] + [[operation_tag]], source_block.header)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
+            parser = CifParser.from_str(str(parser_block), frac_tolerance=0)
             structure = parser.parse_structures(primitive=False)[0]
     except Exception as exc:
         raise ValueError(f"Could not read CIF file: {exc}") from exc
 
     lattice = structure.lattice
     crystal_system = "triclinic"
-    declared_space_group = declared_space_group_from_cif_block(cif_block)
+    declared_space_group = space_group_for_operations(declared_space_group, tuple(operation_texts))
     try:
         analyzer = SpacegroupAnalyzer(structure, symprec=0.01)
         crystal_system = str(analyzer.get_crystal_system()).lower()
     except Exception:
         pass
 
-    sites = atomic_sites_from_cif_block(cif_block, declared_space_group)
     if not sites:
-        representatives_only = space_group_symbol(declared_space_group) not in {"", "P1", "1"}
-        sites = atomic_sites_from_structure(structure, representatives_only=representatives_only)
+        sites = atomic_sites_from_structure(structure, representatives_only=False)
+        sites = reduce_cif_sites_by_declared_symmetry(sites, cif_block, declared_space_group)
 
     if not sites:
         raise ValueError("The CIF file did not contain any atom sites.")
@@ -2198,6 +2303,7 @@ def definition_from_cif(path: Path) -> CrystalDefinition:
         space_group=declared_space_group,
         repeat_boundary_atoms=True,
         sites=sites,
+        symmetry_operations=operation_texts,
     )
 
 
@@ -2413,6 +2519,8 @@ class CrystalBuilder:
         self.save_new_button = None
         self.export_cif_button = None
         self.repeat_boundary_atoms = True
+        self.imported_space_group = "P1"
+        self.imported_symmetry_operations: list[str] = []
         self._build()
 
     def _build(self) -> None:
@@ -2529,7 +2637,10 @@ class CrystalBuilder:
     def load_definition(self, definition: CrystalDefinition) -> None:
         self.name_input.value = definition.name if definition.name not in DEFAULT_NAMES else f"{definition.name} custom"
         self.system_select.value = definition.lattice_system
-        self.symmetry_select.value = space_group_option_for(definition.space_group)
+        symmetry_option = space_group_option_for(definition.space_group)
+        self.symmetry_select.set_options(list(dict.fromkeys([*space_group_options(), symmetry_option])), value=symmetry_option)
+        self.imported_space_group = space_group_symbol(definition.space_group)
+        self.imported_symmetry_operations = list(definition.symmetry_operations)
         self.repeat_boundary_atoms = definition.repeat_boundary_atoms
         self.a_input.value = definition.a
         self.b_input.value = definition.b
@@ -2685,6 +2796,7 @@ class CrystalBuilder:
         return sites
 
     def read_definition(self) -> CrystalDefinition:
+        selected_group = space_group_symbol(self.symmetry_select.value)
         definition = CrystalDefinition(
             name=str(self.name_input.value or "Customized crystal").strip(),
             lattice_system=str(self.system_select.value or "triclinic").lower(),
@@ -2694,9 +2806,12 @@ class CrystalBuilder:
             alpha=float(self.alpha_input.value or 90.0),
             beta=float(self.beta_input.value or 90.0),
             gamma=float(self.gamma_input.value or 90.0),
-            space_group=space_group_symbol(self.symmetry_select.value),
+            space_group=selected_group,
             repeat_boundary_atoms=self.repeat_boundary_atoms,
             sites=self.read_sites_from_rows(),
+            symmetry_operations=(
+                list(self.imported_symmetry_operations) if selected_group == self.imported_space_group else []
+            ),
         )
         lattice_matrix(definition)
         if not definition.sites:
@@ -2775,6 +2890,8 @@ class PanelController:
         self.scale_timer = None
         self.current_model: CrystalModel | None = None
         self.scene_signature: tuple[Any, ...] | None = None
+        self._updating_inputs = False
+        self._applying = False
 
     def build(self) -> None:
         card_classes = f"comparison-panel comparison-panel-{self.state.panel_id}"
@@ -2790,20 +2907,24 @@ class PanelController:
                     with_input=True,
                     on_change=self.on_crystal_changed,
                 ).props("outlined dense").classes("panel-crystal")
-                self.zone_input = ui.input("Zone axis", value=self.state.zone_text, on_change=lambda _: self.apply()).props(
+                self.zone_input = ui.input(
+                    "Zone axis", value=self.state.zone_text,
+                    on_change=lambda event: setattr(self.state, "zone_text", event.value),
+                ).props(
                     "outlined dense"
                 ).classes("panel-index panel-zone")
                 self.zone_input.on("keydown.enter", self.apply_from_browser)
-                self.plane_input = ui.input("Plane", value=self.state.plane_text, on_change=lambda _: self.apply()).props(
+                self.plane_input = ui.input("Plane", value=self.state.plane_text, on_change=lambda _: self.update_annotations()).props(
                     "outlined dense"
                 ).classes("panel-index panel-plane")
                 self.plane_input.on("keydown.enter", self.apply_from_browser)
                 self.vector_input = ui.input(
-                    "Vector", value=self.state.vector_text, on_change=lambda _: self.apply()
+                    "Vector", value=self.state.vector_text, on_change=lambda _: self.update_annotations()
                 ).props("outlined dense").classes("panel-vector")
                 self.vector_input.on("keydown.enter", self.apply_from_browser)
                 self.rotation_input = ui.input(
-                    "Rotation", value=self.state.rotation_text
+                    "Rotation", value=self.state.rotation_text,
+                    on_change=lambda event: setattr(self.state, "rotation_text", event.value),
                 ).props("outlined dense").classes("panel-rotation").tooltip(
                     "Use 110/45 or 110 45. Use 45, 45 ccw, or 45 cw for in-plane rotation."
                 )
@@ -2814,6 +2935,9 @@ class PanelController:
                 ui.button("Sync", on_click=self.sync_from_scene).props("outline dense").classes(
                     "panel-sync-button"
                 ).tooltip("Sync diffraction to the current 3D crystal view")
+                ui.button(
+                    icon="palette", on_click=lambda: self.simulator.open_palette_dialog(self.state.panel_id),
+                ).props("flat round dense").classes("panel-colors-button").tooltip("Panel colors")
                 ui.button(icon="photo_camera", on_click=self.open_download_dialog).props("flat round dense").classes(
                     "panel-download-button"
                 ).tooltip("Download images")
@@ -2892,14 +3016,31 @@ class PanelController:
             self.crystal_select.update()
             self.open_builder()
             return
+        if self.crystal_select.value == self.state.crystal_name:
+            return
+        self.simulator.set_panel_crystal(self.state, self.crystal_select.value, force_default_color=True)
         self.state.plane_text = ""
         self.state.vector_text = ""
-        self.state.applied_zone_text = ""
+        self.state.zone_text = ""
+        self.state.rotation_text = ""
+        zone_text = "100" if self.state.crystal_name in DEFAULT_NAMES else self.state.applied_zone_text or "001"
+        model = self.simulator.model_for(self.state.crystal_name)
+        zone, _ = parse_indices(zone_text, model, "direction", allow_multiple=False)
+        if zone:
+            self.state.view_vector = zone[0].vector
+            self.state.roll = 0.0
+            self.state.applied_zone_text = zone_text
+        self._updating_inputs = True
         if self.plane_input is not None:
             self.plane_input.value = ""
         if self.vector_input is not None:
             self.vector_input.value = ""
-        self.apply()
+        self.zone_input.value = ""
+        self.rotation_input.value = ""
+        self._updating_inputs = False
+        self.redraw_scene(model)
+        self.redraw_diffraction(model)
+        self.simulator.refresh_combo_panels_for_sources({self.state.panel_id})
 
     def open_builder(self) -> None:
         self.simulator.builder.open(
@@ -2987,8 +3128,8 @@ class PanelController:
         ax.set_xlim(center_x - width / 2.0, center_x + width / 2.0)
         ax.set_ylim(center_y - height / 2.0, center_y + height / 2.0)
 
-        plane_palette = self.simulator.plane_palette()
-        vector_palette = self.simulator.vector_palette()
+        plane_palette = self.simulator.plane_palette(self.state.panel_id)
+        vector_palette = self.simulator.vector_palette(self.state.panel_id)
         for index, (_plane, polygon) in enumerate(plane_polygons):
             color = plane_palette[index % len(plane_palette)]
             projected = project_many(polygon)
@@ -3310,8 +3451,16 @@ class PanelController:
             ui.notify("Could not capture the selected image", type="warning")
 
     async def apply_from_browser(self) -> None:
-        rotation_text = self.state.rotation_text
-        values: dict[str, Any] = {}
+        if self._applying:
+            return
+        self._applying = True
+        try:
+            await self.read_browser_inputs_and_apply()
+        finally:
+            self._applying = False
+
+    async def read_browser_inputs_and_apply(self) -> None:
+        rotation_text = self.rotation_input.value if self.rotation_input is not None else self.state.rotation_text
         selector = f".comparison-panel-{self.state.panel_id}"
         try:
             values = await ui.run_javascript(
@@ -3327,20 +3476,16 @@ class PanelController:
                 """
             )
         except Exception:
-            values = {}
+            values = None
         if isinstance(values, dict):
-            if self.zone_input is not None:
-                self.zone_input.value = str(values.get("zone", self.zone_input.value or ""))
-            if self.plane_input is not None:
-                self.plane_input.value = str(values.get("plane", self.plane_input.value or ""))
-            if self.vector_input is not None:
-                self.vector_input.value = str(values.get("vector", self.vector_input.value or ""))
-            rotation_text = str(values.get("rotation", rotation_text or ""))
-        elif self.rotation_input is not None:
+            self._updating_inputs = True
             try:
-                rotation_text = str(self.rotation_input.value or self.state.rotation_text)
-            except Exception:
-                rotation_text = self.rotation_input.value or self.state.rotation_text
+                for name, field in (("zone", self.zone_input), ("plane", self.plane_input), ("vector", self.vector_input)):
+                    if field is not None:
+                        field.value = str(values.get(name, field.value or ""))
+                rotation_text = str(values.get("rotation", rotation_text or ""))
+            finally:
+                self._updating_inputs = False
         self.apply(rotation_text_override=rotation_text)
 
     async def sync_from_scene(self) -> None:
@@ -3359,85 +3504,85 @@ class PanelController:
         self.simulator.propagate_bound_motion(self.state.panel_id, old_view, old_roll, self.state.view_vector, self.state.roll)
         self.simulator.set_status(f"Panel {self.state.panel_id}: diffraction synced to current 3D view")
 
-    def apply(self, initial: bool = False, rotation_text_override: str | None = None) -> None:
-        old_view = self.state.view_vector.copy()
-        old_roll = float(self.state.roll)
-        if self.crystal_select is not None and self.crystal_select.value != CUSTOM_SENTINEL:
-            self.simulator.set_panel_crystal(self.state, self.crystal_select.value or self.state.crystal_name)
-        self.state.zone_text = self.zone_input.value if self.zone_input is not None else self.state.zone_text
-        self.state.plane_text = self.plane_input.value if self.plane_input is not None else self.state.plane_text
-        self.state.vector_text = self.vector_input.value if self.vector_input is not None else self.state.vector_text
-        if rotation_text_override is not None:
-            self.state.rotation_text = rotation_text_override
-        else:
-            self.state.rotation_text = self.rotation_input.value if self.rotation_input is not None else self.state.rotation_text
-
+    def update_annotations(self, *, redraw: bool = True) -> list[str]:
+        if self._updating_inputs:
+            return []
         model = self.simulator.model_for(self.state.crystal_name)
         errors: list[str] = []
-        zone_text_changed = initial or self.state.zone_text != self.state.applied_zone_text
-        zone: list[ParsedIndex] = []
-        if self.state.zone_text.strip():
-            zone, zone_errors = parse_indices(self.state.zone_text, model, "direction", allow_multiple=False)
-        elif zone_text_changed:
-            zone_errors = []
-        else:
-            zone_errors = []
+        changed = False
+        for field, attribute, kind in (
+            (self.plane_input, "plane_text", "plane"),
+            (self.vector_input, "vector_text", "direction"),
+        ):
+            text = str(field.value or "") if field is not None else getattr(self.state, attribute)
+            _, field_errors = parse_indices(text, model, kind, allow_multiple=True, allow_reciprocal=kind == "direction")
+            errors.extend(field_errors)
+            if not field_errors and text != getattr(self.state, attribute):
+                setattr(self.state, attribute, text)
+                changed = True
+        if changed and redraw:
+            self.redraw_scene(model, update_camera=False)
+        return errors
 
-        if zone_text_changed:
-            errors.extend(zone_errors)
-            if zone:
-                self.state.view_vector = zone[0].vector
-                self.state.applied_zone_text = self.state.zone_text
-            elif self.state.zone_text.strip():
-                errors.append(f"Panel {self.state.panel_id}: keeping previous zone direction")
+    def apply(self, initial: bool = False, rotation_text_override: str | None = None) -> None:
+        model = self.simulator.model_for(self.state.crystal_name)
+        if initial:
+            self.redraw_scene(model)
+            self.redraw_diffraction(model)
+            return
 
-        rotation_message = ""
-        snap_message = ""
-        rotation_command, rotation_errors = parse_rotation_command(self.state.rotation_text, model)
-        errors.extend(rotation_errors)
+        zone_text = str(self.zone_input.value if self.zone_input is not None else self.state.zone_text).strip()
+        rotation_text = str(
+            rotation_text_override if rotation_text_override is not None else
+            self.rotation_input.value if self.rotation_input is not None else self.state.rotation_text
+        ).strip()
+        zone, zone_errors = parse_indices(zone_text, model, "direction", allow_multiple=False)
+        rotation_command, rotation_errors = parse_rotation_command(rotation_text, model)
+        # Validate both commands before changing orientation or consuming either input.
+        if zone_text and (
+            zone_errors or len(zone) != 1 or len(split_index_groups(zone_text, allow_multiple=True)) != 1
+            or re.search(r"[^0-9+\-\s,;()\[\]{}<>]", normalize_text(zone_text))
+        ):
+            return
+        if rotation_text and (rotation_errors or rotation_command is None):
+            return
+
+        old_view = self.state.view_vector.copy()
+        old_roll = float(self.state.roll)
+        new_view, new_roll = old_view.copy(), old_roll
+        if zone:
+            new_view, new_roll = zone[0].vector, 0.0
+        message = f"Panel {self.state.panel_id} updated"
         if rotation_command is not None:
             axis = rotation_command.axis
             if axis is None:
-                axis = normalize_vector(self.state.view_vector)
+                axis = normalize_vector(new_view)
             if axis is None:
-                errors.append(f"Panel {self.state.panel_id}: rotation axis has zero length")
-            else:
-                self.state.view_vector, self.state.roll = rotate_orientation(
-                    self.state.view_vector,
-                    self.state.roll,
-                    axis,
-                    rotation_command.angle_degrees,
-                )
-                rotation_message = (
-                    f"Panel {self.state.panel_id}: rotated {rotation_command.angle_degrees:g} deg about "
-                    f"{rotation_command.axis_label}"
-                )
-                self.state.rotation_text = ""
-                if self.rotation_input is not None:
-                    self.rotation_input.value = ""
-        elif self.simulator.always_snap_back_view() and zone:
-            self.state.view_vector = zone[0].vector
-            self.state.roll = 0.0
-            self.state.applied_zone_text = self.state.zone_text
-            snap_message = f"Panel {self.state.panel_id}: snapped back to {zone[0].label}"
+                return
+            new_view, new_roll = rotate_orientation(new_view, new_roll, axis, rotation_command.angle_degrees)
+            message = f"Panel {self.state.panel_id}: rotated {rotation_command.angle_degrees:g} deg about {rotation_command.axis_label}"
+        elif not zone and self.simulator.always_snap_back_view() and self.state.applied_zone_text:
+            previous_zone, _ = parse_indices(self.state.applied_zone_text, model, "direction", allow_multiple=False)
+            if previous_zone:
+                new_view, new_roll = previous_zone[0].vector, 0.0
+                message = f"Panel {self.state.panel_id}: snapped back to {previous_zone[0].label}"
+        if not np.all(np.isfinite(new_view)) or not math.isfinite(new_roll):
+            return
+        self.state.view_vector, self.state.roll = new_view, new_roll
+        if zone:
+            self.state.applied_zone_text = zone_text
+        self.state.zone_text = self.state.rotation_text = ""
+        if self.zone_input is not None:
+            self.zone_input.value = ""
+        if self.rotation_input is not None:
+            self.rotation_input.value = ""
+        errors = self.update_annotations(redraw=False)
         self.redraw_scene(model)
         self.redraw_diffraction(model)
-        if initial:
-            self.simulator.refresh_combo_panels()
-        else:
-            self.simulator.propagate_bound_motion(
-                self.state.panel_id,
-                old_view,
-                old_roll,
-                self.state.view_vector,
-                self.state.roll,
-            )
-        if not initial:
-            self.simulator.set_status(
-                "; ".join(errors[:3]) if errors else (rotation_message or snap_message or f"Panel {self.state.panel_id} updated")
-            )
+        self.simulator.propagate_bound_motion(self.state.panel_id, old_view, old_roll, new_view, new_roll)
+        self.simulator.set_status("; ".join(errors[:3]) if errors else message)
 
-    def redraw_scene(self, model: CrystalModel | None = None) -> None:
+    def redraw_scene(self, model: CrystalModel | None = None, *, update_camera: bool = True) -> None:
         if self.scene is None:
             return
         model = model or self.simulator.model_for(self.state.crystal_name)
@@ -3455,8 +3600,8 @@ class PanelController:
                         color=color_for_site(atom), opacity=0.58 + 0.42 * atom.occupancy
                     )
 
-                planes, plane_errors = parse_indices(self.state.plane_text, model, "plane", allow_multiple=True)
-                vectors, vector_errors = parse_indices(
+                planes, _ = parse_indices(self.state.plane_text, model, "plane", allow_multiple=True)
+                vectors, _ = parse_indices(
                     self.state.vector_text,
                     model,
                     "direction",
@@ -3465,10 +3610,10 @@ class PanelController:
                 )
                 self.draw_planes(model, planes)
                 self.draw_vectors(model, vectors)
-                if plane_errors or vector_errors:
-                    self.simulator.set_status("; ".join((plane_errors + vector_errors)[:3]))
             self.scene_signature = signature
 
+        if not update_camera:
+            return
         view = normalize_vector(self.state.view_vector)
         if view is None:
             view = np.array([1.0, 0.0, 0.0])
@@ -3595,8 +3740,8 @@ class PanelController:
             self.state.plane_text,
             self.state.vector_text,
             bool(self.simulator.show_crystal_annotations()),
-            tuple(self.simulator.plane_palette()),
-            tuple(self.simulator.vector_palette()),
+            tuple(self.simulator.plane_palette(self.state.panel_id)),
+            tuple(self.simulator.vector_palette(self.state.panel_id)),
         )
 
     def set_scale_bar_from_distance(
@@ -3647,7 +3792,7 @@ class PanelController:
     def draw_planes(self, model: CrystalModel, planes: list[ParsedIndex]) -> None:
         if self.scene is None:
             return
-        palette = self.simulator.plane_palette()
+        palette = self.simulator.plane_palette(self.state.panel_id)
         for index, plane in enumerate(planes):
             vertices = clipped_plane_polygon(model, plane)
             if vertices is None:
@@ -3668,7 +3813,7 @@ class PanelController:
     def draw_vectors(self, model: CrystalModel, vectors: list[ParsedIndex]) -> None:
         if self.scene is None:
             return
-        palette = self.simulator.vector_palette()
+        palette = self.simulator.vector_palette(self.state.panel_id)
         for index, vector in enumerate(vectors):
             color = palette[index % len(palette)]
             if vector.is_reciprocal:
@@ -4321,8 +4466,8 @@ class SimulatorApp:
         self.palette_dialog = None
         self.palette_vector_container = None
         self.palette_plane_container = None
-        self.diffraction_color_dialog = None
-        self.diffraction_color_container = None
+        self.palette_panel_id: int | None = None
+        self.palette_diffraction_input = None
         self.cif_dialog = None
         self.crystal_list_dialog = None
         self.crystal_list_container = None
@@ -4427,7 +4572,7 @@ CrysDiS represents **Crystal Diffraction Simulator**.
 Compare a real-space crystal view with its electron diffraction pattern. Each ordinary panel has the crystal on the left and the diffraction pattern on the right.
 
 ### Basic workflow
-1. Choose a crystal, enter a zone axis such as `100`, `110`, or `0001`, then press `Apply`.
+1. Choose a crystal, enter a zone axis such as `100`, `110`, or `0001`, then press `Apply` or Enter. Zone axis and Rotation clear after execution; when both are entered, the zone axis is applied first.
 2. Add planes like `100 123` and vectors like `110 -1-1-2` in the panel inputs.
 3. Use the mouse to rotate the 3D crystal. Press `Sync` to update the diffraction pattern to the current crystal view.
 4. Use `Download` to export the crystal view, diffraction pattern, or both.
@@ -4457,7 +4602,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
 ### Display controls
 - `Scale bar` toggles scale bars in both crystal and diffraction panels.
 - `Crystal annotations` toggles vector and plane labels in the 3D crystal view.
-- `Palette for vectors/planes` lets you customize, reorder, add, remove, or reset vector and plane colors. `Diffraction pattern colors` assigns colors to ordinary panels.
+- `Panel colors` sets the panel's diffraction color and vector/plane palettes. `Palette for vectors/planes` in Advanced sets global defaults; local palettes can return to these with `Use global default`.
                 """
             ).classes("intro-text")
 
@@ -4544,48 +4689,70 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     ui.button(
                         "Palette for vectors/planes",
                         icon="palette",
-                        on_click=self.open_palette_dialog,
-                    ).props("outline dense").classes("advanced-palette-button")
-                    ui.button(
-                        "Diffraction pattern colors",
-                        icon="palette",
-                        on_click=self.open_diffraction_color_dialog,
+                        on_click=lambda: self.open_palette_dialog(),
                     ).props("outline dense").classes("advanced-palette-button")
                 self.log_box = ui.textarea("Log", value="\n".join(self.status_history)).props(
                     "outlined dense readonly rows=5"
                 ).classes("advanced-log")
 
-    def open_palette_dialog(self) -> None:
-        self.palette_dialog = None
+    def open_palette_dialog(self, panel_id: int | None = None) -> None:
+        if panel_id is not None and self.panel_state_by_id(panel_id) is None:
+            return
+        if self.palette_dialog is not None:
+            self.palette_dialog.close()
+            self.palette_dialog.delete()
+        self.palette_panel_id = panel_id
         self.palette_vector_container = None
         self.palette_plane_container = None
+        self.palette_diffraction_input = None
         self.build_palette_dialog()
         self.refresh_palette_dialog()
         self.palette_dialog.open()
 
     def build_palette_dialog(self) -> None:
+        panel_id = self.palette_panel_id
+        state = self.panel_state_by_id(panel_id) if panel_id is not None else None
         self.palette_dialog = ui.dialog()
         with self.palette_dialog, ui.card().classes("palette-card"):
             with ui.row().classes("items-center justify-between full-width"):
-                ui.label("Palette for vectors/planes").classes("text-h6")
+                title = f"Panel {panel_id} colors - {state.crystal_name}" if state is not None else "Palette for vectors/planes"
+                ui.label(title).classes("text-h6")
                 ui.button(icon="close", on_click=self.palette_dialog.close).props("flat round dense").tooltip("Close")
+            if state is not None:
+                with ui.row().classes("items-center full-width"):
+                    self.palette_diffraction_input = ui.color_input(
+                        "Diffraction pattern", value=self.diffraction_color_for_state(state), preview=True,
+                        on_change=lambda event: self.set_panel_diffraction_color(panel_id, event.value),
+                    ).props("outlined dense").classes("panel-diffraction-color")
+                    ui.button(icon="restart_alt", on_click=lambda: self.reset_panel_diffraction_color(panel_id)).props(
+                        "flat round dense"
+                    ).tooltip("Reset diffraction color")
+                ui.separator()
             with ui.row().classes("palette-columns"):
                 with ui.column().classes("palette-column"):
                     with ui.row().classes("items-center justify-between full-width"):
                         ui.label("Vectors").classes("palette-title")
                         with ui.row().classes("palette-actions"):
-                            ui.button("Set to default", on_click=lambda: self.reset_palette("vector")).props("flat dense")
-                            ui.button("Add", icon="add", on_click=lambda: self.add_palette_color("vector")).props("outline dense")
+                            ui.button("Use global default" if state is not None else "Set to default",
+                                      on_click=lambda: self.reset_palette("vector", panel_id)).props("flat dense")
+                            ui.button("Add", icon="add", on_click=lambda: self.add_palette_color("vector", panel_id)).props("outline dense")
                     self.palette_vector_container = ui.element("div").classes("palette-list")
                 with ui.column().classes("palette-column"):
                     with ui.row().classes("items-center justify-between full-width"):
                         ui.label("Planes").classes("palette-title")
                         with ui.row().classes("palette-actions"):
-                            ui.button("Set to default", on_click=lambda: self.reset_palette("plane")).props("flat dense")
-                            ui.button("Add", icon="add", on_click=lambda: self.add_palette_color("plane")).props("outline dense")
+                            ui.button("Use global default" if state is not None else "Set to default",
+                                      on_click=lambda: self.reset_palette("plane", panel_id)).props("flat dense")
+                            ui.button("Add", icon="add", on_click=lambda: self.add_palette_color("plane", panel_id)).props("outline dense")
                     self.palette_plane_container = ui.element("div").classes("palette-list")
 
-    def palette_values(self, kind: str) -> list[str]:
+    def palette_values(self, kind: str, panel_id: int | None = None) -> list[str]:
+        if panel_id is not None:
+            state = self.panel_state_by_id(panel_id)
+            if state is not None:
+                colors = state.vector_colors if kind == "vector" else state.plane_colors
+                if colors is not None:
+                    return colors
         return self.vector_colors if kind == "vector" else self.plane_colors
 
     def palette_default_values(self, kind: str) -> list[str]:
@@ -4623,52 +4790,14 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             state.diffraction_color = current_color
         state.crystal_name = selected_name
 
-    def open_diffraction_color_dialog(self) -> None:
-        self.diffraction_color_dialog = None
-        self.diffraction_color_container = None
-        self.build_diffraction_color_dialog()
-        self.refresh_diffraction_color_dialog()
-        self.diffraction_color_dialog.open()
-
-    def build_diffraction_color_dialog(self) -> None:
-        self.diffraction_color_dialog = ui.dialog()
-        with self.diffraction_color_dialog, ui.card().classes("diffraction-color-card"):
-            with ui.row().classes("items-center justify-between full-width"):
-                ui.label("Diffraction pattern colors").classes("text-h6")
-                ui.button(icon="close", on_click=self.diffraction_color_dialog.close).props("flat round dense").tooltip("Close")
-            with ui.row().classes("palette-actions justify-end full-width"):
-                ui.button("Set to default", on_click=self.reset_all_diffraction_colors).props("flat dense")
-            self.diffraction_color_container = ui.element("div").classes("diffraction-color-list")
-
-    def refresh_diffraction_color_dialog(self) -> None:
-        if self.diffraction_color_container is None:
-            return
-        self.diffraction_color_container.clear()
-        with self.diffraction_color_container:
-            with ui.element("div").classes("diffraction-color-row diffraction-color-header"):
-                ui.label("Panel")
-                ui.label("Crystal")
-                ui.label("Color")
-                ui.label("")
-            for state in self.panel_states:
-                with ui.element("div").classes("diffraction-color-row"):
-                    ui.label(str(state.panel_id)).classes("diffraction-color-panel")
-                    ui.label(state.crystal_name).classes("diffraction-color-crystal")
-                    ui.color_input(
-                        value=self.diffraction_color_for_state(state),
-                        preview=True,
-                        on_change=lambda event, panel_id=state.panel_id: self.set_panel_diffraction_color(panel_id, event.value),
-                    ).props("outlined dense").classes("palette-color-input")
-                    ui.button(
-                        icon="restart_alt",
-                        on_click=lambda _=None, panel_id=state.panel_id: self.reset_panel_diffraction_color(panel_id),
-                    ).props("flat round dense").tooltip("Reset to default")
-
     def set_panel_diffraction_color(self, panel_id: int, value: str | None) -> None:
         state = self.panel_state_by_id(panel_id)
         if state is None:
             return
-        state.diffraction_color = self.normalize_palette_color(value, self.diffraction_color_for_state(state))
+        color = self.normalize_palette_color(value, self.diffraction_color_for_state(state))
+        if color == state.diffraction_color:
+            return
+        state.diffraction_color = color
         self.redraw_panel_diffractions({panel_id})
         self.refresh_combo_panels_for_sources({panel_id})
 
@@ -4676,16 +4805,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         state = self.panel_state_by_id(panel_id)
         if state is None:
             return
-        state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
-        self.refresh_diffraction_color_dialog()
-        self.redraw_panel_diffractions({panel_id})
-        self.refresh_combo_panels_for_sources({panel_id})
-
-    def reset_all_diffraction_colors(self) -> None:
-        for state in self.panel_states:
-            state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
-        self.refresh_diffraction_color_dialog()
-        self.refresh_diffractions()
+        self.set_panel_diffraction_color(panel_id, self.default_diffraction_color_for_crystal(state.crystal_name))
+        if self.palette_panel_id == panel_id and self.palette_diffraction_input is not None:
+            self.palette_diffraction_input.value = state.diffraction_color
 
     def refresh_palette_dialog(self) -> None:
         self.refresh_palette_list("vector", self.palette_vector_container)
@@ -4694,7 +4816,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def refresh_palette_list(self, kind: str, container: Any) -> None:
         if container is None:
             return
-        palette = self.palette_values(kind)
+        panel_id = self.palette_panel_id
+        palette = self.palette_values(kind, panel_id)
         container.clear()
         with container:
             for index, color in enumerate(palette):
@@ -4703,16 +4826,16 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     ui.color_input(
                         value=color,
                         preview=True,
-                        on_change=lambda event, k=kind, i=index: self.set_palette_color(k, i, event.value),
+                        on_change=lambda event, k=kind, i=index, p=panel_id: self.set_palette_color(k, i, event.value, p),
                     ).props("outlined dense").classes("palette-color-input")
-                    up = ui.button(icon="arrow_upward", on_click=lambda _=None, k=kind, i=index: self.move_palette_color(k, i, -1)).props(
+                    up = ui.button(icon="arrow_upward", on_click=lambda _=None, k=kind, i=index, p=panel_id: self.move_palette_color(k, i, -1, p)).props(
                         "flat round dense"
                     ).tooltip("Move up")
                     down = ui.button(
                         icon="arrow_downward",
-                        on_click=lambda _=None, k=kind, i=index: self.move_palette_color(k, i, 1),
+                        on_click=lambda _=None, k=kind, i=index, p=panel_id: self.move_palette_color(k, i, 1, p),
                     ).props("flat round dense").tooltip("Move down")
-                    delete = ui.button(icon="delete", on_click=lambda _=None, k=kind, i=index: self.remove_palette_color(k, i)).props(
+                    delete = ui.button(icon="delete", on_click=lambda _=None, k=kind, i=index, p=panel_id: self.remove_palette_color(k, i, p)).props(
                         "flat round dense color=negative"
                     ).tooltip("Remove color")
                     if index == 0:
@@ -4722,44 +4845,57 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     if len(palette) <= 1:
                         delete.disable()
 
-    def set_palette_color(self, kind: str, index: int, value: str | None) -> None:
-        palette = self.palette_values(kind)
+    def replace_palette(self, kind: str, colors: list[str] | None, panel_id: int | None, *, refresh_dialog: bool = True) -> None:
+        attribute = "vector_colors" if kind == "vector" else "plane_colors"
+        if panel_id is None:
+            setattr(self, attribute, colors if colors is not None else self.palette_default_values(kind).copy())
+            affected = {state.panel_id for state in self.panel_states if getattr(state, attribute) is None}
+        else:
+            state = self.panel_state_by_id(panel_id)
+            if state is None:
+                return
+            setattr(state, attribute, colors)
+            affected = {panel_id}
+        if refresh_dialog:
+            self.refresh_palette_dialog()
+        for controller in self.controllers:
+            if controller.state.panel_id in affected:
+                controller.redraw_scene(update_camera=False)
+
+    def set_palette_color(self, kind: str, index: int, value: str | None, panel_id: int | None = None) -> None:
+        palette = self.palette_values(kind, panel_id).copy()
         if not (0 <= index < len(palette)):
             return
-        palette[index] = self.normalize_palette_color(value, palette[index])
-        self.refresh_crystal_scenes()
+        color = self.normalize_palette_color(value, palette[index])
+        if color != palette[index]:
+            palette[index] = color
+            self.replace_palette(kind, palette, panel_id, refresh_dialog=False)
 
-    def add_palette_color(self, kind: str) -> None:
-        palette = self.palette_values(kind)
-        defaults = self.palette_default_values(kind)
+    def add_palette_color(self, kind: str, panel_id: int | None = None) -> None:
+        palette = self.palette_values(kind, panel_id).copy()
+        defaults = self.palette_values(kind) if panel_id is not None else self.palette_default_values(kind)
         palette.append(defaults[len(palette) % len(defaults)])
-        self.refresh_palette_dialog()
-        self.refresh_crystal_scenes()
+        self.replace_palette(kind, palette, panel_id)
 
-    def reset_palette(self, kind: str) -> None:
-        if kind == "vector":
-            self.vector_colors = VECTOR_COLORS.copy()
-        else:
-            self.plane_colors = PLANE_COLORS.copy()
-        self.refresh_palette_dialog()
-        self.refresh_crystal_scenes()
+    def reset_palette(self, kind: str, panel_id: int | None = None) -> None:
+        self.replace_palette(kind, None, panel_id)
 
-    def remove_palette_color(self, kind: str, index: int) -> None:
-        palette = self.palette_values(kind)
+    def remove_palette_color(self, kind: str, index: int, panel_id: int | None = None) -> None:
+        palette = self.palette_values(kind, panel_id).copy()
         if len(palette) <= 1 or not (0 <= index < len(palette)):
             return
         palette.pop(index)
-        self.refresh_palette_dialog()
-        self.refresh_crystal_scenes()
+        self.replace_palette(kind, palette, panel_id)
 
-    def move_palette_color(self, kind: str, index: int, direction: int) -> None:
-        palette = self.palette_values(kind)
+    def move_palette_color(self, kind: str, index: int, direction: int, panel_id: int | None = None) -> None:
+        palette = self.palette_values(kind, panel_id).copy()
+        if not 0 <= index < len(palette):
+            return
         new_index = min(max(index + direction, 0), len(palette) - 1)
         if new_index == index:
             return
         palette[index], palette[new_index] = palette[new_index], palette[index]
-        self.refresh_palette_dialog()
-        self.refresh_crystal_scenes()
+        self.replace_palette(kind, palette, panel_id)
 
     def build_cif_dialog(self) -> None:
         self.cif_dialog = ui.dialog()
@@ -4919,8 +5055,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         for state in self.panel_states:
             if state.crystal_name == name:
                 self.set_panel_crystal(state, "FCC", force_default_color=True)
-                state.zone_text = "100"
-                state.applied_zone_text = ""
+                state.zone_text = ""
+                state.applied_zone_text = "100"
                 state.view_vector = np.array([1.0, 0.0, 0.0])
                 state.roll = 0.0
                 affected_panel_ids.add(state.panel_id)
@@ -5055,8 +5191,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .panel-toolbar {
                 width: 100%;
                 display: grid;
-                grid-template-columns: 20px minmax(86px, 1.18fr) minmax(50px, 0.64fr) minmax(50px, 0.64fr) minmax(62px, 0.76fr) minmax(58px, 0.7fr) minmax(48px, auto) minmax(44px, auto) 24px 24px 24px 20px;
-                grid-template-areas: "number crystal zone plane vector rotation apply sync download edit magnify close";
+                grid-template-columns: 20px minmax(70px, 1fr) minmax(50px, 0.64fr) minmax(50px, 0.64fr) minmax(62px, 0.76fr) minmax(54px, 0.66fr) minmax(48px, auto) minmax(44px, auto) 24px 24px 24px 24px 24px;
+                grid-template-areas: "number crystal zone plane vector rotation apply sync colors download edit magnify close";
                 gap: 2px;
                 align-items: center;
                 margin-bottom: 6px;
@@ -5095,7 +5231,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .panel-close-button {
                 grid-area: close;
-                width: 20px;
+                width: 24px;
                 height: 34px;
                 min-height: 34px;
             }
@@ -5110,6 +5246,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 width: 24px;
                 height: 34px;
                 min-height: 34px;
+            }
+            .panel-colors-button {
+                grid-area: colors;
+                width: 24px;
+                height: 34px;
+                min-height: 34px;
+                justify-self: start;
             }
             .panel-magnify-button {
                 grid-area: magnify;
@@ -5222,6 +5365,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 min-height: 34px;
                 padding: 2px 5px;
                 font-size: 11.5px;
+            }
+            .panel-toolbar .q-btn--round {
+                min-width: 24px;
+                padding: 0;
             }
             .visual-stack {
                 display: grid;
@@ -5415,6 +5562,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .palette-card {
                 width: min(760px, calc(100vw - 40px));
+                max-width: calc(100vw - 40px) !important;
                 border-radius: 8px;
                 gap: 10px;
             }
@@ -5424,7 +5572,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 gap: 14px;
             }
             .palette-column {
-                flex: 1 1 0;
+                flex: 1 1 300px;
                 min-width: 0;
                 gap: 8px;
             }
@@ -5465,52 +5613,6 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 min-width: 0;
             }
             .palette-row .q-btn {
-                min-width: 26px;
-                width: 26px;
-                min-height: 26px;
-                height: 26px;
-                padding: 0;
-            }
-            .diffraction-color-card {
-                width: min(560px, calc(100vw - 40px));
-                border-radius: 8px;
-                gap: 10px;
-            }
-            .diffraction-color-list {
-                width: 100%;
-                max-height: min(460px, calc(100vh - 220px));
-                overflow-y: auto;
-                display: flex;
-                flex-direction: column;
-                gap: 6px;
-            }
-            .diffraction-color-row {
-                display: grid;
-                grid-template-columns: 54px minmax(0, 1fr) 150px 28px;
-                gap: 8px;
-                align-items: center;
-                width: 100%;
-            }
-            .diffraction-color-header {
-                color: #9aa7b5;
-                font-size: 11px;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0;
-            }
-            .diffraction-color-panel {
-                color: #dbeafe;
-                font-weight: 700;
-                font-size: 12px;
-            }
-            .diffraction-color-crystal {
-                min-width: 0;
-                overflow: hidden;
-                text-overflow: ellipsis;
-                white-space: nowrap;
-                font-size: 13px;
-            }
-            .diffraction-color-row .q-btn {
                 min-width: 26px;
                 width: 26px;
                 min-height: 26px;
@@ -5614,13 +5716,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 width: 100%;
                 align-items: start;
             }
-            @container comparison-panel (max-width: 590px) {
+            @container comparison-panel (max-width: 650px) {
                 .panel-toolbar {
                     grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
-                        "number apply sync download edit magnify"
-                        "number close close close close close";
+                        "number apply sync colors download edit"
+                        "number magnify close . . .";
                 }
                 .panel-number {
                     height: 100%;
@@ -5642,14 +5744,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             @container comparison-panel (max-width: 500px) {
                 .panel-toolbar {
-                    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr);
+                    grid-template-columns: 22px repeat(4, minmax(0, 1fr));
                     grid-template-areas:
-                        "number crystal crystal"
-                        "number zone plane"
-                        "number vector rotation"
-                        "number apply sync"
-                        "number download edit"
-                        "number magnify close";
+                        "number crystal crystal crystal crystal"
+                        "number zone zone plane plane"
+                        "number vector vector rotation rotation"
+                        "number apply apply sync colors"
+                        "number download edit magnify close";
                 }
                 .panel-apply-button,
                 .panel-sync-button {
@@ -5680,8 +5781,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
-                        "number apply sync download edit magnify"
-                        "number close close close close close";
+                        "number apply sync colors download edit"
+                        "number magnify close . . .";
                 }
                 .panel-number {
                     height: 100%;
@@ -5742,8 +5843,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 24px minmax(112px, 1.45fr) minmax(72px, 0.8fr) minmax(72px, 0.8fr) minmax(86px, 0.95fr) minmax(76px, 0.85fr);
                     grid-template-areas:
                         "number crystal zone plane vector rotation"
-                        "number apply sync download edit magnify"
-                        "number close close close close close";
+                        "number apply sync colors download edit"
+                        "number magnify close . . .";
                 }
                 .panel-number {
                     height: 100%;
@@ -5781,14 +5882,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 1fr !important;
                 }
                 .panel-toolbar {
-                    grid-template-columns: 22px minmax(0, 1fr) minmax(0, 1fr);
+                    grid-template-columns: 22px repeat(4, minmax(0, 1fr));
                     grid-template-areas:
-                        "number crystal crystal"
-                        "number zone plane"
-                        "number vector rotation"
-                        "number apply sync"
-                        "number download edit"
-                        "number magnify close";
+                        "number crystal crystal crystal crystal"
+                        "number zone zone plane plane"
+                        "number vector vector rotation rotation"
+                        "number apply apply sync colors"
+                        "number download edit magnify close";
                 }
                 .panel-apply-button,
                 .panel-sync-button {
@@ -5968,15 +6068,15 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def show_crystal_annotations(self) -> bool:
         return bool(getattr(getattr(self, "show_crystal_annotations_input", None), "value", True))
 
-    def plane_palette(self) -> list[str]:
-        return self.plane_colors or PLANE_COLORS
+    def plane_palette(self, panel_id: int | None = None) -> list[str]:
+        return self.palette_values("plane", panel_id) or PLANE_COLORS
 
-    def vector_palette(self) -> list[str]:
-        return self.vector_colors or VECTOR_COLORS
+    def vector_palette(self, panel_id: int | None = None) -> list[str]:
+        return self.palette_values("vector", panel_id) or VECTOR_COLORS
 
     def refresh_crystal_scenes(self) -> None:
         for controller in self.controllers:
-            controller.redraw_scene()
+            controller.redraw_scene(update_camera=False)
 
     def show_scale_bars(self) -> bool:
         return bool(getattr(getattr(self, "show_scale_bar_input", None), "value", True))
@@ -6163,7 +6263,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         state = PanelState(
             panel_id=self.next_panel_id,
             crystal_name=crystal,
-            zone_text=zone,
+            applied_zone_text=zone,
             plane_text=plane,
             vector_text=vector,
             diffraction_color=self.default_diffraction_color_for_crystal(crystal),
