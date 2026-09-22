@@ -3276,6 +3276,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         self.show_zone_axis_var = tk.BooleanVar(value=False)
         self.hex_four_index_var = tk.BooleanVar(value=True)
         self.auto_sync_var = tk.BooleanVar(value=False)
+        self.snap_back_var = tk.BooleanVar(value=True)
         self.performance_mode_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Ready")
         self.status_history: list[str] = ["Ready"]
@@ -3783,6 +3784,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         for text, variable in (
             ("Use four-index basis for hexagonal systems", self.hex_four_index_var),
             ("Auto sync crystal/diffraction", self.auto_sync_var),
+            ("Always snap back view", self.snap_back_var),
             ("Delay diffraction during drag", self.performance_mode_var),
         ):
             check = tk.Checkbutton(
@@ -4632,14 +4634,21 @@ class CrystalDiffractionSimulator(tk.Tk):
         old_roll = state.roll
         new_view, new_roll = old_view.copy(), old_roll
         if zone:
-            new_view, new_roll = zone[0].vector, 0.0
-        rotation_message = ""
+            new_view = zone[0].vector
+            if self.snap_back_var.get():
+                new_roll = 0.0
+        orientation_message = ""
         if rotation_command is not None:
             axis = rotation_command.axis if rotation_command.axis is not None else new_view
             if normalize_vector(axis) is None:
                 return
             new_view, new_roll = rotate_orientation(new_view, new_roll, axis, rotation_command.angle_degrees)
-            rotation_message = f"Panel {panel_id}: rotated {rotation_command.angle_degrees:g} deg about {rotation_command.axis_label}"
+            orientation_message = f"Panel {panel_id}: rotated {rotation_command.angle_degrees:g} deg about {rotation_command.axis_label}"
+        elif not initial and not zone and self.snap_back_var.get() and state.applied_zone_text:
+            previous_zone, _ = parse_indices(state.applied_zone_text, model, "direction", allow_multiple=False)
+            if previous_zone:
+                new_view, new_roll = previous_zone[0].vector, 0.0
+                orientation_message = f"Panel {panel_id}: snapped back to {previous_zone[0].label}"
         if not np.all(np.isfinite(new_view)) or not math.isfinite(new_roll):
             return
         pending = self._pending_live_jobs.pop(panel_id, None)
@@ -4659,7 +4668,7 @@ class CrystalDiffractionSimulator(tk.Tk):
         if not initial:
             self.propagate_bound_motion(panel_id, old_view, old_roll, new_view, state.roll)
             self.refresh_combo_panels()
-            self.status_var.set("; ".join(errors[:3]) if errors else (rotation_message or f"Panel {panel_id}: {state.crystal} updated"))
+            self.status_var.set("; ".join(errors[:3]) if errors else (orientation_message or f"Panel {panel_id}: {state.crystal} updated"))
 
     def sync_panel_from_axis(self, panel_id: int) -> None:
         state = self.panel_state_by_id(panel_id)
