@@ -4,8 +4,6 @@
 
 The easiest way to try CrysDiS is the hosted web app. However, it may be laggy and disconnect occasionally. The most robust way is to run the Python code directly (see Run From Source below). Desktop packages are useful when users want a double-click local app, which is convenient and performs better than the hosted web version.
 
-The tkinter version is also provided. It has essentially the same features as the NiceGui version, but with a more classic, nostalgic desktop interface. It is suitable for heavy multi-panel crystal/diffraction comparison.
-
 ## Introduction Slides
 
 A short visual introduction to CrysDiS is available here:
@@ -22,27 +20,19 @@ https://crysdis.onrender.com
 
 ## Download Desktop Packages
 
-Desktop packages are available from the GitHub **Releases** page. For version `v0.1.2`, download the file matching your operating system.
+Desktop packages are available from the GitHub **Releases** page. For version `v0.1.5`, download the file matching your operating system.
 
-Suggested release assets:
-
-```text
-CrysDiS-Windows-v0.1.4.zip
-CrysDiS-Linux-v0.1.4.tar.gz
-CrysDiS-macOS-arm64-v0.1.4.zip
-```
-
-Optional tkinter version:
+Release assets:
 
 ```text
-CrysDiS_tkinter-Windows-v0.1.2.zip
-CrysDiS_tkinter-Linux-v0.1.2.tar.gz
-CrysDiS_tkinter-macOS-arm64-v0.1.2.zip
+CrysDiS-Windows-v0.1.5.zip
+CrysDiS-Linux-v0.1.5.tar.gz
+CrysDiS-macOS-arm64-v0.1.5.zip
 ```
 
 ### Windows
 
-1. Download `CrysDiS-Windows-v0.1.2.zip`.
+1. Download `CrysDiS-Windows-v0.1.5.zip`.
 2. Before extracting, right-click the zip file → Properties → General → Unblock → Apply → OK.
 3. Extract/unzip the folder.
 4. Open the extracted `CrysDiS` folder.
@@ -54,11 +44,11 @@ CrysDiS.exe
 
 ### Linux
 
-1. Download `CrysDiS-Linux-v0.1.2.tar.gz`.
+1. Download `CrysDiS-Linux-v0.1.5.tar.gz`.
 2. Extract it:
 
 ```bash
-tar -xzf CrysDiS-Linux-v0.1.2.tar.gz
+tar -xzf CrysDiS-Linux-v0.1.5.tar.gz
 cd CrysDiS
 ```
 
@@ -78,7 +68,7 @@ After installing the launcher, search for **CrysDiS** in your Linux application 
 
 ### macOS
 
-1. Download `CrysDiS-macOS-arm64-v0.1.2.zip`.
+1. Download `CrysDiS-macOS-arm64-v0.1.5.zip`.
 2. Unzip it.
 3. Double-click:
 
