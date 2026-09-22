@@ -3551,7 +3551,9 @@ class PanelController:
         old_roll = float(self.state.roll)
         new_view, new_roll = old_view.copy(), old_roll
         if zone:
-            new_view, new_roll = zone[0].vector, 0.0
+            new_view = zone[0].vector
+            if self.simulator.always_snap_back_view():
+                new_roll = 0.0
         message = f"Panel {self.state.panel_id} updated"
         if rotation_command is not None:
             axis = rotation_command.axis
