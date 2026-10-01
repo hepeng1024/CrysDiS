@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from nicegui import app, core, native, ui
@@ -146,8 +146,11 @@ def export_image_filename(
     fallback_base: str,
     dpi: float,
     transparent_background: bool = False,
+    include_suffixes: bool = True,
 ) -> str:
     stem = sanitize_export_filename_stem(filename_base, fallback_base)
+    if not include_suffixes:
+        return sanitize_export_filename(stem, fallback_base)
     transparent_suffix = "_transparent" if transparent_background else ""
     return sanitize_export_filename(f"{stem}{transparent_suffix}_{round(float(dpi))}dpi", fallback_base)
 
@@ -893,42 +896,43 @@ def split_index_groups(text: str, allow_multiple: bool = False) -> list[str]:
     text = normalize_text(text)
     if not text:
         return []
-    bracketed = re.findall(r"[\[\(\{<]\s*([^\]\)\}>]+?)\s*[\]\)\}>]", text)
-    if bracketed:
-        return [group.strip() for group in bracketed if group.strip()]
-    if re.search(r"[,;|/]", text):
-        return [part.strip() for part in re.split(r"[,;|/]+", text) if part.strip()]
-    parts = text.split()
-    if allow_multiple and len(parts) > 1:
-        compact_groups = [parse_compact_indices(part) for part in parts]
-        if all(len(group) in (3, 4) for group in compact_groups):
-            return parts
-    return [text]
+    text = re.sub(r"\s*,\s*", ",", text)
+    _reciprocal, coordinates = reciprocal_prefix_group(text)
+    parts = coordinates.split()
+    if len(parts) in (3, 4) and all(re.fullmatch(r"[+-]?[0-9]+", part) for part in parts):
+        # Retain standalone spaced coordinates, but never reinterpret complete
+        # compact entries plus an unfinished entry (e.g. "100 114 1") as one vector.
+        if not allow_multiple or all(len(parse_compact_indices(part)) not in (3, 4) for part in parts):
+            return [text]
+
+    # Keep wrappers and reciprocal prefixes attached, and consume bare entries
+    # as well. The final alternative preserves malformed brackets for validation.
+    token_pattern = (
+        r"(?:[*rR]\s*)?(?:\[[^\[\]]*\]|\([^()]*\)|\{[^{}]*\}|<[^<>]*>|[^\s;|/\[\](){}<>]+)"
+        r"|[^\s;|/]"
+    )
+    return [match.group(0).strip() for match in re.finditer(token_pattern, text)]
 
 
 def parse_compact_indices(text: str) -> list[int]:
-    cleaned = re.sub(r"[^0-9+\-]", "", normalize_text(text))
-    values = []
-    sign = 1
-    for char in cleaned:
-        if char == "+":
-            sign = 1
-        elif char == "-":
-            sign = -1
-        elif char.isdigit():
-            values.append(sign * int(char))
-            sign = 1
-    return values
+    text = normalize_text(text)
+    if not re.fullmatch(r"(?:[+-]?[0-9])+", text):
+        return []
+    return [int(value) for value in re.findall(r"[+-]?[0-9]", text)]
 
 
 def parse_index_values(text: str) -> tuple[int, ...]:
-    text = normalize_text(text).strip("[](){}<>")
-    spaced = re.sub(r"[,;|/]+", " ", text)
-    if re.search(r"\s", spaced):
-        values = [int(match.group(0)) for match in re.finditer(r"[+-]?\d+", spaced)]
-    else:
-        values = parse_compact_indices(spaced)
-    return tuple(values)
+    text = normalize_text(text)
+    pairs = {"[": "]", "(": ")", "{": "}", "<": ">"}
+    if text[:1] in pairs:
+        if not text.endswith(pairs[text[0]]):
+            return ()
+        text = text[1:-1].strip()
+    if re.search(r"[\s,;|/]", text):
+        if not re.fullmatch(r"[+-]?[0-9]+(?:(?:\s*[,;|/]\s*|\s+)[+-]?[0-9]+)+", text):
+            return ()
+        return tuple(int(value) for value in re.split(r"[\s,;|/]+", text))
+    return tuple(parse_compact_indices(text))
 
 
 def reciprocal_lattice(lattice: np.ndarray) -> np.ndarray:
@@ -1141,7 +1145,9 @@ def direction_segment_for_display(values: tuple[int, ...], model: CrystalModel) 
     return start, end
 
 
-def reduce_integer_tuple(values: tuple[int, ...] | list[int] | np.ndarray) -> tuple[int, ...]:
+def reduce_integer_tuple(
+    values: tuple[int, ...] | list[int] | np.ndarray, *, preserve_sign: bool = False,
+) -> tuple[int, ...]:
     ints = [int(round(float(value))) for value in values]
     if all(value == 0 for value in ints):
         return tuple(ints)
@@ -1151,7 +1157,7 @@ def reduce_integer_tuple(values: tuple[int, ...] | list[int] | np.ndarray) -> tu
     if divisor > 1:
         ints = [value // divisor for value in ints]
     first_nonzero = next((value for value in ints if value != 0), 1)
-    if first_nonzero < 0:
+    if first_nonzero < 0 and not preserve_sign:
         ints = [-value for value in ints]
     return tuple(int(value) for value in ints)
 
@@ -1195,7 +1201,7 @@ def zone_axis_candidate_table(model: CrystalModel, max_index: int) -> tuple[np.n
 
 def hcp_three_index_direction_to_four(axis: tuple[int, int, int]) -> tuple[int, int, int, int]:
     u, v, w = axis
-    return reduce_integer_tuple((2 * u - v, 2 * v - u, -u - v, 3 * w))
+    return reduce_integer_tuple((2 * u - v, 2 * v - u, -u - v, 3 * w), preserve_sign=True)
 
 
 def integer_zone_axis_from_view(
@@ -1224,7 +1230,11 @@ def zone_axis_label_from_view(
     axis_vector = normalize_vector(np.array(axis, dtype=float) @ model.lattice)
     approximate = True
     if view is not None and axis_vector is not None:
-        angle = math.degrees(math.acos(min(max(abs(float(np.dot(view, axis_vector))), -1.0), 1.0)))
+        # The candidate cache identifies an axis up to sign; the label identifies a viewing direction.
+        alignment = float(np.dot(view, axis_vector))
+        if alignment < 0.0:
+            axis = tuple(-value for value in axis)
+        angle = math.degrees(math.acos(min(max(abs(alignment), -1.0), 1.0)))
         approximate = angle > ZONE_AXIS_EXACT_TOL_DEGREES
     prefix = "~" if approximate else ""
     label_axis: tuple[int, ...] = (
@@ -1537,8 +1547,8 @@ def parse_indices(
     groups = split_index_groups(text, allow_multiple=allow_multiple)
     if not groups:
         return [], []
-    if not allow_multiple:
-        groups = groups[:1]
+    if not allow_multiple and len(groups) != 1:
+        return [], ["Enter a single index"]
 
     valid_lengths = (3, 4) if is_hexagonal(model.definition) else (3,)
     parsed = []
@@ -1586,6 +1596,110 @@ def projection_basis(view_vector: np.ndarray, roll: float = 0.0) -> tuple[np.nda
     rolled_u = math.cos(roll_rad) * u_axis + math.sin(roll_rad) * v_axis
     rolled_v = -math.sin(roll_rad) * u_axis + math.cos(roll_rad) * v_axis
     return rolled_u, rolled_v
+
+
+@dataclass
+class CrystalExportLayer:
+    path: Any
+    depth_at: Callable[[np.ndarray, np.ndarray], np.ndarray]
+    face_color: tuple[float, ...] | None = None
+    edge_color: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
+    linewidth: float = 0.0
+    dashed: bool = False
+
+
+def composite_crystal_export(
+    layers: list[CrystalExportLayer], width: int, height: int, dpi: float, tile_size: int = 256,
+) -> np.ndarray:
+    """Rasterize with Agg, then alpha-composite each pixel from far to near.
+
+    Paths use display pixels; depth increases toward the camera. Small tiles
+    bound temporary memory even at 1200 dpi with several translucent planes.
+    """
+    from matplotlib.backends.backend_agg import RendererAgg
+    from matplotlib.path import Path as MplPath
+    from matplotlib.transforms import Affine2D
+
+    paths = []
+    for layer in layers:
+        path = layer.path
+        if layer.dashed:
+            # Dashed layers are straight vector shafts. Construct the dashes before
+            # viewport clipping, which would otherwise restart their phase in each tile.
+            start, end = path.vertices[0], path.vertices[-1]
+            delta = end - start
+            length = float(np.linalg.norm(delta))
+            dash_unit = layer.linewidth * dpi / 72.0
+            if length > 1e-12 and dash_unit > 0.0:
+                starts = np.arange(0.0, length, 5.3 * dash_unit)
+                ends = np.minimum(starts + 3.7 * dash_unit, length)
+                distances = np.column_stack((starts, ends)).ravel()
+                vertices = start + distances[:, None] * delta / length
+                path = MplPath(vertices, np.tile([MplPath.MOVETO, MplPath.LINETO], len(starts)))
+        paths.append(path)
+
+    bounds = [path.get_extents().padded(layer.linewidth * dpi / 144.0 + 2.0) for layer, path in zip(layers, paths)]
+    # Agg clips paths at its viewport before stroking them. Keep those clipped
+    # caps and antialiasing outside the tile that will actually be composited.
+    padding = math.ceil(max((layer.linewidth for layer in layers), default=0.0) * dpi / 72.0) + 2
+    image = np.zeros((height, width, 4), dtype=np.uint8)
+    for bottom in range(0, height, tile_size):
+        top = min(bottom + tile_size, height)
+        for left in range(0, width, tile_size):
+            right = min(left + tile_size, width)
+            visible = [(layer, path) for layer, path, bound in zip(layers, paths, bounds)
+                       if bound.x1 >= left and bound.x0 <= right and bound.y1 >= bottom and bound.y0 <= top]
+            if not visible:
+                continue
+            renderer = RendererAgg(right - left + 2 * padding, top - bottom + 2 * padding, dpi)
+            transform = Affine2D().translate(-left + padding, -bottom + padding)
+            x, y = np.meshgrid(np.arange(left, right) + 0.5, np.arange(top - 1, bottom - 1, -1) + 0.5)
+            colors, depths = [], []
+            for layer, path in visible:
+                renderer.clear()
+                gc = renderer.new_gc()
+                gc.set_foreground(layer.edge_color, isRGBA=True)
+                gc.set_linewidth(layer.linewidth)
+                gc.set_capstyle("round")
+                renderer.draw_path(gc, path, transform, layer.face_color)
+                gc.restore()
+                rgba = np.asarray(renderer.buffer_rgba())[padding:padding + top - bottom, padding:padding + right - left].copy()
+                if not np.any(rgba[:, :, 3]):
+                    continue
+                depth = np.broadcast_to(layer.depth_at(x, y), x.shape).astype(np.float32).copy()
+                depth[rgba[:, :, 3] == 0] = -np.inf
+                colors.append(rgba)
+                depths.append(depth)
+            if not colors:
+                continue
+            order = np.argsort(np.stack(depths), axis=0, kind="stable")
+            sorted_colors = np.take_along_axis(np.stack(colors), order[:, :, :, None], axis=0)
+            blended = np.zeros((*x.shape, 4), dtype=np.float32)
+            for rgba in sorted_colors:
+                color = rgba.astype(np.float32) / 255.0
+                alpha = color[:, :, 3:4]
+                blended[:, :, :3] = color[:, :, :3] * alpha + blended[:, :, :3] * (1.0 - alpha)
+                blended[:, :, 3:4] = alpha + blended[:, :, 3:4] * (1.0 - alpha)
+            # PNG stores straight alpha, not premultiplied colors.
+            np.divide(blended[:, :, :3], blended[:, :, 3:4], out=blended[:, :, :3], where=blended[:, :, 3:4] > 0)
+            image[height - top:height - bottom, left:right] = np.clip(np.round(255.0 * blended), 0, 255).astype(np.uint8)
+    return image
+
+
+def crystal_segment_depth(
+    start: np.ndarray, end: np.ndarray, front_offset: float = 0.0,
+) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """Depth along a projected segment, whose x/y coordinates are display pixels."""
+    delta = end - start
+    length_squared = float(np.dot(delta[:2], delta[:2]))
+    if length_squared < 1e-20:
+        return lambda x, y: np.full_like(x, max(start[2], end[2]) + front_offset, dtype=float)
+
+    def depth_at(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        fraction = np.clip(((x - start[0]) * delta[0] + (y - start[1]) * delta[1]) / length_squared, 0.0, 1.0)
+        return start[2] + fraction * delta[2] + front_offset
+
+    return depth_at
 
 
 def rotation_matrix_about_axis(axis: np.ndarray, degrees: float) -> np.ndarray:
@@ -2859,12 +2973,11 @@ class CrystalBuilder:
             ui.notify(str(exc), type="negative")
             return
         self.simulator.set_status(f"Saved new structure {saved.name} to {self.scope_select.value}")
-        self.simulator.refresh_library(
-            saved.name,
-            target_panel_id=self.target_panel_id,
-            force_default_color=True,
-            affected_crystal_names=(),
-        )
+        self.simulator.refresh_panel_crystal_select_options()
+        # Saves from Crystal List remain library-only; creation from the toolbar
+        # or a panel opens a separate view without replacing the source panel.
+        if self.mode == "new" or self.target_panel_id is not None:
+            self.simulator.add_panel(crystal_name=saved.name)
         self.simulator.refresh_crystal_list()
         self.dialog.close()
 
@@ -3061,7 +3174,9 @@ class PanelController:
         matplotlib.use("Agg", force=True)
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         from matplotlib.figure import Figure
-        from matplotlib.patches import Polygon
+        from matplotlib.patches import ArrowStyle
+        from matplotlib.path import Path as MplPath
+        from matplotlib.transforms import Affine2D
 
         model = self.current_model or self.simulator.model_for(self.state.crystal_name)
         view = normalize_vector(view_vector if view_vector is not None else self.state.view_vector)
@@ -3122,72 +3237,79 @@ class PanelController:
         background_color = (0.0, 0.0, 0.0, 0.0) if transparent_background else "#0B0F14"
         fig = Figure(figsize=(4.6, 3.6), dpi=dpi, facecolor=background_color)
         FigureCanvasAgg(fig)
-        ax = fig.add_axes([0, 0, 1, 1], facecolor=background_color)
+        ax = fig.add_axes([0, 0, 1, 1], facecolor="none")
         ax.set_aspect("equal", adjustable="box")
         ax.set_axis_off()
         ax.set_xlim(center_x - width / 2.0, center_x + width / 2.0)
         ax.set_ylim(center_y - height / 2.0, center_y + height / 2.0)
+        fig.canvas.draw()
+        pixel_width, pixel_height = fig.canvas.get_width_height()
+        units_per_pixel = 1.0 / float(ax.transData.transform((1, 0))[0] - ax.transData.transform((0, 0))[0])
+        camera_basis = np.column_stack((u_axis, v_axis, view))
+
+        def screen_points(points: np.ndarray) -> np.ndarray:
+            camera_points = np.asarray(points) @ camera_basis
+            return np.column_stack((ax.transData.transform(camera_points[:, :2]), camera_points[:, 2]))
+
+        layers: list[CrystalExportLayer] = []
+
+        def add_line(start: np.ndarray, end: np.ndarray, color: tuple[float, ...], linewidth: float) -> None:
+            layers.append(CrystalExportLayer(
+                MplPath([start[:2], end[:2]]), crystal_segment_depth(start, end),
+                edge_color=color, linewidth=linewidth,
+            ))
 
         plane_palette = self.simulator.plane_palette(self.state.panel_id)
         vector_palette = self.simulator.vector_palette(self.state.panel_id)
         for index, (_plane, polygon) in enumerate(plane_polygons):
-            color = plane_palette[index % len(plane_palette)]
-            projected = project_many(polygon)
-            ax.add_patch(
-                Polygon(
-                    projected,
-                    closed=True,
-                    facecolor=color,
-                    edgecolor=color,
-                    linewidth=1.1,
-                    alpha=0.35,
-                    zorder=1,
-                )
-            )
+            rgb = color_to_rgb(plane_palette[index % len(plane_palette)])
+            points = screen_points(polygon)
+            normal = np.cross(points[1] - points[0], points[2] - points[0])
+            if abs(float(normal[2])) > 1e-8:
+                equation = np.array([-normal[0], -normal[1], np.dot(normal, points[0])]) / normal[2]
+                layers.append(CrystalExportLayer(
+                    MplPath(np.vstack((points[:, :2], points[0, :2])), closed=True),
+                    lambda x, y, eq=equation: eq[0] * x + eq[1] * y + eq[2],
+                    face_color=(*rgb, 0.36),
+                ))
+            for start, end in zip(points, np.roll(points, -1, axis=0)):
+                add_line(start, end, (*rgb, 0.9), 1.1)
 
         for start, end in model.display_edges:
-            x0, y0 = project(start)
-            x1, y1 = project(end)
-            ax.plot([x0, x1], [y0, y1], color="#7A8796", linewidth=1.25, alpha=0.82, zorder=2)
+            points = screen_points(np.array([start, end]))
+            add_line(points[0], points[1], (*color_to_rgb("#7A8796"), 0.82), 1.25)
 
-        atoms = sorted(model.display_atoms, key=lambda atom: float(np.dot(atom.position, view)))
-        atom_edge_color = (0.0, 0.0, 0.0, 0.28) if transparent_background else "#0B0F14"
-        for atom in atoms:
-            x, y = project(atom.position)
+        atom_edge_rgb = (0.0, 0.0, 0.0) if transparent_background else color_to_rgb("#0B0F14")
+        for atom in model.display_atoms:
+            center = screen_points(np.array([atom.position]))[0]
             radius_factor = model.atom_radius_scale * occupancy_radius_factor(atom.occupancy)
-            size = CRYSTAL_EXPORT_ATOM_MARKER_SIZE * radius_factor * radius_factor
-            ax.scatter(
-                [x],
-                [y],
-                s=size,
-                c=[color_for_site(atom)],
-                alpha=0.58 + 0.42 * atom.occupancy,
-                edgecolors=atom_edge_color,
-                linewidths=0.4,
-                zorder=4,
-            )
+            radius = 0.5 * math.sqrt(CRYSTAL_EXPORT_ATOM_MARKER_SIZE) * radius_factor * dpi / 72.0
+            opacity = 0.58 + 0.42 * atom.occupancy
+
+            def atom_depth(x: np.ndarray, y: np.ndarray, center=center, radius=radius) -> np.ndarray:
+                distance_squared = (x - center[0]) ** 2 + (y - center[1]) ** 2
+                return center[2] + np.sqrt(np.maximum(radius ** 2 - distance_squared, 0.0)) * units_per_pixel
+
+            layers.append(CrystalExportLayer(
+                MplPath.unit_circle().transformed(Affine2D().scale(radius).translate(*center[:2])),
+                atom_depth, face_color=(*color_to_rgb(color_for_site(atom)), opacity),
+                edge_color=(*atom_edge_rgb, opacity), linewidth=0.4,
+            ))
 
         for index, (vector, start, end) in enumerate(vector_segments):
             color = vector_palette[index % len(vector_palette)]
             x0, y0 = project(start)
             x1, y1 = project(end)
-            linestyle = "--" if vector.is_reciprocal else "-"
-            ax.annotate(
-                "",
-                xy=(x1, y1),
-                xytext=(x0, y0),
-                arrowprops={
-                    "arrowstyle": "-|>",
-                    "color": color,
-                    "linewidth": 2.4,
-                    "linestyle": linestyle,
-                    "mutation_scale": 18,
-                    "shrinkA": 0,
-                    "shrinkB": 0,
-                    "alpha": 0.95,
-                },
-                zorder=5,
-            )
+            points = screen_points(np.array([start, end]))
+            paths, filled = ArrowStyle("-|>")(MplPath(points[:, :2]), 18.0 * dpi / 72.0, 2.4 * dpi / 72.0)
+            # The shaft has thickness, so a vector lying in a plane is just in front of its surface.
+            depth_at = crystal_segment_depth(points[0], points[1], 1.2 * dpi / 72.0 * units_per_pixel)
+            rgba = (*color_to_rgb(color), 0.95)
+            for path, fill in zip(paths, filled):
+                layers.append(CrystalExportLayer(
+                    path, depth_at, face_color=rgba if fill else None,
+                    edge_color=rgba, linewidth=2.4, dashed=vector.is_reciprocal and not fill,
+                ))
             if self.simulator.show_crystal_annotations():
                 ax.text(
                     x1 + 0.025 * width,
@@ -3200,6 +3322,9 @@ class PanelController:
                     va="center",
                     zorder=6,
                 )
+
+        pixels = composite_crystal_export(layers, pixel_width, pixel_height, dpi)
+        fig.figimage(pixels, origin="upper", zorder=-1)
 
         if self.simulator.show_crystal_annotations():
             for index, (plane, polygon) in enumerate(plane_polygons):
@@ -3284,6 +3409,7 @@ class PanelController:
                 .classes("full-width")
             )
             dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
+            suffix_checkbox = ui.checkbox("Add transparency and DPI suffixes", value=True).props("dense")
             if self.simulator.direct_file_exports_enabled():
                 export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
 
@@ -3303,6 +3429,7 @@ class PanelController:
                         bool(transparent_checkbox.value),
                         str(crystal_filename_input.value or ""),
                         str(diffraction_filename_input.value or ""),
+                        include_suffixes=bool(suffix_checkbox.value),
                     ),
                 ).props("unelevated dense")
         self.download_dialog.open()
@@ -3315,6 +3442,7 @@ class PanelController:
         transparent_background: bool = False,
         crystal_filename_base: str | None = None,
         diffraction_filename_base: str | None = None,
+        include_suffixes: bool = True,
     ) -> None:
         if not include_crystal and not include_diffraction:
             ui.notify("Choose at least one image to download", type="warning")
@@ -3328,12 +3456,14 @@ class PanelController:
             f"panel_{self.state.panel_id}_crystal",
             dpi,
             transparent_background,
+            include_suffixes=include_suffixes,
         )
         diffraction_filename = export_image_filename(
             diffraction_filename_base,
             f"panel_{self.state.panel_id}_diffraction",
             dpi,
             transparent_background,
+            include_suffixes=include_suffixes,
         )
         if include_crystal:
             try:
@@ -4108,6 +4238,7 @@ class ComboPanelController:
                 .classes("full-width")
             )
             dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
+            suffix_checkbox = ui.checkbox("Add transparency and DPI suffixes", value=True).props("dense")
             if self.simulator.direct_file_exports_enabled():
                 export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
 
@@ -4124,6 +4255,7 @@ class ComboPanelController:
                         float(dpi_input.value or 300),
                         bool(transparent_checkbox.value),
                         str(filename_input.value or ""),
+                        include_suffixes=bool(suffix_checkbox.value),
                     ),
                 ).props("unelevated dense")
         self.download_dialog.open()
@@ -4133,6 +4265,7 @@ class ComboPanelController:
         dpi: float,
         transparent_background: bool = False,
         filename_base: str | None = None,
+        include_suffixes: bool = True,
     ) -> None:
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
         direct_export = self.simulator.direct_file_exports_enabled()
@@ -4142,6 +4275,7 @@ class ComboPanelController:
             f"combo_C{self.state.combo_id}_diffraction",
             dpi,
             transparent_background,
+            include_suffixes=include_suffixes,
         )
         script = f"""
         const root = document.querySelector({json.dumps(selector)});
@@ -4524,7 +4658,7 @@ class SimulatorApp:
             ui.button(
                 "New crystal",
                 icon="add_box",
-                on_click=lambda: self.builder.open(target_panel_id=self.latest_panel_id(), mode="new"),
+                on_click=lambda: self.builder.open(mode="new"),
             ).props("flat dense")
             self.add_combo_button = ui.button(
                 "Add combo panel",
@@ -5079,8 +5213,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 temp_path = Path(handle.name)
             await event.file.save(temp_path)
             definition = definition_from_cif(temp_path)
-            definition.name = Path(upload_name).stem or definition.name
-            saved = self.library.save(definition, USER_LIBRARY_SCOPE)
+            base_name = Path(upload_name).stem or definition.name
+            definition.name = base_name
+            counter = 2
+            while self.library.exists(definition.name):
+                definition.name = f"{base_name} {counter}"
+                counter += 1
+            saved = self.library.save_new(definition, USER_LIBRARY_SCOPE)
         except ValueError as exc:
             message = str(exc)
             self.set_status(f"CIF import failed: {message}")
@@ -5090,7 +5229,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             if temp_path is not None:
                 temp_path.unlink(missing_ok=True)
 
-        self.refresh_library(saved.name, target_panel_id=self.latest_panel_id(), force_default_color=True)
+        self.refresh_panel_crystal_select_options()
+        self.add_panel(crystal_name=saved.name)
         self.refresh_crystal_list()
         self.set_status(f"Loaded CIF: {saved.name}")
         ui.notify(f"Loaded CIF: {saved.name}", type="positive")
@@ -6255,13 +6395,15 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         for controller in self.combo_controllers:
             controller.refresh_source_options()
 
-    def add_panel(self) -> None:
+    def add_panel(self, *, crystal_name: str | None = None) -> None:
         defaults = [
             ("FCC", "100", "", ""),
             ("BCC", "100", "", ""),
             ("HCP", "100", "", ""),
         ]
         crystal, zone, plane, vector = defaults[(self.next_panel_id - 1) % len(defaults)]
+        if crystal_name is not None:
+            crystal = crystal_name
         state = PanelState(
             panel_id=self.next_panel_id,
             crystal_name=crystal,
@@ -6384,11 +6526,6 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if panel_id is None:
             return self.panel_states[0] if self.panel_states else None
         return next((state for state in self.panel_states if state.panel_id == panel_id), None)
-
-    def latest_panel_id(self) -> int | None:
-        if not self.panel_states:
-            return None
-        return max(self.panel_states, key=lambda state: state.panel_id).panel_id
 
     def refresh_panel_crystal_select_options(self) -> None:
         options = self.library.options()
