@@ -20,19 +20,19 @@ https://crysdis.onrender.com
 
 ## Download Desktop Packages
 
-Desktop packages are available from the GitHub **Releases** page. For version `v0.1.5`, download the file matching your operating system.
+Desktop packages are available from the GitHub **Releases** page. For version `v0.1.6`, download the file matching your operating system.
 
 Release assets:
 
 ```text
-CrysDiS-Windows-v0.1.5.zip
-CrysDiS-Linux-v0.1.5.tar.gz
-CrysDiS-macOS-arm64-v0.1.5.zip
+CrysDiS-Windows-v0.1.6.zip
+CrysDiS-Linux-v0.1.6.tar.gz
+CrysDiS-macOS-arm64-v0.1.6.zip
 ```
 
 ### Windows
 
-1. Download `CrysDiS-Windows-v0.1.5.zip`.
+1. Download `CrysDiS-Windows-v0.1.6.zip`.
 2. Before extracting, right-click the zip file → Properties → General → Unblock → Apply → OK.
 3. Extract/unzip the folder.
 4. Open the extracted `CrysDiS` folder.
@@ -44,11 +44,11 @@ CrysDiS.exe
 
 ### Linux
 
-1. Download `CrysDiS-Linux-v0.1.5.tar.gz`.
+1. Download `CrysDiS-Linux-v0.1.6.tar.gz`.
 2. Extract it:
 
 ```bash
-tar -xzf CrysDiS-Linux-v0.1.5.tar.gz
+tar -xzf CrysDiS-Linux-v0.1.6.tar.gz
 cd CrysDiS
 ```
 
@@ -68,7 +68,7 @@ After installing the launcher, search for **CrysDiS** in your Linux application 
 
 ### macOS
 
-1. Download `CrysDiS-macOS-arm64-v0.1.5.zip`.
+1. Download `CrysDiS-macOS-arm64-v0.1.6.zip`.
 2. Unzip it.
 3. Double-click:
 
@@ -90,10 +90,32 @@ If macOS blocks the app because it is unsigned, right-click `CrysDiS.app`, choos
 
 1. Choose a crystal and enter a zone axis such as `100`, `110`, or `0001`.
 2. Press `Apply`.
-3. Add planes such as `100 123` or vectors such as `110 -1-1-2`.
+3. Add planes such as `123 (411) 1,1,4` or vectors such as `100 114 [123] *1,2,3` (see Input Formats below).
 4. Rotate the 3D crystal with the mouse. Press `Sync` to update the diffraction pattern to the current view.
 5. Use `Download` to export images.
 6. Use `Add combo panel` to overlay diffraction patterns from multiple panels.
+
+### Input Formats
+
+In the **Plane** and **Vector** fields, use **spaces to separate different entries** and **commas to separate the components of one entry**. Compact and bracketed forms can be mixed in the same field.
+
+| Entry type | Accepted examples |
+| --- | --- |
+| Real-space vector (`u,v,w`) | `114`, `1,1,4`, `[114]`, `[1,1,4]`, `[1 1 4]` |
+| Reciprocal vector (`*u,v,w`) | `*123`, `*1,2,3`, `*[123]`, `*[1,2,3]`, `*[1 2 3]` |
+| Plane (`h,k,l`) | `411`, `4,1,1`, `(411)`, `(4,1,1)`, `(4 1 1)` |
+
+The letters above stand for integer indices. Reciprocal vectors also accept `r` or `R` instead of `*`, for example `r123`, `R1,2,3`, `r[123]`, and `R[1,2,3]`.
+
+Examples with multiple entries:
+
+- Vector: `100 114 [123]` displays all three vectors.
+- Vector: `1,1,4 *1,2,3` mixes a real-space vector and a reciprocal vector.
+- Plane: `123 (411) 1,1,4` displays all three planes.
+
+For negative or multi-digit components, use forms such as `1,-1,10`, `[13 3 0]`, or `(1 2 27)`. Compact notation treats each digit as a separate component, so use commas or spaces inside brackets/parentheses to make multi-digit indices unambiguous. When mixing entries, enclose space-separated components in brackets/parentheses, or use commas without brackets.
+
+Use `100 114`, not `100,114`, for two separate vectors or planes: commas mean components, not separate entries. Hexagonal structures also accept four-index forms such as `10-10`, `1,0,-1,0`, `[1 0 -1 0]`, or `(1 0 -1 0)` in the corresponding field.
 
 ## Run From Source
 
