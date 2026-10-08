@@ -16,7 +16,9 @@ import sys
 import tempfile
 import warnings
 from dataclasses import asdict, dataclass, field
+from fractions import Fraction
 from functools import lru_cache
+from html import escape
 from itertools import product
 from pathlib import Path
 from typing import Any, Callable
@@ -1271,17 +1273,110 @@ def cif_number(value: float) -> str:
     return f"{float(value):.8f}"
 
 
-def cif_formula_sum(definition: CrystalDefinition) -> str:
-    totals: dict[str, float] = {}
-    for site in expanded_sites(definition):
+def unit_cell_composition(definition: CrystalDefinition, *, expanded: list[AtomicSite] | None = None) -> dict[str, Fraction]:
+    totals: dict[str, Fraction] = {}
+    for site in expanded_sites(definition) if expanded is None else expanded:
         occupancy = min(max(float(site.occupancy), 0.0), 1.0)
         if occupancy <= 0.0:
             continue
         element = site.element.strip().capitalize()
-        totals[element] = totals.get(element, 0.0) + occupancy
+        # Decimal occupancies stay exact when summed and reduced to integer ratios.
+        totals[element] = totals.get(element, Fraction(0)) + Fraction(str(occupancy))
+    return totals
+
+
+FORMULA_MODES = {"cell": "Unit cell", "reduced": "Reduced", "fraction": "Atomic fraction", "sites": "Site occupancies"}
+
+
+def rounded_formula_units(amounts: list[Fraction]) -> list[int]:
+    scaled = [amount * 1000 for amount in amounts]
+    units = [amount.numerator // amount.denominator for amount in scaled]
+    # Balance rounding to the original total, without normalizing partially vacant sites.
+    order = sorted(range(len(units)), key=lambda index: scaled[index] - units[index], reverse=True)
+    for index in order[:round(sum(scaled)) - sum(units)]:
+        units[index] += 1
+    return units
+
+
+@dataclass(frozen=True)
+class SiteOccupancyGroup:
+    components: tuple[tuple[str, Fraction], ...]
+    multiplicity: int
+
+
+def site_occupancy_groups(sites: list[AtomicSite]) -> list[SiteOccupancyGroup]:
+    positions: dict[tuple[int, ...], dict[str, Fraction]] = {}
+    tolerance = 1e-6
+    for site in sites:
+        frac = wrap_fractional(site.fractional, tolerance=tolerance)
+        key = tuple(int(round(float(value) / tolerance)) for value in frac)
+        components = positions.setdefault(key, {})
+        element = site.element.strip().capitalize()
+        occupancy = Fraction(str(float(site.occupancy)))
+        components[element] = components.get(element, Fraction(0)) + occupancy
+
+    counts: dict[tuple[tuple[str, Fraction], ...], int] = {}
+    for components in positions.values():
+        occupied = {element: amount for element, amount in components.items() if amount != 0}
+        pattern = tuple(sorted((occupied or components).items()))
+        counts[pattern] = counts.get(pattern, 0) + 1
+    groups = [SiteOccupancyGroup(pattern, count) for pattern, count in counts.items()]
+    # Mixed/partial groups precede fully occupied elements; keep distinct patterns separate.
+    return sorted(groups, key=lambda group: len(group.components) == 1 and group.components[0][1] == 1)
+
+
+def unbalanced_site_occupancies(definition: CrystalDefinition) -> list[SiteOccupancyGroup]:
+    groups = site_occupancy_groups(expanded_sites(definition))
+    # Ignore decimal rounding noise without hiding an underfilled or overfilled site.
+    tolerance = Fraction(1, 1_000_000)
+    return [group for group in groups if abs(sum(amount for _, amount in group.components) - 1) > tolerance]
+
+
+def site_occupancy_formula(groups: list[SiteOccupancyGroup]) -> str:
+    if not groups:
+        return ""
+    divisor = math.gcd(*(group.multiplicity for group in groups))
+    parts = []
+    for group in groups:
+        if len(group.components) == 1 and group.components[0][1] == 1:
+            content = escape(group.components[0][0])
+        else:
+            units = rounded_formula_units([amount for _, amount in group.components])
+            content = "(" + "<wbr>".join(
+                escape(element) + "<sub>" + f"{amount / 1000:.3f}".rstrip("0").rstrip(".") + "</sub>"
+                for (element, _), amount in zip(group.components, units)
+            ) + ")"
+        multiplier = group.multiplicity // divisor
+        parts.append(content + (f"<sub>{multiplier}</sub>" if multiplier != 1 else ""))
+    return "<wbr>".join(parts)
+
+
+def formula_terms(totals: dict[str, Fraction], mode: str) -> list[tuple[str, str]]:
+    if not totals:
+        return []
+    elements = list(totals)
+    amounts = list(totals.values())
+    if mode == "reduced":
+        denominator = math.lcm(*(amount.denominator for amount in amounts))
+        integers = [int(amount * denominator) for amount in amounts]
+        divisor = math.gcd(*integers)
+        return [(element, str(amount // divisor) if amount != divisor else "")
+                for element, amount in zip(elements, integers)]
+    if mode == "fraction":
+        total = sum(amounts)
+        units = rounded_formula_units([amount / total for amount in amounts])
+        return [(element, f"{amount / 1000:.3f}") for element, amount in zip(elements, units)]
+    if mode != "cell":
+        raise ValueError(f"Unknown formula mode: {mode}")
+    return [(element, "" if amount == 1 else str(amount.numerator) if amount.denominator == 1 else f"{float(amount):.12g}")
+            for element, amount in zip(elements, amounts)]
+
+
+def cif_formula_sum(definition: CrystalDefinition) -> str:
+    totals = unit_cell_composition(definition)
     parts = []
     for element in sorted(totals):
-        amount = totals[element]
+        amount = float(totals[element])
         if math.isclose(amount, 1.0, abs_tol=1e-8):
             amount_text = ""
         elif math.isclose(amount, round(amount), abs_tol=1e-8):
@@ -2632,9 +2727,18 @@ class CrystalBuilder:
         self.save_edit_button = None
         self.save_new_button = None
         self.export_cif_button = None
+        self.occupancy_warning_dialog = None
         self.repeat_boundary_atoms = True
         self.imported_space_group = "P1"
         self.imported_symmetry_operations: list[str] = []
+        self.formula_mode = "cell"
+        self.formula_totals: dict[str, Fraction] = {}
+        self.formula_groups: list[SiteOccupancyGroup] = []
+        self.formula_error = ""
+        self.formula_label = None
+        self.formula_mode_label = None
+        self.formula_timer = None
+        self._loading_definition = False
         self._build()
 
     def _build(self) -> None:
@@ -2692,22 +2796,91 @@ class CrystalBuilder:
             ui.label("Atom sites").classes("text-subtitle2")
             self.site_container = ui.column().classes("full-width gap-2")
 
-            with ui.row().classes("justify-end full-width gap-2"):
-                self.save_edit_button = ui.button(
-                    "Save edited structure",
-                    icon="save",
-                    on_click=self.save_edited_structure,
-                ).props("outline color=primary")
-                self.save_new_button = ui.button(
-                    "Save as a new structure",
-                    icon="save_as",
-                    on_click=self.save_as_new_structure,
-                ).props("unelevated color=primary")
-                self.export_cif_button = ui.button(
-                    "EXPORT AS CIF",
-                    icon="download",
-                    on_click=self.open_cif_export_dialog,
-                ).props("outline color=primary")
+            with ui.row().classes("builder-footer"):
+                with ui.row().classes("builder-formula"):
+                    self.formula_cycle_button = ui.button(icon="swap_horiz", on_click=self.cycle_formula_mode).props(
+                        'flat round dense aria-label="Cycle formula representation"'
+                    ).classes("formula-cycle")
+                    self.formula_cycle_button.tooltip("Cycle formula representation")
+                    with ui.column().classes("formula-content"):
+                        self.formula_mode_label = ui.label(FORMULA_MODES[self.formula_mode]).classes("formula-mode")
+                        self.formula_label = ui.html("No occupied sites").classes("formula-value")
+                with ui.row().classes("builder-save-actions"):
+                    self.save_edit_button = ui.button(
+                        "Save edited structure",
+                        icon="save",
+                        on_click=self.save_edited_structure,
+                    ).props("outline color=primary")
+                    self.save_new_button = ui.button(
+                        "Save as a new structure",
+                        icon="save_as",
+                        on_click=self.save_as_new_structure,
+                    ).props("unelevated color=primary")
+                    self.export_cif_button = ui.button(
+                        "EXPORT AS CIF",
+                        icon="download",
+                        on_click=self.open_cif_export_dialog,
+                    ).props("outline color=primary")
+        for field in (self.symmetry_select, self.system_select, self.a_input, self.b_input, self.c_input,
+                      self.alpha_input, self.beta_input, self.gamma_input):
+            field.on_value_change(self.schedule_formula_update)
+
+    def schedule_formula_update(self) -> None:
+        if self._loading_definition:
+            return
+        if self.formula_timer is not None:
+            self.formula_timer.deactivate()
+        if core.is_loop_running():
+            self.formula_timer = ui.timer(0.25, self.update_formula, once=True, immediate=False)
+        else:
+            self.update_formula()
+
+    def update_formula(self) -> None:
+        if self._loading_definition:
+            return
+        if self.formula_timer is not None:
+            self.formula_timer.deactivate()
+            self.formula_timer = None
+        try:
+            for row in self.site_rows:
+                if not str(row["element"].value or "").strip():
+                    raise ValueError("Incomplete atom site")
+                for key in ("x", "y", "z", "occupancy"):
+                    value = row[key].value
+                    if value is None or not math.isfinite(float(value)):
+                        raise ValueError("Incomplete atom site")
+                if not 0 <= float(row["occupancy"].value) <= 1:
+                    raise ValueError("Invalid occupancy")
+            definition = self.read_definition()
+            if not definition.symmetry_operations and space_group_export_metadata(definition.space_group)[1] is None:
+                raise ValueError("Unknown symmetry")
+            sites = expanded_sites(definition)
+            self.formula_totals = unit_cell_composition(definition, expanded=sites)
+            self.formula_groups = (site_occupancy_groups(sites)
+                                   if any(site.occupancy != 1 for site in definition.sites) else [])
+            self.formula_error = ""
+        except (ValueError, TypeError, OverflowError):
+            self.formula_totals = {}
+            self.formula_groups = []
+            self.formula_error = "Formula unavailable"
+        self.render_formula()
+
+    def render_formula(self) -> None:
+        if self.formula_mode == "sites" and not self.formula_groups:
+            self.formula_mode = "cell"
+        self.formula_mode_label.set_text(FORMULA_MODES[self.formula_mode])
+        if self.formula_mode == "sites":
+            content = site_occupancy_formula(self.formula_groups)
+        else:
+            terms = formula_terms(self.formula_totals, self.formula_mode)
+            content = "<wbr>".join(escape(element) + (f"<sub>{escape(amount)}</sub>" if amount else "")
+                                  for element, amount in terms)
+        self.formula_label.set_content(content or self.formula_error or "No occupied sites")
+
+    def cycle_formula_mode(self) -> None:
+        modes = [mode for mode in FORMULA_MODES if mode != "sites" or self.formula_groups]
+        self.formula_mode = modes[(modes.index(self.formula_mode) + 1) % len(modes)]
+        self.render_formula()
 
     def open(
         self,
@@ -2749,20 +2922,25 @@ class CrystalBuilder:
             self.export_cif_button.update()
 
     def load_definition(self, definition: CrystalDefinition) -> None:
-        self.name_input.value = definition.name if definition.name not in DEFAULT_NAMES else f"{definition.name} custom"
-        self.system_select.value = definition.lattice_system
-        symmetry_option = space_group_option_for(definition.space_group)
-        self.symmetry_select.set_options(list(dict.fromkeys([*space_group_options(), symmetry_option])), value=symmetry_option)
-        self.imported_space_group = space_group_symbol(definition.space_group)
-        self.imported_symmetry_operations = list(definition.symmetry_operations)
-        self.repeat_boundary_atoms = definition.repeat_boundary_atoms
-        self.a_input.value = definition.a
-        self.b_input.value = definition.b
-        self.c_input.value = definition.c
-        self.alpha_input.value = definition.alpha
-        self.beta_input.value = definition.beta
-        self.gamma_input.value = definition.gamma
-        self.rebuild_site_rows([AtomicSite(**asdict(site)) for site in definition.sites])
+        self._loading_definition = True
+        try:
+            self.name_input.value = definition.name if definition.name not in DEFAULT_NAMES else f"{definition.name} custom"
+            self.system_select.value = definition.lattice_system
+            symmetry_option = space_group_option_for(definition.space_group)
+            self.symmetry_select.set_options(list(dict.fromkeys([*space_group_options(), symmetry_option])), value=symmetry_option)
+            self.imported_space_group = space_group_symbol(definition.space_group)
+            self.imported_symmetry_operations = list(definition.symmetry_operations)
+            self.repeat_boundary_atoms = definition.repeat_boundary_atoms
+            self.a_input.value = definition.a
+            self.b_input.value = definition.b
+            self.c_input.value = definition.c
+            self.alpha_input.value = definition.alpha
+            self.beta_input.value = definition.beta
+            self.gamma_input.value = definition.gamma
+            self.rebuild_site_rows([AtomicSite(**asdict(site)) for site in definition.sites])
+        finally:
+            self._loading_definition = False
+        self.update_formula()
 
     def apply_lattice_constraints(self) -> None:
         system = self.system_select.value or "triclinic"
@@ -2891,6 +3069,9 @@ class CrystalBuilder:
                             "label": label,
                         }
                     )
+                    for field in (element, x, y, z, occ):
+                        field.on_value_change(self.schedule_formula_update)
+        self.update_formula()
 
     def read_sites_from_rows(self) -> list[AtomicSite]:
         sites = []
@@ -2933,16 +3114,70 @@ class CrystalBuilder:
         return definition
 
     def open_cif_export_dialog(self) -> None:
-        try:
-            definition = self.read_definition()
-        except ValueError as exc:
-            ui.notify(str(exc), type="negative")
-            return
-        self.simulator.open_crystal_cif_export_dialog(definition=definition)
+        self.request_structure_action(
+            lambda definition: self.simulator.open_crystal_cif_export_dialog(definition=definition),
+            exporting=True,
+        )
 
     def save_edited_structure(self) -> None:
+        self.request_structure_action(self._save_edited_structure)
+
+    def save_as_new_structure(self) -> None:
+        self.request_structure_action(self._save_as_new_structure)
+
+    def request_structure_action(self, action: Callable[[CrystalDefinition], None], *, exporting: bool = False) -> None:
+        if self.occupancy_warning_dialog is not None:
+            return
         try:
             definition = self.read_definition()
+            warnings = unbalanced_site_occupancies(definition)
+        except (ValueError, TypeError, OverflowError) as exc:
+            ui.notify(str(exc), type="negative")
+            return
+        if not warnings:
+            action(definition)
+            return
+
+        dialog = self.occupancy_warning_dialog = ui.dialog().props("persistent")
+        decided = False
+
+        def finish(confirmed: bool) -> None:
+            nonlocal decided
+            if decided:
+                return
+            decided = True
+            self.occupancy_warning_dialog = None
+            dialog.close()
+            if confirmed:
+                # A follow-up export dialog must not be a child of this disappearing warning.
+                with self.dialog.client:
+                    action(definition)
+
+        dialog.on("hide", dialog.delete)
+        action_name = "exporting" if exporting else "saving"
+        with dialog, ui.card().classes("occupancy-warning-card"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("warning", color="warning")
+                ui.label("Check site occupancies").classes("text-h6")
+            ui.label(f"Crystal: {definition.name}").classes("full-width break-words text-caption")
+            ui.label(f"Some atomic positions have total occupancy below or above 1. Continue {action_name} with these values?")
+            with ui.column().classes("occupancy-warning-list"):
+                for group in warnings:
+                    components = ", ".join(f"{element}: {float(amount):.12g}" for element, amount in group.components)
+                    total = float(sum(amount for _, amount in group.components))
+                    count = group.multiplicity
+                    with ui.column().classes("full-width gap-1"):
+                        ui.label(components).classes("full-width break-words")
+                        ui.label(f"Total: {total:.12g} | {count} unit-cell position{'s' if count != 1 else ''}").classes(
+                            "text-caption"
+                        )
+            with ui.row().classes("justify-end full-width gap-2"):
+                ui.button("Cancel", on_click=lambda: finish(False)).props("flat")
+                ui.button(f"Continue {action_name}", icon="download" if exporting else "save", on_click=lambda: finish(True)).props("unelevated")
+        dialog.open()
+
+    def _save_edited_structure(self, definition: CrystalDefinition) -> None:
+        try:
             saved = self.simulator.library.save_edited(
                 definition,
                 self.scope_select.value or "Project local library",
@@ -2965,9 +3200,8 @@ class CrystalBuilder:
         self.simulator.refresh_crystal_list()
         self.dialog.close()
 
-    def save_as_new_structure(self) -> None:
+    def _save_as_new_structure(self, definition: CrystalDefinition) -> None:
         try:
-            definition = self.read_definition()
             saved = self.simulator.library.save_new(definition, self.scope_select.value or "Project local library")
         except ValueError as exc:
             ui.notify(str(exc), type="negative")
@@ -4719,6 +4953,18 @@ Compare a real-space crystal view with its electron diffraction pattern. Each or
 - `New Crystal` lets you create or edit custom structures, set symmetry, lattice parameters, atom sites, occupancies, and atom colors.
 - `Crystal list` lets you review, edit, export, or delete available structures.
 
+### Chemical formulas
+The formula at the bottom left of the crystal builder is calculated after symmetry expansion, with each element weighted by its site occupancy. The cycle button switches between:
+
+- **Unit cell:** total elemental amounts in one unit cell, such as `Fe14Cr16`.
+- **Reduced:** the simplest whole-number elemental ratio, such as `Fe7Cr8`.
+- **Atomic fraction:** elemental amounts normalized to 1, such as `Fe0.467Cr0.533`. Subscripts are rounded to three decimal places and balanced to sum to 1.000.
+- **Site occupancies:** available when any occupancy differs from 1. Elements sharing a position are grouped, identical occupation patterns are combined, and outer coefficients give reduced integer site counts. For example, `(Fe0.2Mn0.2Ni0.6)3Ti`; different occupation patterns remain separate. Inner occupancies are rounded to three decimal places without normalization.
+
+Extra drawings on opposite cell boundaries are not counted again in the formula. Boundary atoms themselves are included: an FCC cell shows eight corners and six face centers, contributing `8 x 1/8 + 6 x 1/2 = 4` atoms per unit cell. This geometric sharing is separate from chemical occupancy; a fully occupied corner site still has occupancy 1.
+
+Both builder Save buttons and **Export as CIF** check the sum of occupancies at each position after symmetry expansion. Totals differing from 1 by more than 0.000001 trigger a warning. **Cancel** returns to editing without saving or exporting; **Continue saving** or **Continue exporting** keeps the entered values unchanged, including intentional vacancies. Continuing an export opens the filename and symmetry options. Neither action normalizes occupancies automatically.
+
 ### Indices and vectors
 - Plane indices use entries like `100`, `1-10`, or `0001`.
 - Real-space vectors use entries like `110` or `2-1-10`.
@@ -5668,6 +5914,19 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 border-radius: 8px;
                 gap: 8px;
             }
+            .occupancy-warning-card {
+                width: min(560px, calc(100vw - 40px));
+                max-width: calc(100vw - 40px) !important;
+                border-radius: 8px;
+                gap: 12px;
+                overflow-wrap: anywhere;
+            }
+            .occupancy-warning-list {
+                width: 100%;
+                max-height: 35vh;
+                overflow-y: auto;
+                gap: 12px;
+            }
             .export-folder-label {
                 max-width: 100%;
                 color: #B8C0CC;
@@ -5850,6 +6109,52 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 width: 100%;
                 grid-template-columns: repeat(5, minmax(130px, 1fr)) !important;
                 gap: 10px;
+            }
+            .builder-footer {
+                width: 100%;
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+            }
+            .builder-formula {
+                flex: 1 1 240px;
+                min-width: 0;
+                max-width: 100%;
+                align-items: center;
+                flex-wrap: nowrap;
+                gap: 8px;
+            }
+            .formula-content {
+                min-width: 0;
+                gap: 2px;
+            }
+            .formula-mode {
+                font-size: 12px;
+                opacity: 0.7;
+            }
+            .formula-value {
+                max-width: 100%;
+                min-height: 32px;
+                font-size: 20px;
+                line-height: 1.6;
+                overflow-wrap: anywhere;
+            }
+            .formula-value sub {
+                font-size: 0.75em;
+                line-height: 0;
+            }
+            .formula-cycle {
+                flex: 0 0 32px;
+                width: 32px;
+                height: 32px;
+            }
+            .builder-save-actions {
+                max-width: 100%;
+                flex-wrap: wrap;
+                justify-content: flex-end;
+                gap: 8px;
             }
             .site-row {
                 display: grid;
