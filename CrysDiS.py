@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import colorsys
+import copy
 import io
 import importlib.util
 import json
@@ -15,7 +16,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from functools import lru_cache
 from html import escape
@@ -25,6 +26,11 @@ from typing import Any, Callable
 
 import numpy as np
 from nicegui import app, core, native, ui
+# Register event/marker dragging before NiceGUI builds the initial page's import map.
+from nicegui.elements import sortable as _sortable
+from CrysDiS_markers import (CrystalMarker, MarkerEditor, THREE_MARKERS_SCRIPT,
+                            marker_geometry, marker_extent_points, marker_hidden_atom_indices,
+                            validate_markers, clean_coordinate, point_text)
 
 
 try:
@@ -104,6 +110,42 @@ def is_frozen_app() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def system_save_file_dialog(suggested: Path, extension: str) -> tuple[Path | None, bool]:
+    """Return (selection, picker_available), distinguishing Cancel from failure."""
+    if sys.platform.startswith("linux"):
+        commands = (
+            ("zenity", ["zenity", "--file-selection", "--save", "--confirm-overwrite", f"--filename={suggested}"]),
+            ("kdialog", ["kdialog", "--getsavefilename", str(suggested), f"*{extension}"]),
+            ("yad", ["yad", "--file-selection", "--save", "--confirm-overwrite", f"--filename={suggested}"]),
+        )
+        for executable, command in commands:
+            if shutil.which(executable):
+                try:
+                    result = subprocess.run(command, capture_output=True, text=True)
+                    if result.returncode == 0:
+                        value = result.stdout.strip()
+                        return (normalize_export_path(value) if value else None), True
+                    if not result.stderr.strip():
+                        return None, True
+                except OSError:
+                    pass
+    root = None
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        value = filedialog.asksaveasfilename(title="Save CrysDiS file as", initialdir=str(suggested.parent),
+            initialfile=suggested.name, defaultextension=extension,
+            filetypes=[(extension[1:].upper() + " files", "*" + extension)], confirmoverwrite=True)
+        return (normalize_export_path(value) if value else None), True
+    except Exception:
+        return None, False
+    finally:
+        if root is not None:
+            root.destroy()
+
+
 def is_desktop_mode() -> bool:
     return is_frozen_app() or os.environ.get("CRYSDIS_DESKTOP") == "1"
 
@@ -167,6 +209,7 @@ APP_DIR = resource_dir()
 BUNDLED_LIBRARY_PATH = APP_DIR / "custom_crystals_local.json"
 USER_DATA_DIR = app_data_dir()
 USER_LIBRARY_PATH = USER_DATA_DIR / "custom_crystals.json"
+ELEMENT_COLORS_PATH = USER_DATA_DIR / "element_colors.json"
 LEGACY_LIBRARY_PATH = Path.home() / ".crystal_diffraction_simulator" / "custom_crystals.json"
 LOCAL_LIBRARY_PATH = BUNDLED_LIBRARY_PATH
 GLOBAL_LIBRARY_PATH = USER_LIBRARY_PATH
@@ -178,14 +221,14 @@ SIMULATION_METHOD_PYMATGEN = "Pymatgen TEMCalculator"
 SIMULATION_METHODS = (SIMULATION_METHOD_EWALD, SIMULATION_METHOD_PYMATGEN)
 SIMULATION_METHOD = SIMULATION_METHOD_PYMATGEN
 DEFAULT_VOLTAGE_KV = 500.0
-DEFAULT_THICKNESS_NM = 10.0
+DEFAULT_THICKNESS_NM = 30.0
 DEFAULT_MAX_HKL = 7
 DEFAULT_ZONE_AXIS_SEARCH_MAX = 18
 _ZONE_AXIS_CANDIDATE_CACHE: dict[tuple[tuple[float, ...], int], tuple[np.ndarray, np.ndarray]] = {}
 DEFAULT_CAMERA_LENGTH_MM = 200.0
 DIFFRACTION_BASE_LIMIT_NM_INV = 16.0
-DEFAULT_SPOT_INTENSITY_THRESHOLD = 0.001
-MIN_SPOT_INTENSITY_THRESHOLD = 1e-4
+DEFAULT_SPOT_INTENSITY_THRESHOLD = 1e-4
+MIN_SPOT_INTENSITY_THRESHOLD = 1e-10
 DEFAULT_SPOT_SIZE_SCALING = 0.3
 DEFAULT_INTENSITY_COMPRESSION_FACTOR = 100.0
 BASE_DIFFRACTION_MARKER_SIZE = 5.0
@@ -202,6 +245,7 @@ REAL_SCENE_ATOM_RADIUS = 0.072
 REAL_SCENE_ATOM_MIN_RADIUS_SCALE = 0.38
 REAL_SCENE_ATOM_SPACING_FRACTION = 0.35
 CRYSTAL_EXPORT_ATOM_MARKER_SIZE = 160.0
+MAX_FRAME_THICKNESS = 20.0
 IDEAL_HCP_CA = math.sqrt(8.0 / 3.0)
 SYMMETRY_SITE_TOL = 5e-3
 
@@ -542,6 +586,91 @@ class DisplayAtom:
     occupancy: float
     label: str = ""
     color: str = ""
+    radius_multiplier: float = 1.0
+    components: tuple[tuple[str, float, str], ...] = ()
+
+
+@dataclass
+class AnnotationStyle:
+    font_size: float = 12.0
+    color: str = "#F7FAFC"
+    position: str = "bottom_left"
+    opacity: float = 1.0
+
+
+@dataclass
+class PanelAnnotations:
+    real_scale_visible: bool = True
+    reciprocal_scale_visible: bool = True
+    real_scale: AnnotationStyle = field(default_factory=AnnotationStyle)
+    reciprocal_scale: AnnotationStyle = field(default_factory=lambda: AnnotationStyle(font_size=11))
+    zone: AnnotationStyle = field(default_factory=lambda: AnnotationStyle(position="bottom_right", opacity=.9))
+    indices: AnnotationStyle = field(default_factory=lambda: AnnotationStyle(font_size=9, position="up", opacity=.88))
+    index_offset: float = 4.0
+
+
+ANNOTATION_CORNERS = {"top_left": "Top left", "top_right": "Top right",
+                      "bottom_left": "Bottom left", "bottom_right": "Bottom right"}
+SPOT_LABEL_DIRECTIONS = {"upper_left": (-1, 1), "up": (0, 1), "upper_right": (1, 1),
+                         "left": (-1, 0), "right": (1, 0),
+                         "bottom_left": (-1, -1), "bottom": (0, -1), "bottom_right": (1, -1)}
+ANNOTATION_STYLE_NAMES = ("real_scale", "reciprocal_scale", "zone", "indices")
+
+
+@dataclass
+class PanelDisplaySettings:
+    frame_mode: str = "original"
+    frame_color: str = "#7A8796"
+    frame_width: float = 1.0
+    atom_scale: float = 1.0
+    element_scales: dict[str, float] = field(default_factory=dict)
+    occupancy_colors: str = "sectors"
+    cells: tuple[int, int, int] = (1, 1, 1)
+    extend_annotations: bool = False
+    frame_opacity: float = 0.72
+    vector_opacity: float = 0.95
+    reciprocal_opacity: float = 0.78
+    plane_opacity: float = 0.36
+    plane_edge_opacity: float = 0.9
+    vector_label_scale: float = 1.0
+    vector_label_opacity: float = 0.95
+    plane_label_scale: float = 1.0
+    plane_label_opacity: float = 0.9
+    annotations: PanelAnnotations = field(default_factory=PanelAnnotations)
+    markers: list[CrystalMarker] = field(default_factory=list)
+
+
+DISPLAY_SETTING_FIELDS = {
+    "frame": ("frame_mode", "frame_color", "frame_width", "frame_opacity"),
+    "atoms": ("atom_scale", "element_scales", "occupancy_colors"),
+    "cells": ("cells", "extend_annotations"),
+    "colors": ("vector_opacity", "reciprocal_opacity", "plane_opacity", "plane_edge_opacity",
+               "vector_label_scale", "vector_label_opacity", "plane_label_scale", "plane_label_opacity"),
+    "annotations": ("annotations",),
+}
+DISPLAY_SETTING_SECTIONS = frozenset(DISPLAY_SETTING_FIELDS)
+
+
+def crystal_display_settings(settings: PanelDisplaySettings) -> PanelDisplaySettings:
+    """Exclude 2D overlays from crystal geometry/cache invalidation."""
+    return replace(settings, annotations=PanelAnnotations())
+
+
+@dataclass
+class DisplaySettingsDraft:
+    display: PanelDisplaySettings = field(default_factory=PanelDisplaySettings)
+    inherited: set[str] = field(default_factory=set)
+    vector_colors: list[str] = field(default_factory=lambda: VECTOR_COLORS.copy())
+    plane_colors: list[str] = field(default_factory=lambda: PLANE_COLORS.copy())
+    diffraction_color: str | None = None
+    element_colors: dict[str, str] = field(default_factory=dict)
+
+
+def inherited_display_settings(local: PanelDisplaySettings, defaults: PanelDisplaySettings,
+                               sections: set[str]) -> PanelDisplaySettings:
+    values = {name: getattr(defaults, name) for section, names in DISPLAY_SETTING_FIELDS.items()
+              if section in sections for name in names}
+    return copy.deepcopy(replace(local, **values))
 
 
 @dataclass
@@ -557,6 +686,21 @@ class CrystalModel:
     atom_radius_scale: float
     scale_nm: float
     limit: float
+    display_source: CrystalModel | None = None
+    bounds_edges: list[tuple[np.ndarray, np.ndarray]] | None = None
+    clip_edges: list[tuple[np.ndarray, np.ndarray]] | None = None
+    annotation_min: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    annotation_max: np.ndarray = field(default_factory=lambda: np.ones(3))
+    display_extent_scale: float = 1.0
+    display_atom_scale: float = 1.0
+    hidden_atom_indices: frozenset[int] = field(default_factory=frozenset)
+
+    def atom_radius(self, atom: DisplayAtom | None = None) -> float:
+        factor = occupancy_radius_factor(atom.occupancy) * atom.radius_multiplier if atom is not None else 1.0
+        return REAL_SCENE_ATOM_RADIUS * self.atom_radius_scale * factor
+
+    def visible_display_atoms(self):
+        return (atom for index, atom in enumerate(self.display_atoms) if index not in self.hidden_atom_indices)
 
 
 @dataclass
@@ -589,6 +733,9 @@ class PanelState:
     magnified: bool = False
     vector_colors: list[str] | None = None
     plane_colors: list[str] | None = None
+    display_settings: PanelDisplaySettings = field(default_factory=PanelDisplaySettings)
+    global_display_sections: set[str] = field(default_factory=lambda: set(DISPLAY_SETTING_SECTIONS))
+    diffraction_color_custom: bool = False
 
 
 @dataclass
@@ -994,15 +1141,29 @@ def atom_radius_scale_for_display(atoms: list[DisplayAtom]) -> float:
     return min(1.0, max(REAL_SCENE_ATOM_MIN_RADIUS_SCALE, spacing_scale))
 
 
-def mixed_occupancy_display_sites(sites: list[AtomicSite], tolerance: float = 1e-6) -> list[AtomicSite]:
+def occupancy_site_key(fractional: np.ndarray, tolerance: float = 1e-6) -> tuple[int, int, int]:
+    return tuple(int(round(float(value) / tolerance)) for value in wrap_fractional(fractional, tolerance=tolerance))
+
+
+def grouped_occupancy_sites(sites: list[AtomicSite], tolerance: float = 1e-6) -> dict:
     grouped: dict[tuple[int, int, int], list[AtomicSite]] = {}
     for site in sites:
-        frac = wrap_fractional(site.fractional, tolerance=tolerance)
-        key = tuple(int(round(float(value) / tolerance)) for value in frac)
-        grouped.setdefault(key, []).append(site)
+        grouped.setdefault(occupancy_site_key(site.fractional, tolerance), []).append(site)
+    return grouped
 
+
+def occupancy_components(sites: list[AtomicSite], element_colors: dict[str, str] | None = None) -> dict:
+    return {
+        key: tuple((site.element, max(float(site.occupancy), 0.0), color_for_site(site, element_colors))
+                   for site in group if site.occupancy > 0)
+        for key, group in grouped_occupancy_sites(sites).items()
+    }
+
+
+def mixed_occupancy_display_sites(sites: list[AtomicSite], tolerance: float = 1e-6,
+                                  element_colors: dict[str, str] | None = None) -> list[AtomicSite]:
     mixed_sites: list[AtomicSite] = []
-    for group in grouped.values():
+    for group in grouped_occupancy_sites(sites, tolerance).values():
         representative = group[0]
         total_occupancy = sum(max(float(site.occupancy), 0.0) for site in group)
         if total_occupancy > 1e-12:
@@ -1013,7 +1174,7 @@ def mixed_occupancy_display_sites(sites: list[AtomicSite], tolerance: float = 1e
                 weight = max(float(site.occupancy), 0.0)
                 if weight <= 0.0:
                     continue
-                rgb += weight * np.array(color_to_rgb(color_for_site(site)), dtype=float)
+                rgb += weight * np.array(color_to_rgb(color_for_site(site, element_colors)), dtype=float)
                 elements.append(site.element.strip().capitalize())
                 if site.label:
                     labels.append(site.label)
@@ -1022,7 +1183,7 @@ def mixed_occupancy_display_sites(sites: list[AtomicSite], tolerance: float = 1e
             element = "+".join(dict.fromkeys(elements)) or representative.element
             label = "/".join(dict.fromkeys(labels))
         else:
-            mixed_color = color_for_site(representative)
+            mixed_color = color_for_site(representative, element_colors)
             element = representative.element
             label = representative.label
         mixed_sites.append(
@@ -1044,6 +1205,7 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
     reciprocal = reciprocal_lattice(lattice)
     model_sites = expanded_sites(definition)
     display_sites = mixed_occupancy_display_sites(model_sites)
+    components = occupancy_components(model_sites)
     corners_frac = np.array(list(product([0.0, 1.0], repeat=3)), dtype=float)
     corners_cart = corners_frac @ lattice
     center = np.array([0.5, 0.5, 0.5], dtype=float) @ lattice
@@ -1082,6 +1244,7 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
                         occupancy=min(max(float(site.occupancy), 0.0), 1.0),
                         label=site.label,
                         color=site.color,
+                        components=components.get(occupancy_site_key(site.fractional), ()),
                     )
                 )
 
@@ -1102,6 +1265,136 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
         scale_nm=scale_nm,
         limit=limit,
     )
+
+
+def validate_display_settings(settings: PanelDisplaySettings) -> None:
+    validate_markers(settings.markers)
+    annotations = settings.annotations
+    for name in ANNOTATION_STYLE_NAMES:
+        style = getattr(annotations, name)
+        positions = SPOT_LABEL_DIRECTIONS if name == "indices" else ANNOTATION_CORNERS
+        if style.position not in positions:
+            raise ValueError(f"Invalid {name.replace('_', ' ')} annotation position.")
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", style.color):
+            raise ValueError("Annotation colors must be six-digit hex colors.")
+        if not math.isfinite(style.font_size) or not 6 <= style.font_size <= 40:
+            raise ValueError("Annotation font sizes must be between 6 and 40 px.")
+        if not math.isfinite(style.opacity) or not 0 <= style.opacity <= 1:
+            raise ValueError("Annotation opacity must be between 0 and 100%.")
+    if not math.isfinite(annotations.index_offset) or not -20 <= annotations.index_offset <= 40:
+        raise ValueError("Spot label gap must be between -20 and 40 px.")
+    if settings.frame_mode not in {"original", "all", "hidden"}:
+        raise ValueError("Choose original-cell, every-cell, or hidden frames.")
+    if settings.occupancy_colors not in OCCUPANCY_COLOR_OPTIONS:
+        raise ValueError("Choose blended colors or occupancy sectors.")
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", settings.frame_color):
+        raise ValueError("Frame color must be a six-digit hex color.")
+    for value, name, low, high in (
+        (settings.frame_width, "Frame thickness", 0.25, MAX_FRAME_THICKNESS),
+        (settings.atom_scale, "Atom size", 0.1, 3.0),
+        (settings.vector_label_scale, "Vector text size", 0.25, 3.0),
+        (settings.plane_label_scale, "Plane text size", 0.25, 3.0),
+        *((getattr(settings, name), name.replace("_", " ").capitalize(), 0.0, 1.0) for name in (
+            "frame_opacity", "vector_opacity", "reciprocal_opacity", "plane_opacity", "plane_edge_opacity",
+            "vector_label_opacity", "plane_label_opacity")),
+        *((value, f"{element} atom size", 0.1, 3.0) for element, value in settings.element_scales.items()),
+    ):
+        if not math.isfinite(float(value)) or not low <= float(value) <= high:
+            raise ValueError(f"{name} must be between {low:g} and {high:g}.")
+    if len(settings.cells) != 3 or any(not math.isfinite(float(n)) or int(n) != n or not 1 <= abs(n) <= 8 for n in settings.cells):
+        raise ValueError("Cell counts must be nonzero integers from -8 to 8.")
+    if math.prod(abs(n) for n in settings.cells) > 216:
+        raise ValueError("Display at most 216 unit cells at a time.")
+
+
+def display_cell_bounds(cells: tuple[int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+    counts = np.array(cells, dtype=int)
+    return np.minimum(counts + 1, 0).astype(float), np.maximum(counts, 1).astype(float)
+
+
+def fractional_box_edges(low: np.ndarray, high: np.ndarray) -> list[tuple[np.ndarray, np.ndarray]]:
+    corners = np.array(list(product(*zip(low, high))), dtype=float)
+    return [(start, end) for index, start in enumerate(corners) for end in corners[index + 1:]
+            if np.count_nonzero(np.abs(start - end) > 1e-9) == 1]
+
+
+def make_panel_display_model(source: CrystalModel, settings: PanelDisplaySettings,
+                             element_colors: dict[str, str] | None = None) -> CrystalModel:
+    """Replicate drawing geometry only; keep the crystallographic unit cell intact."""
+    validate_display_settings(settings)
+    source = source.display_source or source
+    element_colors = relevant_element_colors(source, element_colors or {})
+    if settings == PanelDisplaySettings() and not element_colors:
+        return source
+    low, high = display_cell_bounds(settings.cells)
+    translations = list(product(*(range(int(a), int(b)) for a, b in zip(low, high))))
+    if len(translations) > 1 and len(source.display_atoms) * len(translations) > 30000:
+        raise ValueError("This display would exceed 30,000 atoms. Reduce the cell counts.")
+    origin = -0.5 * (low + high) @ source.display_lattice
+
+    def to_display(edges):
+        return [(origin + start @ source.display_lattice, origin + end @ source.display_lattice) for start, end in edges]
+
+    original = fractional_box_edges(np.zeros(3), np.ones(3))
+    outer = to_display(fractional_box_edges(low, high))
+    edges = []
+    if settings.frame_mode == "original":
+        edges = to_display(original)
+    elif settings.frame_mode == "all":
+        seen_edges = set()
+        for translation in translations:
+            for start, end in original:
+                start, end = start + translation, end + translation
+                key = tuple(sorted((tuple(start), tuple(end))))
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    edges.append((origin + start @ source.display_lattice, origin + end @ source.display_lattice))
+
+    # A mixed-occupancy sphere retains one geometry and uses an occupancy-weighted size.
+    size_weights: dict[tuple, list[float]] = {}
+    for site in source.expanded_sites:
+        key = tuple(np.round(wrap_fractional(site.fractional), 6))
+        weight = max(float(site.occupancy), 0.0)
+        values = size_weights.setdefault(key, [0.0, 0.0])
+        values[0] += weight * settings.element_scales.get(site.element, 1.0)
+        values[1] += weight
+    atoms = []
+    seen_atoms = set()
+    colors_by_site = {
+        tuple(np.round(wrap_fractional(site.fractional), 6)): site.color
+        for site in mixed_occupancy_display_sites(source.expanded_sites, element_colors=element_colors)
+    } if element_colors else {}
+    components_by_site = occupancy_components(source.expanded_sites, element_colors) if element_colors else {}
+    inverse = np.linalg.inv(source.display_lattice)
+    for atom in source.display_atoms:
+        fractional = (atom.position - source.display_origin) @ inverse
+        weight, total = size_weights.get(tuple(np.round(wrap_fractional(fractional), 6)), (1.0, 1.0))
+        multiplier = settings.atom_scale * (weight / total if total > 1e-12 else 1.0)
+        color = colors_by_site.get(tuple(np.round(wrap_fractional(fractional), 6)), atom.color)
+        components = components_by_site.get(occupancy_site_key(fractional), atom.components)
+        for translation in translations:
+            position = fractional + translation
+            key = (tuple(np.round(position, 7)), atom.element, atom.color, atom.occupancy)
+            if key in seen_atoms:
+                continue
+            seen_atoms.add(key)
+            atoms.append(replace(atom, position=origin + position @ source.display_lattice,
+                                 radius_multiplier=multiplier, color=color, components=components))
+    points = np.array([point for edge in outer for point in edge])
+    limit = max(1.25, float(np.max(np.abs(points))) * 1.35)
+    base_extent = max(np.linalg.norm(point) for edge in source.display_edges for point in edge)
+    extent_scale = max(1.0, float(np.max(np.linalg.norm(points, axis=1))) / max(base_extent, 1e-9))
+    result = replace(source, display_source=source, display_origin=origin, display_edges=edges, display_atoms=atoms,
+                   bounds_edges=outer, clip_edges=outer if settings.extend_annotations else to_display(original),
+                   annotation_min=low if settings.extend_annotations else np.zeros(3),
+                   annotation_max=high if settings.extend_annotations else np.ones(3),
+                   limit=limit, display_extent_scale=extent_scale, display_atom_scale=settings.atom_scale)
+    result.hidden_atom_indices = marker_hidden_atom_indices(settings.markers, result)
+    marker_points = marker_extent_points(marker_geometry(settings.markers, result))
+    if marker_points:
+        result.bounds_edges = [*outer, *((point, point) for point in marker_points)]
+        result.limit = max(result.limit, max(np.linalg.norm(point) for point in marker_points) * 1.15)
+    return result
 
 
 def is_hexagonal(definition: CrystalDefinition) -> bool:
@@ -1138,9 +1431,11 @@ def direction_delta_for_display(values: tuple[int, ...], model: CrystalModel) ->
 
 def direction_segment_for_display(values: tuple[int, ...], model: CrystalModel) -> tuple[np.ndarray, np.ndarray]:
     components = direction_components(values, model)
-    scale = max(float(np.max(np.abs(components))), 1.0)
-    delta_fractional = components / scale
-    start_fractional = np.where(delta_fractional < 0.0, -delta_fractional, 0.0)
+    nonzero = np.abs(components) > 1e-12
+    spans = model.annotation_max - model.annotation_min
+    scale = float(np.min(spans[nonzero] / np.abs(components[nonzero]))) if np.any(nonzero) else 0.0
+    delta_fractional = components * scale
+    start_fractional = model.annotation_min + np.where(delta_fractional < 0.0, -delta_fractional, 0.0)
     end_fractional = start_fractional + delta_fractional
     start = model.display_origin + start_fractional @ model.display_lattice
     end = model.display_origin + end_fractional @ model.display_lattice
@@ -1576,6 +1871,16 @@ def shifted_segment_for_display_delta(delta: np.ndarray, model: CrystalModel) ->
 
 
 def reciprocal_segment_for_display(values: tuple[int, ...], model: CrystalModel) -> tuple[np.ndarray, np.ndarray]:
+    if model.display_source is not None:
+        delta = reciprocal_delta_for_display(values, model)
+        fractional = np.linalg.solve(model.display_lattice.T, delta)
+        nonzero = np.abs(fractional) > 1e-12
+        spans = model.annotation_max - model.annotation_min
+        fit = float(np.min(spans[nonzero] / np.abs(fractional[nonzero]))) if np.any(nonzero) else 0.0
+        extended = not (np.array_equal(model.annotation_min, np.zeros(3)) and np.array_equal(model.annotation_max, np.ones(3)))
+        fractional *= fit if extended else min(1.0, fit)
+        start = model.annotation_min + np.where(fractional < 0.0, -fractional, 0.0)
+        return model.display_origin + start @ model.display_lattice, model.display_origin + (start + fractional) @ model.display_lattice
     return shifted_segment_for_display_delta(reciprocal_delta_for_display(values, model), model)
 
 
@@ -1599,6 +1904,15 @@ def plane_coefficients(values: tuple[int, ...], model: CrystalModel) -> np.ndarr
 
 def plane_normal_to_cart(values: tuple[int, ...], model: CrystalModel) -> np.ndarray:
     return plane_coefficients(values, model) @ model.reciprocal
+
+
+def diffraction_intensity_text(intensity: float) -> str:
+    if intensity == 0:
+        return "0"
+    if 0 < intensity < 0.01:
+        mantissa, exponent = f"{intensity:.3e}".split("e")
+        return f"{mantissa.rstrip('0').rstrip('.')}e{int(exponent)}"
+    return f"{intensity:.4f}"
 
 
 def diffraction_label_for_hkl(
@@ -1701,6 +2015,176 @@ class CrystalExportLayer:
     edge_color: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0)
     linewidth: float = 0.0
     dashed: bool = False
+    color_at: Callable[[np.ndarray, np.ndarray], np.ndarray] | None = None
+
+
+ATOM_SHADING_OPTIONS = {"none": "None", "mild": "Mild", "strong": "Strong", "very_strong": "Very strong"}
+ATOM_SHADING_STRENGTH = {"none": 0.0, "mild": 0.3, "strong": 0.68, "very_strong": 0.9}
+OCCUPANCY_COLOR_OPTIONS = {"blend": "Blended colors", "sectors": "Occupancy sectors"}
+EXPORT_OCCUPANCY_COLOR_OPTIONS = {"panel": "Panel settings", **OCCUPANCY_COLOR_OPTIONS}
+
+
+def occupancy_sectors(components: tuple) -> list[tuple[float, str]]:
+    """Cumulative sector fractions, including vacancies; never change site data."""
+    parts = [(float(weight), color) for _element, weight, color in components if weight > 0]
+    total = sum(weight for weight, _color in parts)
+    if parts and total < 1.0 - 1e-8:
+        parts.append((1.0 - total, "#B8B8B8"))
+        total = 1.0
+    end = 0.0
+    result = []
+    for weight, color in parts:
+        end += weight / total
+        result.append((min(end, 1.0), color))
+    return result
+
+
+THREE_OCCUPANCY_SCRIPT = r"""
+function applyOccupancySectors(mesh, sectors) {
+    if (sectors.length < 2 || mesh.userData.crysdisSectors) return;
+    const material = mesh.material;
+    const count = sectors.length;
+    const colors = sectors.map(part => new THREE.Color(part[1]));
+    const ends = sectors.map(part => part[0] * 2 * Math.PI);
+    // Recolor before lighting, leaving geometry, depth, opacity and highlights intact.
+    material.onBeforeCompile = shader => {
+        shader.uniforms.crysdisSectorColors = {value: colors};
+        shader.uniforms.crysdisSectorEnds = {value: ends};
+        shader.vertexShader = 'varying vec2 crysdisSectorPosition;\n' + shader.vertexShader;
+        shader.vertexShader = shader.vertexShader.replace('#include <project_vertex>', `
+            #include <project_vertex>
+            vec4 sectorCenter = projectionMatrix * modelViewMatrix * vec4(0.0, 0.0, 0.0, 1.0);
+            crysdisSectorPosition = (gl_Position.xy - sectorCenter.xy * gl_Position.w / sectorCenter.w)
+                / vec2(projectionMatrix[0][0], projectionMatrix[1][1]);
+        `);
+        shader.fragmentShader = `
+            varying vec2 crysdisSectorPosition;
+            uniform vec3 crysdisSectorColors[${count}];
+            uniform float crysdisSectorEnds[${count}];
+            vec3 crysdisSectorColor(vec2 point) {
+                float angle = mod(atan(point.x, point.y) + 6.28318530718, 6.28318530718);
+                for (int i = 0; i < ${count}; i++) {
+                    if (angle < crysdisSectorEnds[i]) return crysdisSectorColors[i];
+                }
+                return crysdisSectorColors[${count - 1}];
+            }
+        ` + shader.fragmentShader;
+        shader.fragmentShader = shader.fragmentShader.replace('#include <color_fragment>', `
+            #include <color_fragment>
+            vec2 sectorDx = 0.25 * dFdx(crysdisSectorPosition);
+            vec2 sectorDy = 0.25 * dFdy(crysdisSectorPosition);
+            diffuseColor.rgb = 0.25 * (
+                crysdisSectorColor(crysdisSectorPosition - sectorDx - sectorDy) +
+                crysdisSectorColor(crysdisSectorPosition + sectorDx - sectorDy) +
+                crysdisSectorColor(crysdisSectorPosition - sectorDx + sectorDy) +
+                crysdisSectorColor(crysdisSectorPosition + sectorDx + sectorDy));
+        `);
+    };
+    material.customProgramCacheKey = () => 'crysdis-sectors-v1-' + count;
+    material.needsUpdate = true;
+    mesh.userData.crysdisSectors = sectors;
+}
+"""
+
+
+class CrystalScene(ui.scene):
+    """Keep live atom materials consistent across redraws and browser remounts."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.atom_sectors: dict[str, list] = {}
+        self.marker_groups: dict[str, list] = {}
+        super().__init__(*args, **kwargs)
+        # Orbit drags can end with a browser click; do not interpret those as atom picks.
+        self.on("init", js_handler=f"""() => {{
+            const scene = getElement({self.id});
+            const canvas = scene?.renderer?.domElement;
+            if (!canvas || canvas.dataset.atomClickGuard) return;
+            canvas.dataset.atomClickGuard = 'true';
+            let start = null, dragged = false;
+            canvas.addEventListener('pointerdown', e => {{start = [e.clientX, e.clientY]; dragged = false;}});
+            canvas.addEventListener('pointermove', e => {{
+                if (start && Math.hypot(e.clientX-start[0], e.clientY-start[1]) > 5) dragged = true;
+            }});
+            canvas.addEventListener('pointercancel', () => {{start = null; dragged = true;}});
+            canvas.addEventListener('click', e => {{
+                start = null;
+                if (dragged) e.stopImmediatePropagation();
+            }}, true);
+        }}""")
+
+    def _handle_init(self) -> None:
+        super()._handle_init()
+        self.apply_atom_sectors()
+        self.apply_markers()
+
+    def apply_markers(self) -> None:
+        if not self.marker_groups:
+            return
+        self.client.run_javascript(
+            "const {default: SceneLib} = await import('nicegui-scene'); const {THREE} = SceneLib;\n"
+            + THREE_MARKERS_SCRIPT + f"\nconst component = getElement({self.id});\n"
+            + "const sphereMaterial = (color, opacity) => new THREE.MeshPhongMaterial({color, opacity, transparent:true});\n"
+            + f"for (const [id, markers] of Object.entries({json.dumps(self.marker_groups)})) {{\n"
+              " const group = component?.objects?.get(id);\n"
+              " if (group && !group.userData.crysdisMarkers) {addCrystalMarkers(THREE, group, markers, sphereMaterial); group.userData.crysdisMarkers = true;}\n"
+              "}\n")
+
+    def clear(self):
+        if self.marker_groups:
+            self.client.run_javascript(f"""
+                const component = getElement({self.id});
+                for (const id of {json.dumps(list(self.marker_groups))}) {{
+                    component?.objects?.get(id)?.traverse(o => {{
+                        o.geometry?.dispose(); o.material?.map?.dispose(); o.material?.dispose();
+                    }});
+                }}
+            """)
+            self.marker_groups = {}
+        return super().clear()
+
+    def apply_atom_sectors(self) -> None:
+        if not self.atom_sectors:
+            return
+        self.client.run_javascript(
+            "const {default: SceneLib} = await import('nicegui-scene'); const {THREE} = SceneLib;\n"
+            + THREE_OCCUPANCY_SCRIPT + f"\nconst component = getElement({self.id});\n"
+            + f"for (const [id, sectors] of Object.entries({json.dumps(self.atom_sectors)})) {{\n"
+              "    const mesh = component?.objects?.get(id);\n"
+              "    if (mesh) applyOccupancySectors(mesh, sectors);\n"
+              "}\n")
+
+
+def crystal_atom_shader(center: np.ndarray, radius: float, color: tuple[float, ...],
+                        shading: str = "strong", components: tuple = ()) -> Callable:
+    """Screen-fixed lighting on the same spherical surface used for atom depth."""
+    strength = ATOM_SHADING_STRENGTH[shading]
+    light = normalize_vector(np.array([-0.45, 0.55, 1.0]))
+    halfway = normalize_vector(light + np.array([0.0, 0.0, 1.0]))
+    rgb = np.asarray(color[:3])
+    sectors = occupancy_sectors(components)
+    boundaries = np.array([end for end, _color in sectors])
+    colors = [color_to_rgb(color) for _end, color in sectors]
+    sector_colors = np.asarray(colors)
+
+    def color_at(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        base = rgb
+        if sectors:
+            # Subpixel samples smooth sector boundaries without gaps or overlapping wedges.
+            base = np.zeros((*x.shape, 3))
+            for dx, dy in ((-.25, -.25), (.25, -.25), (-.25, .25), (.25, .25)):
+                turn = np.mod(np.arctan2(x + dx - center[0], y + dy - center[1]), 2 * math.pi) / (2 * math.pi)
+                indices = np.minimum(np.searchsorted(boundaries, turn, side="right"), len(colors) - 1)
+                base += sector_colors[indices] * .25
+        if strength == 0:
+            return np.broadcast_to(base, (*x.shape, 3))
+        nx, ny = (x - center[0]) / radius, (y - center[1]) / radius
+        nz = np.sqrt(np.maximum(1.0 - nx * nx - ny * ny, 0.0))
+        diffuse = np.maximum(nx * light[0] + ny * light[1] + nz * light[2], 0.0)
+        highlight = np.maximum(nx * halfway[0] + ny * halfway[1] + nz * halfway[2], 0.0) ** 80
+        return np.clip(base * (1 - strength + strength * diffuse[..., None])
+                       + (0.65 * strength / .68) * highlight[..., None], 0.0, 1.0)
+
+    return color_at
 
 
 def composite_crystal_export(
@@ -1761,6 +2245,8 @@ def composite_crystal_export(
                 rgba = np.asarray(renderer.buffer_rgba())[padding:padding + top - bottom, padding:padding + right - left].copy()
                 if not np.any(rgba[:, :, 3]):
                     continue
+                if layer.color_at is not None:
+                    rgba[:, :, :3] = np.round(255.0 * layer.color_at(x, y)).astype(np.uint8)
                 depth = np.broadcast_to(layer.depth_at(x, y), x.shape).astype(np.float32).copy()
                 depth[rgba[:, :, 3] == 0] = -np.inf
                 colors.append(rgba)
@@ -1977,12 +2463,13 @@ def clipped_plane_polygon(model: CrystalModel, plane: ParsedIndex) -> np.ndarray
     if normal_unit is None:
         return None
     constant = float(np.dot(normal, model.display_origin) + 1.0)
-    polygon = intersect_plane_with_edges(model.display_edges, normal, constant)
+    edges = model.clip_edges if model.clip_edges is not None else model.display_edges
+    polygon = intersect_plane_with_edges(edges, normal, constant)
     if len(polygon) < 3:
-        vertices = np.array([point for edge in model.display_edges for point in edge], dtype=float)
+        vertices = np.array([point for edge in edges for point in edge], dtype=float)
         projected = vertices @ normal
         constant = float(0.5 * (projected.min() + projected.max()))
-        polygon = intersect_plane_with_edges(model.display_edges, normal, constant)
+        polygon = intersect_plane_with_edges(edges, normal, constant)
     if len(polygon) < 3:
         return None
 
@@ -2127,6 +2614,7 @@ def choose_scale_bar(limit: float) -> float:
 def diffraction_scale_bar_items(
     limit: float,
     reciprocal_units_per_plot_unit: float = 1.0,
+    settings: PanelAnnotations | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Build a scale bar for the diffraction panel.
 
@@ -2135,54 +2623,70 @@ def diffraction_scale_bar_items(
     in nm^-1.  reciprocal_units_per_plot_unit converts one plotted unit into
     nm^-1; for detector coordinates it is 1 / (L * lambda).
     """
+    settings = settings or PanelAnnotations()
+    style = settings.reciprocal_scale
+    if not settings.reciprocal_scale_visible:
+        return [], []
+    right, top = "right" in style.position, "top" in style.position
     reciprocal_units_per_plot_unit = max(float(reciprocal_units_per_plot_unit), 1e-12)
     reciprocal_limit = max(float(limit) * reciprocal_units_per_plot_unit, 1e-9)
     bar_reciprocal = choose_scale_bar(reciprocal_limit)
     bar_plot = bar_reciprocal / reciprocal_units_per_plot_unit
-    x0 = -0.94 * limit
-    y0 = -0.91 * limit
+    x0 = 0.94 * limit - bar_plot if right else -0.94 * limit
+    y0 = (0.91 if top else -0.91) * limit
     tick = 0.022 * limit
-    line = {"type": "line", "xref": "x", "yref": "y", "line": {"color": "#F7FAFC", "width": 3}}
+    line = {"type": "line", "xref": "x", "yref": "y", "opacity": style.opacity,
+            "line": {"color": style.color, "width": 3}}
     shapes = [
         {**line, "x0": x0, "x1": x0 + bar_plot, "y0": y0, "y1": y0},
-        {**line, "x0": x0, "x1": x0, "y0": y0 - tick, "y1": y0 + tick, "line": {"color": "#F7FAFC", "width": 2}},
+        {**line, "x0": x0, "x1": x0, "y0": y0 - tick, "y1": y0 + tick, "line": {"color": style.color, "width": 2}},
         {
             **line,
             "x0": x0 + bar_plot,
             "x1": x0 + bar_plot,
             "y0": y0 - tick,
             "y1": y0 + tick,
-            "line": {"color": "#F7FAFC", "width": 2},
+            "line": {"color": style.color, "width": 2},
         },
     ]
     annotations = [
         {
             "x": x0 + bar_plot * 0.5,
-            "y": y0 + 0.055 * limit,
+            "y": y0,
+            "yshift": -7 if top else 7,
             "xref": "x",
             "yref": "y",
             "text": f"{bar_reciprocal:g} nm<sup>-1</sup>",
             "showarrow": False,
-            "font": {"color": "#F7FAFC", "size": 11},
+            "font": {"color": style.color, "size": style.font_size},
             "xanchor": "center",
-            "yanchor": "bottom",
+            "yanchor": "top" if top else "bottom",
+            "opacity": style.opacity,
         }
     ]
     return shapes, annotations
 
 
-def diffraction_zone_axis_annotation(limit: float, label: str) -> dict[str, Any]:
+def diffraction_zone_axis_annotation(limit: float, label: str, settings: PanelAnnotations | None = None,
+                                    scale_visible: bool = True) -> dict[str, Any]:
+    settings = settings or PanelAnnotations()
+    style = settings.zone
+    right, top = "right" in style.position, "top" in style.position
+    shift = 0
+    if scale_visible and settings.reciprocal_scale_visible and settings.reciprocal_scale.opacity > 0 and style.position == settings.reciprocal_scale.position:
+        shift = (settings.reciprocal_scale.font_size + 20) * (-1 if top else 1)
     return {
-        "x": 0.94 * float(limit),
-        "y": -0.91 * float(limit),
+        "x": (0.94 if right else -0.94) * float(limit),
+        "y": (0.91 if top else -0.91) * float(limit),
+        "yshift": shift,
         "xref": "x",
         "yref": "y",
         "text": label,
         "showarrow": False,
-        "font": {"color": "#F7FAFC", "size": 12},
-        "xanchor": "right",
-        "yanchor": "bottom",
-        "opacity": 0.9,
+        "font": {"color": style.color, "size": style.font_size},
+        "xanchor": "right" if right else "left",
+        "yanchor": "top" if top else "bottom",
+        "opacity": style.opacity,
     }
 
 
@@ -2193,8 +2697,8 @@ def empty_diffraction_figure() -> dict[str, Any]:
             "paper_bgcolor": "#050607",
             "plot_bgcolor": "#050607",
             "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
-            "xaxis": {"visible": False, "range": [-4, 4], "scaleanchor": "y", "scaleratio": 1, "fixedrange": True},
-            "yaxis": {"visible": False, "range": [-4, 4], "fixedrange": True},
+            "xaxis": {"visible": False, "range": [-4, 4], "scaleanchor": "y", "scaleratio": 1, "fixedrange": True, "constrain": "domain"},
+            "yaxis": {"visible": False, "range": [-4, 4], "fixedrange": True, "constrain": "domain"},
             "showlegend": False,
             "hovermode": "closest",
             "dragmode": False,
@@ -2535,11 +3039,64 @@ def color_for_element(element: str) -> str:
     return "#35D0BA"
 
 
-def color_for_site(site: AtomicSite | DisplayAtom) -> str:
+def color_for_site(site: AtomicSite | DisplayAtom, element_colors: dict[str, str] | None = None) -> str:
+    if element_colors and site.element.strip().capitalize() in element_colors:
+        return element_colors[site.element.strip().capitalize()]
     color = str(getattr(site, "color", "") or "").strip()
     if re.match(r"^#[0-9a-fA-F]{6}$", color):
         return color
     return color_for_element(site.element)
+
+
+def relevant_element_colors(model: CrystalModel, colors: dict[str, str]) -> dict[str, str]:
+    elements = {site.element.strip().capitalize() for site in model.expanded_sites}
+    return {symbol: color for symbol, color in colors.items() if symbol in elements}
+
+
+def validate_element_colors(colors: Any) -> dict[str, str]:
+    if not isinstance(colors, dict):
+        raise ValueError("Element colors must be a dictionary.")
+    result = {}
+    for element, value in colors.items():
+        if element not in ELEMENTS:
+            raise ValueError(f"Unknown element: {element}")
+        color = normalized_hex_color(value)
+        if color is None:
+            raise ValueError(f"{element} color must be a six-digit hex color.")
+        result[element] = color
+    return result
+
+
+def load_element_colors(path: Path | None = None) -> dict[str, str]:
+    path = path or ELEMENT_COLORS_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            raise ValueError("Unsupported element-color preferences format.")
+        return validate_element_colors(payload.get("element_colors"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, TypeError) as exc:
+        warnings.warn(f"Could not load element colors from {path}: {exc}. Using structure/default colors.")
+        return {}
+
+
+def save_element_colors(colors: dict[str, str], path: Path | None = None) -> None:
+    path = path or ELEMENT_COLORS_PATH
+    payload = {"version": 1, "element_colors": validate_element_colors(colors)}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def color_to_rgb(color: str) -> tuple[float, float, float]:
@@ -2739,6 +3296,7 @@ class CrystalBuilder:
         self.formula_mode_label = None
         self.formula_timer = None
         self._loading_definition = False
+        self.coordinate_mode = "fractional"
         self._build()
 
     def _build(self) -> None:
@@ -2793,7 +3351,11 @@ class CrystalBuilder:
                 ).props("outline")
 
             ui.separator()
-            ui.label("Atom sites").classes("text-subtitle2")
+            with ui.row().classes("items-center justify-between full-width"):
+                ui.label("Atom sites").classes("text-subtitle2")
+                self.coordinate_select = ui.toggle({"fractional": "Fractional", "cartesian": "Cartesian (nm)"},
+                    value="fractional", on_change=self.change_coordinate_mode).props("no-caps")
+                self.coordinate_select.tooltip("Convert existing positions. Cartesian axes: a along x, b in the xy plane; distances in nm.")
             self.site_container = ui.column().classes("full-width gap-2")
 
             with ui.row().classes("builder-footer"):
@@ -2942,6 +3504,53 @@ class CrystalBuilder:
             self._loading_definition = False
         self.update_formula()
 
+    def builder_lattice(self) -> np.ndarray:
+        try:
+            values = [float(control.value) for control in (self.a_input, self.b_input, self.c_input,
+                      self.alpha_input, self.beta_input, self.gamma_input)]
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Complete all lattice parameters before converting coordinates.") from exc
+        if not all(math.isfinite(value) for value in values) or min(values[:3]) <= 0:
+            raise ValueError("Lattice lengths must be positive and finite.")
+        if not all(0 < value < 180 for value in values[3:]):
+            raise ValueError("Lattice angles must lie between 0 and 180 degrees.")
+        ca, cb, cg = np.cos(np.radians(values[3:]))
+        if 1 + 2 * ca * cb * cg - ca**2 - cb**2 - cg**2 <= 1e-12:
+            raise ValueError("The lattice angles must define a cell with positive volume.")
+        matrix = lattice_matrix(replace(self.new_definition_template(), **dict(zip(
+            ("a", "b", "c", "alpha", "beta", "gamma"), values))))
+        if abs(np.linalg.det(matrix)) < 1e-12 * np.prod(values[:3]):
+            raise ValueError("The unit cell must have nonzero volume.")
+        return matrix
+
+    def change_coordinate_mode(self, event: Any) -> None:
+        mode = event.value
+        if mode == self.coordinate_mode or self._loading_definition:
+            return
+        try:
+            lattice = self.builder_lattice()
+            positions = np.array([[float(row[key].value) for key in ("x", "y", "z")] for row in self.site_rows])
+            if not np.all(np.isfinite(positions)):
+                raise ValueError("Complete all atom coordinates before switching.")
+            converted = positions @ lattice if mode == "cartesian" else np.linalg.solve(lattice.T, positions.T).T
+        except (ValueError, TypeError, np.linalg.LinAlgError) as exc:
+            self.coordinate_select.value = self.coordinate_mode
+            ui.notify(f"Cannot convert coordinates: {exc}", type="warning")
+            return
+        self._loading_definition = True
+        try:
+            self.coordinate_mode = mode
+            for row, point in zip(self.site_rows, converted):
+                for key, value in zip(("x", "y", "z"), point):
+                    row[key].value = clean_coordinate(value)
+                    if mode == "cartesian":
+                        row[key].props("suffix=nm")
+                    else:
+                        row[key].props(remove="suffix")
+        finally:
+            self._loading_definition = False
+        self.update_formula()
+
     def apply_lattice_constraints(self) -> None:
         system = self.system_select.value or "triclinic"
         a = float(self.a_input.value or 0.35)
@@ -2969,12 +3578,20 @@ class CrystalBuilder:
             self.gamma_input.value = 90.0
 
     def add_site(self) -> None:
-        sites = self.read_sites_from_rows()
+        try:
+            sites = self.read_sites_from_rows()
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+            return
         sites.append(AtomicSite("Ni", 0.0, 0.0, 0.0, 1.0, ""))
         self.rebuild_site_rows(sites)
 
     def remove_site(self, index: int) -> None:
-        sites = self.read_sites_from_rows()
+        try:
+            sites = self.read_sites_from_rows()
+        except ValueError as exc:
+            ui.notify(str(exc), type="warning")
+            return
         if len(sites) > 1:
             sites.pop(index)
         self.rebuild_site_rows(sites)
@@ -3038,6 +3655,7 @@ class CrystalBuilder:
         self.site_container.clear()
         with self.site_container:
             for index, site in enumerate(sites or [AtomicSite("Ni", 0.0, 0.0, 0.0, 1.0, "")]):
+                position = site.fractional @ self.builder_lattice() if self.coordinate_mode == "cartesian" else site.fractional
                 with ui.row().classes("site-row"):
                     element_options = ELEMENTS if site.element in ELEMENTS else [*ELEMENTS, site.element]
                     element = ui.select(
@@ -3047,9 +3665,10 @@ class CrystalBuilder:
                         with_input=True,
                         new_value_mode="add-unique",
                     ).props("outlined dense")
-                    x = ui.number("x", value=site.x, step=0.01).props("outlined dense")
-                    y = ui.number("y", value=site.y, step=0.01).props("outlined dense")
-                    z = ui.number("z", value=site.z, step=0.01).props("outlined dense")
+                    suffix = "nm" if self.coordinate_mode == "cartesian" else None
+                    x = ui.number("x", value=clean_coordinate(position[0]), step=0.01, suffix=suffix).props("outlined dense")
+                    y = ui.number("y", value=clean_coordinate(position[1]), step=0.01, suffix=suffix).props("outlined dense")
+                    z = ui.number("z", value=clean_coordinate(position[2]), step=0.01, suffix=suffix).props("outlined dense")
                     occ = ui.number("Occ.", value=site.occupancy, min=0.0, max=1.0, step=0.05).props("outlined dense")
                     color = ui.color_input("Color", value=color_for_site(site), preview=True).props("outlined dense")
                     label = ui.input("Site").props("outlined dense")
@@ -3076,13 +3695,21 @@ class CrystalBuilder:
     def read_sites_from_rows(self) -> list[AtomicSite]:
         sites = []
         for row in self.site_rows:
+            try:
+                point = np.array([float(row[key].value) for key in ("x", "y", "z")])
+            except (ValueError, TypeError) as exc:
+                raise ValueError("Complete all atom coordinates before continuing.") from exc
+            if not np.all(np.isfinite(point)):
+                raise ValueError("Atom coordinates must be finite.")
+            if self.coordinate_mode == "cartesian":
+                point = np.linalg.solve(self.builder_lattice().T, point)
             element = str(row["element"].value or "X").strip().capitalize()
             sites.append(
                 AtomicSite(
                     element=element,
-                    x=float(row["x"].value or 0.0),
-                    y=float(row["y"].value or 0.0),
-                    z=float(row["z"].value or 0.0),
+                    x=clean_coordinate(point[0]),
+                    y=clean_coordinate(point[1]),
+                    z=clean_coordinate(point[2]),
                     occupancy=float(row["occupancy"].value if row["occupancy"].value is not None else 1.0),
                     label=str(row["label"].value or ""),
                     color=str(row["color"].value or ""),
@@ -3222,6 +3849,8 @@ class PanelController:
         self.state = state
         self.card = None
         self.scene = None
+        self.atom_objects: dict[str, DisplayAtom] = {}
+        self.atom_inspector = None
         self.diffraction = None
         self.crystal_select = None
         self.zone_input = None
@@ -3229,6 +3858,7 @@ class PanelController:
         self.vector_input = None
         self.rotation_input = None
         self.download_dialog = None
+        self.animation_dialog = None
         self.close_button = None
         self.magnify_button = None
         self.scale_bar_line = None
@@ -3236,6 +3866,8 @@ class PanelController:
         self.scale_bar_container = None
         self.scale_timer = None
         self.current_model: CrystalModel | None = None
+        self._display_model_key: tuple | None = None
+        self._display_model: CrystalModel | None = None
         self.scene_signature: tuple[Any, ...] | None = None
         self._updating_inputs = False
         self._applying = False
@@ -3283,8 +3915,8 @@ class PanelController:
                     "panel-sync-button"
                 ).tooltip("Sync diffraction to the current 3D crystal view")
                 ui.button(
-                    icon="palette", on_click=lambda: self.simulator.open_palette_dialog(self.state.panel_id),
-                ).props("flat round dense").classes("panel-colors-button").tooltip("Panel colors")
+                    icon="settings", on_click=lambda: self.simulator.open_palette_dialog(self.state.panel_id),
+                ).props("flat round dense").classes("panel-colors-button").tooltip("Panel settings")
                 ui.button(icon="photo_camera", on_click=self.open_download_dialog).props("flat round dense").classes(
                     "panel-download-button"
                 ).tooltip("Download images")
@@ -3302,13 +3934,15 @@ class PanelController:
 
             with ui.element("div").classes("visual-stack"):
                 with ui.element("div").classes("scene-wrap"):
-                    self.scene = ui.scene(
+                    self.scene = CrystalScene(
                         width=440,
                         height=280,
                         grid=False,
                         background_color="#0B0F14",
                         camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
+                        on_click=self.inspect_atom, click_events=["click"],
                     ).classes("real-scene")
+                    self.build_atom_inspector()
                     with ui.element("div").classes("real-scale-bar") as self.scale_bar_container:
                         self.scale_bar_line = ui.element("div").classes("real-scale-line")
                         self.scale_bar_label = ui.label("1 nm").classes("real-scale-label")
@@ -3318,6 +3952,44 @@ class PanelController:
         self.apply(initial=True)
         self.update_close_button()
         self.update_magnify_button()
+
+    def build_atom_inspector(self) -> None:
+        with ui.column().classes("atom-inspector") as self.atom_inspector:
+            with ui.row().classes("items-start no-wrap full-width gap-1"):
+                self.atom_title = ui.label("").classes("text-weight-bold flex-1 min-w-0 break-words")
+                ui.button(icon="close", on_click=self.hide_atom_inspector).props("flat round dense size=sm aria-label='Close atom position'").tooltip("Close atom position")
+            ui.label("Fractional (a, b, c)").classes("atom-coordinate-caption")
+            self.atom_fractional = ui.label("").classes("atom-coordinate-value")
+            ui.label("Cartesian (nm)").classes("atom-coordinate-caption")
+            self.atom_cartesian = ui.label("").classes("atom-coordinate-value")
+        self.atom_inspector.set_visibility(False)
+
+    def hide_atom_inspector(self) -> None:
+        if self.atom_inspector is not None:
+            self.atom_inspector.set_visibility(False)
+
+    def inspect_atom(self, event) -> None:
+        if event.button != 0 or self.atom_inspector is None or self.current_model is None:
+            return
+        atom = self.atom_at_click(event)
+        if atom is None:
+            self.hide_atom_inspector()
+            return
+        model = self.current_model
+        offset = atom.position - model.display_origin
+        fractional = np.linalg.solve(model.display_lattice.T, offset)
+        cartesian = offset * model.scale_nm
+        title = atom.element + (f" ({atom.label})" if atom.label else "")
+        self.atom_title.set_text(title)
+        self.atom_fractional.set_text(point_text(fractional))
+        self.atom_cartesian.set_text(point_text(cartesian))
+        self.atom_inspector.set_visibility(True)
+
+    def atom_at_click(self, event) -> DisplayAtom | None:
+        if event.button != 0:
+            return None
+        # Hits are nearest-first. Ignore frame lines and translucent annotation surfaces.
+        return next((self.atom_objects[hit.object_id] for hit in event.hits if hit.object_id in self.atom_objects), None)
 
     def magnify_icon(self) -> str:
         return "close_fullscreen" if self.state.magnified else "open_in_full"
@@ -3365,7 +4037,7 @@ class PanelController:
             return
         if self.crystal_select.value == self.state.crystal_name:
             return
-        self.simulator.set_panel_crystal(self.state, self.crystal_select.value, force_default_color=True)
+        self.simulator.set_panel_crystal(self.state, self.crystal_select.value)
         self.state.plane_text = ""
         self.state.vector_text = ""
         self.state.zone_text = ""
@@ -3396,13 +4068,42 @@ class PanelController:
             mode="edit",
         )
 
+    def display_model(self, source: CrystalModel | None = None, *, settings: PanelDisplaySettings | None = None,
+                      element_colors: dict[str, str] | None = None) -> CrystalModel:
+        source = source or self.simulator.model_for(self.state.crystal_name)
+        source = source.display_source or source
+        if settings is None:
+            settings = self.state.display_settings
+            count = math.prod(abs(n) for n in settings.cells)
+            if count > 1 and len(source.display_atoms) * count > 30000:
+                settings = replace(settings, cells=(1, 1, 1))
+                self.state.display_settings = settings
+                self.state.global_display_sections.discard("cells")
+                self.simulator.set_status(f"Panel {self.state.panel_id}: displayed cells reset to one; replication would exceed 30,000 atoms")
+        colors = relevant_element_colors(source, getattr(self.simulator, "element_colors", {}) if element_colors is None else element_colors)
+        key = (id(source), crystal_model_key(source), json.dumps(asdict(crystal_display_settings(settings)), sort_keys=True), tuple(sorted(colors.items())))
+        if key != self._display_model_key:
+            self._display_model = make_panel_display_model(source, settings, colors)
+            self._display_model_key = key
+        return self._display_model
+
     def render_crystal_png(
         self,
         dpi: float,
         transparent_background: bool = False,
         view_vector: np.ndarray | None = None,
         roll: float | None = None,
+        frame_size: tuple[int, int] | None = None,
+        fixed_extent: float | None = None,
+        shaded_atoms: bool = False,
+        atom_shading: str | None = None,
+        occupancy_colors: str = "panel",
     ) -> bytes:
+        atom_shading = atom_shading if atom_shading is not None else ("strong" if shaded_atoms else "none")
+        if occupancy_colors == "panel":
+            occupancy_colors = self.state.display_settings.occupancy_colors
+        if atom_shading not in ATOM_SHADING_OPTIONS or occupancy_colors not in OCCUPANCY_COLOR_OPTIONS:
+            raise ValueError("Unknown atom shading or occupancy color style.")
         import matplotlib
 
         matplotlib.use("Agg", force=True)
@@ -3412,7 +4113,7 @@ class PanelController:
         from matplotlib.path import Path as MplPath
         from matplotlib.transforms import Affine2D
 
-        model = self.current_model or self.simulator.model_for(self.state.crystal_name)
+        model = self.display_model(self.current_model or self.simulator.model_for(self.state.crystal_name))
         view = normalize_vector(view_vector if view_vector is not None else self.state.view_vector)
         if view is None:
             view = np.array([1.0, 0.0, 0.0])
@@ -3434,7 +4135,7 @@ class PanelController:
         )
 
         visible_points: list[np.ndarray] = []
-        visible_points.extend(point for edge in model.display_edges for point in edge)
+        visible_points.extend(point for edge in (model.bounds_edges if model.bounds_edges is not None else model.display_edges) for point in edge)
         visible_points.extend(atom.position for atom in model.display_atoms)
         plane_polygons: list[tuple[ParsedIndex, np.ndarray]] = []
         for plane in planes:
@@ -3466,10 +4167,15 @@ class PanelController:
             height = width / figure_aspect
         width *= 1.34
         height *= 1.34
+        if fixed_extent is not None:
+            center_x = center_y = 0.0
+            height = float(fixed_extent)
+            width = height * (frame_size[0] / frame_size[1] if frame_size else figure_aspect)
 
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
         background_color = (0.0, 0.0, 0.0, 0.0) if transparent_background else "#0B0F14"
-        fig = Figure(figsize=(4.6, 3.6), dpi=dpi, facecolor=background_color)
+        figsize = (frame_size[0] / dpi, frame_size[1] / dpi) if frame_size else (4.6, 3.6)
+        fig = Figure(figsize=figsize, dpi=dpi, facecolor=background_color)
         FigureCanvasAgg(fig)
         ax = fig.add_axes([0, 0, 1, 1], facecolor="none")
         ax.set_aspect("equal", adjustable="box")
@@ -3495,6 +4201,7 @@ class PanelController:
 
         plane_palette = self.simulator.plane_palette(self.state.panel_id)
         vector_palette = self.simulator.vector_palette(self.state.panel_id)
+        settings = self.state.display_settings
         for index, (_plane, polygon) in enumerate(plane_polygons):
             rgb = color_to_rgb(plane_palette[index % len(plane_palette)])
             points = screen_points(polygon)
@@ -3504,19 +4211,19 @@ class PanelController:
                 layers.append(CrystalExportLayer(
                     MplPath(np.vstack((points[:, :2], points[0, :2])), closed=True),
                     lambda x, y, eq=equation: eq[0] * x + eq[1] * y + eq[2],
-                    face_color=(*rgb, 0.36),
+                    face_color=(*rgb, settings.plane_opacity),
                 ))
             for start, end in zip(points, np.roll(points, -1, axis=0)):
-                add_line(start, end, (*rgb, 0.9), 1.1)
+                add_line(start, end, (*rgb, settings.plane_edge_opacity), 1.1)
 
         for start, end in model.display_edges:
             points = screen_points(np.array([start, end]))
-            add_line(points[0], points[1], (*color_to_rgb("#7A8796"), 0.82), 1.25)
+            add_line(points[0], points[1], (*color_to_rgb(settings.frame_color), settings.frame_opacity), 1.25 * settings.frame_width)
 
         atom_edge_rgb = (0.0, 0.0, 0.0) if transparent_background else color_to_rgb("#0B0F14")
-        for atom in model.display_atoms:
+        for atom in model.visible_display_atoms():
             center = screen_points(np.array([atom.position]))[0]
-            radius_factor = model.atom_radius_scale * occupancy_radius_factor(atom.occupancy)
+            radius_factor = model.atom_radius_scale * occupancy_radius_factor(atom.occupancy) * atom.radius_multiplier / model.display_extent_scale
             radius = 0.5 * math.sqrt(CRYSTAL_EXPORT_ATOM_MARKER_SIZE) * radius_factor * dpi / 72.0
             opacity = 0.58 + 0.42 * atom.occupancy
 
@@ -3524,11 +4231,18 @@ class PanelController:
                 distance_squared = (x - center[0]) ** 2 + (y - center[1]) ** 2
                 return center[2] + np.sqrt(np.maximum(radius ** 2 - distance_squared, 0.0)) * units_per_pixel
 
+            path = MplPath.unit_circle().transformed(Affine2D().scale(radius).translate(*center[:2]))
+            components = atom.components if occupancy_colors == "sectors" else ()
+            use_shader = atom_shading != "none" or bool(components)
             layers.append(CrystalExportLayer(
-                MplPath.unit_circle().transformed(Affine2D().scale(radius).translate(*center[:2])),
+                path,
                 atom_depth, face_color=(*color_to_rgb(color_for_site(atom)), opacity),
-                edge_color=(*atom_edge_rgb, opacity), linewidth=0.4,
+                edge_color=(*atom_edge_rgb, opacity), linewidth=0.0 if use_shader else 0.4,
+                color_at=crystal_atom_shader(center, radius, color_to_rgb(color_for_site(atom)),
+                                             atom_shading, components) if use_shader else None,
             ))
+            if use_shader:
+                layers.append(CrystalExportLayer(path, atom_depth, edge_color=(*atom_edge_rgb, opacity), linewidth=0.4))
 
         for index, (vector, start, end) in enumerate(vector_segments):
             color = vector_palette[index % len(vector_palette)]
@@ -3538,49 +4252,124 @@ class PanelController:
             paths, filled = ArrowStyle("-|>")(MplPath(points[:, :2]), 18.0 * dpi / 72.0, 2.4 * dpi / 72.0)
             # The shaft has thickness, so a vector lying in a plane is just in front of its surface.
             depth_at = crystal_segment_depth(points[0], points[1], 1.2 * dpi / 72.0 * units_per_pixel)
-            rgba = (*color_to_rgb(color), 0.95)
+            opacity = settings.reciprocal_opacity if vector.is_reciprocal else settings.vector_opacity
+            rgba = (*color_to_rgb(color), opacity)
             for path, fill in zip(paths, filled):
                 layers.append(CrystalExportLayer(
                     path, depth_at, face_color=rgba if fill else None,
                     edge_color=rgba, linewidth=2.4, dashed=vector.is_reciprocal and not fill,
                 ))
-            if self.simulator.show_crystal_annotations():
+            if self.simulator.show_crystal_annotations() and settings.vector_label_opacity > 0:
                 ax.text(
                     x1 + 0.025 * width,
                     y1 + 0.025 * height,
                     vector.label,
                     color=color,
-                    fontsize=9,
+                    alpha=settings.vector_label_opacity,
+                    fontsize=9 * settings.vector_label_scale,
                     weight="bold",
                     ha="left",
                     va="center",
                     zorder=6,
                 )
 
+        for marker in marker_geometry(settings.markers, model):
+            rgb = color_to_rgb(marker["color"])
+            rgba = (*rgb, marker["opacity"])
+            linewidth = marker["width"] / units_per_pixel * 72 / dpi
+            for start, end in marker["segments"]:
+                points = screen_points(np.array([start, end]))
+                add_line(points[0], points[1], rgba, linewidth)
+            for dot in marker["dots"]:
+                center = screen_points(np.array([dot]))[0]
+                radius = marker["width"] / (2 * units_per_pixel)
+                path = MplPath.unit_circle().transformed(Affine2D().scale(radius).translate(*center[:2]))
+
+                def dot_depth(x, y, center=center, radius=radius):
+                    return center[2] + np.sqrt(np.maximum(radius ** 2 - (x-center[0])**2 - (y-center[1])**2, 0)) * units_per_pixel
+
+                layers.append(CrystalExportLayer(path, dot_depth, face_color=rgba))
+            points = screen_points(np.array(marker["points"]))
+            if marker["fill_opacity"] > 0:
+                for face in marker["faces"]:
+                    corners = points[list(face)]
+                    _, _, axes = np.linalg.svd(corners - corners.mean(axis=0), full_matrices=False)
+                    normal = axes[-1]
+                    if abs(float(normal[2])) > 1e-8:
+                        equation = np.array([-normal[0], -normal[1], np.dot(normal, corners[0])]) / normal[2]
+                        layers.append(CrystalExportLayer(
+                            MplPath(np.vstack((corners[:, :2], corners[0, :2])), closed=True),
+                            lambda x, y, eq=equation: eq[0] * x + eq[1] * y + eq[2],
+                            face_color=(*rgb, marker["fill_opacity"])))
+            for head in marker["arrowheads"]:
+                base, tip = screen_points(np.array([head["base"], head["tip"]]))
+                delta = tip[:2] - base[:2]
+                radius = head["radius"] / units_per_pixel
+                length = np.linalg.norm(delta)
+                if length > 1e-8:
+                    side = np.array([-delta[1], delta[0]]) * radius / length
+                    path = MplPath(np.array([tip[:2], base[:2] + side, base[:2] - side, tip[:2]]), closed=True)
+                else:
+                    path = MplPath.unit_circle().transformed(Affine2D().scale(radius).translate(*base[:2]))
+                layers.append(CrystalExportLayer(path, crystal_segment_depth(base, tip), face_color=rgba))
+            if marker["kind"] == "point" and not marker["hide_atom"]:
+                center = points[0]
+                radius = (0.5 * math.sqrt(CRYSTAL_EXPORT_ATOM_MARKER_SIZE) * marker["radius"]
+                          / REAL_SCENE_ATOM_RADIUS / model.display_extent_scale * dpi / 72.0)
+                path = MplPath.unit_circle().transformed(Affine2D().scale(radius).translate(*center[:2]))
+                if marker["point_style"] == "ring":
+                    layers.append(CrystalExportLayer(path, lambda x, y, z=center[2]: z,
+                                                    edge_color=rgba, linewidth=linewidth))
+                else:
+                    def marker_depth(x, y, center=center, radius=radius):
+                        return center[2] + np.sqrt(np.maximum(radius ** 2 - (x-center[0])**2 - (y-center[1])**2, 0)) * units_per_pixel
+                    use_shader = atom_shading != "none"
+                    edge = (*atom_edge_rgb, marker["opacity"])
+                    layers.append(CrystalExportLayer(path, marker_depth, face_color=rgba,
+                        edge_color=edge, linewidth=0 if use_shader else .4,
+                        color_at=crystal_atom_shader(center, radius, rgb, atom_shading) if use_shader else None))
+                    if use_shader:
+                        layers.append(CrystalExportLayer(path, marker_depth, edge_color=edge, linewidth=.4))
+            if marker["label"] and self.simulator.show_crystal_annotations():
+                x, y = project(np.mean(marker["points"], axis=0))
+                dx, dy = marker["label_direction"]
+                gap = marker["label_gap"] * 9 / 13
+                ax.annotate(marker["label"], (x, y), xytext=(dx * gap, dy * gap), textcoords="offset points",
+                    color=marker["label_color"], alpha=marker["label_opacity"], fontsize=9 * marker["label_size"] / 13,
+                    ha="left" if dx > 0 else "right" if dx < 0 else "center",
+                    va="bottom" if dy > 0 else "top" if dy < 0 else "center", zorder=6, parse_math=False)
+
         pixels = composite_crystal_export(layers, pixel_width, pixel_height, dpi)
         fig.figimage(pixels, origin="upper", zorder=-1)
 
-        if self.simulator.show_crystal_annotations():
+        if self.simulator.show_crystal_annotations() and settings.plane_label_opacity > 0:
             for index, (plane, polygon) in enumerate(plane_polygons):
                 color = plane_palette[index % len(plane_palette)]
                 x, y = project(np.mean(polygon, axis=0))
-                ax.text(x, y, plane.label, color=color, fontsize=9, weight="bold", ha="center", va="center", zorder=6)
+                ax.text(x, y, plane.label, color=color, alpha=settings.plane_label_opacity,
+                        fontsize=9 * settings.plane_label_scale, weight="bold", ha="center", va="center", zorder=6)
 
-        if self.simulator.show_scale_bars():
+        if self.simulator.show_scale_bars() and settings.annotations.real_scale_visible:
+            style = settings.annotations.real_scale
+            right, top = "right" in style.position, "top" in style.position
             visible_nm = max(width * model.scale_nm, 1e-9)
             bar_nm = choose_scale_bar(visible_nm)
             bar_display = bar_nm / max(model.scale_nm, 1e-9)
-            x0 = center_x - width / 2.0 + 0.07 * width
-            y0 = center_y - height / 2.0 + 0.10 * height
-            ax.plot([x0, x0 + bar_display], [y0, y0], color="#F7FAFC", linewidth=2.4, zorder=10)
+            x0 = center_x + (0.43 * width - bar_display if right else -0.43 * width)
+            y0 = center_y + (0.40 if top else -0.40) * height
+            if not top:
+                text_height = style.font_size * .75 * dpi / 72 * units_per_pixel * 1.3
+                y0 = max(y0, center_y - height / 2 + .065 * height + text_height)
+            ax.plot([x0, x0 + bar_display], [y0, y0], color=style.color, alpha=style.opacity, linewidth=2.4, zorder=10)
             ax.text(
-                x0,
+                x0 + bar_display if right else x0,
                 y0 - 0.035 * height,
                 f"{bar_nm:g} nm",
-                color="#F7FAFC",
-                fontsize=9,
+                color=style.color,
+                alpha=style.opacity,
+                fontsize=style.font_size * .75,
                 weight="bold",
-                ha="left",
+                ha="right" if right else "left",
                 va="top",
                 zorder=10,
             )
@@ -3624,49 +4413,38 @@ class PanelController:
         return view, roll
 
     def open_download_dialog(self) -> None:
-        self.download_dialog = ui.dialog()
-        with self.download_dialog, ui.card().classes("download-card"):
-            with ui.row().classes("items-center justify-between full-width"):
-                ui.label(f"Download panel {self.state.panel_id}").classes("text-h6")
-                ui.button(icon="close", on_click=self.download_dialog.close).props("flat round dense").tooltip("Close")
-            crystal_checkbox = ui.checkbox("Real-space crystal", value=True).props("dense")
-            diffraction_checkbox = ui.checkbox("Diffraction pattern", value=True).props("dense")
-            transparent_checkbox = ui.checkbox("Transparent background", value=False).props("dense")
-            crystal_filename_input = (
-                ui.input("Crystal file name base", value=f"panel_{self.state.panel_id}_crystal")
-                .props("outlined dense")
-                .classes("full-width")
-            )
-            diffraction_filename_input = (
-                ui.input("Diffraction file name base", value=f"panel_{self.state.panel_id}_diffraction")
-                .props("outlined dense")
-                .classes("full-width")
-            )
-            dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
-            suffix_checkbox = ui.checkbox("Add transparency and DPI suffixes", value=True).props("dense")
-            if self.simulator.direct_file_exports_enabled():
-                export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
+        self.download_editor = StaticDownloadDialog(self)
+        self.download_dialog = self.download_editor.dialog
+        self.download_editor.open()
 
-                async def choose_folder() -> None:
-                    await self.simulator.choose_export_folder(export_folder_label)
+    async def render_crystal_image(
+        self, dpi: float, transparent: bool = False, renderer: str = "three",
+        atom_shading: str = "mild", occupancy_colors: str = "panel", shaded_atoms: bool = False,
+    ) -> bytes:
+        from CrysDiS_animation import RENDER_LOCK, render_static_three_png
 
-                ui.button("Choose export folder", icon="folder_open", on_click=choose_folder).props("outline dense")
-            with ui.row().classes("justify-end full-width"):
-                ui.button("Cancel", on_click=self.download_dialog.close).props("flat dense")
-                ui.button(
-                    "Download",
-                    icon="download",
-                    on_click=lambda: self.download_images(
-                        bool(crystal_checkbox.value),
-                        bool(diffraction_checkbox.value),
-                        float(dpi_input.value or 300),
-                        bool(transparent_checkbox.value),
-                        str(crystal_filename_input.value or ""),
-                        str(diffraction_filename_input.value or ""),
-                        include_suffixes=bool(suffix_checkbox.value),
-                    ),
-                ).props("unelevated dense")
-        self.download_dialog.open()
+        view, roll = await self.live_scene_orientation()
+        if renderer == "three":
+            return await render_static_three_png(
+                sys.modules[__name__], self, dpi, transparent, view, roll,
+                atom_shading=atom_shading, occupancy_colors=occupancy_colors)
+
+        def render() -> bytes:
+            with RENDER_LOCK:
+                return self.render_crystal_png(
+                    dpi, transparent_background=transparent, view_vector=view, roll=roll,
+                    shaded_atoms=shaded_atoms, atom_shading=atom_shading, occupancy_colors=occupancy_colors)
+
+        return await asyncio.to_thread(render)
+
+    async def open_animation_dialog(self) -> None:
+        from CrysDiS_animation import AnimationDialog
+
+        if self.download_dialog is not None:
+            self.download_dialog.close()
+        if self.animation_dialog is None:
+            self.animation_dialog = AnimationDialog(self, sys.modules[__name__])
+        await self.animation_dialog.open()
 
     async def download_images(
         self,
@@ -3677,6 +4455,10 @@ class PanelController:
         crystal_filename_base: str | None = None,
         diffraction_filename_base: str | None = None,
         include_suffixes: bool = True,
+        crystal_renderer: str = "three",
+        shaded_atoms: bool = False,
+        atom_shading: str | None = None,
+        occupancy_colors: str = "panel",
     ) -> None:
         if not include_crystal and not include_diffraction:
             ui.notify("Choose at least one image to download", type="warning")
@@ -3701,13 +4483,9 @@ class PanelController:
         )
         if include_crystal:
             try:
-                live_view, live_roll = await self.live_scene_orientation()
-                image_bytes = self.render_crystal_png(
-                    dpi,
-                    transparent_background=transparent_background,
-                    view_vector=live_view,
-                    roll=live_roll,
-                )
+                shading = atom_shading or ("strong" if shaded_atoms else "mild")
+                image_bytes = await self.render_crystal_image(
+                    dpi, transparent_background, crystal_renderer, shading, occupancy_colors, shaded_atoms)
                 if direct_export:
                     saved_paths.append(self.simulator.save_exported_image(image_bytes, crystal_filename))
                 else:
@@ -3951,20 +4729,39 @@ class PanelController:
     def redraw_scene(self, model: CrystalModel | None = None, *, update_camera: bool = True) -> None:
         if self.scene is None:
             return
-        model = model or self.simulator.model_for(self.state.crystal_name)
+        model = self.display_model(model)
         self.current_model = model
         signature = self.scene_content_signature(model)
         if signature != self.scene_signature:
+            self.atom_objects.clear()
+            self.hide_atom_inspector()
             self.scene.clear()
+            self.scene.atom_sectors = {}
+            self.scene.marker_groups = {}
             with self.scene:
                 for start, end in model.display_edges:
-                    self.scene.line(start.tolist(), end.tolist()).material(color="#7A8796", opacity=0.72)
+                    settings = self.state.display_settings
+                    if settings.frame_opacity == 0:
+                        continue
+                    if settings.frame_width == 1.0:
+                        self.scene.line(start.tolist(), end.tolist()).material(color=settings.frame_color, opacity=settings.frame_opacity)
+                    else:
+                        delta = end - start
+                        radius = 0.0025 * settings.frame_width
+                        self.scene.cylinder(radius, radius, float(np.linalg.norm(delta)), radial_segments=12).move(
+                            *((start + end) * 0.5).tolist()
+                        ).rotate_R(rotation_matrix_from_y(delta)).material(color=settings.frame_color, opacity=settings.frame_opacity)
 
-                for atom in model.display_atoms:
-                    radius = REAL_SCENE_ATOM_RADIUS * model.atom_radius_scale * occupancy_radius_factor(atom.occupancy)
-                    self.scene.sphere(radius=radius, width_segments=32, height_segments=16).move(*atom.position.tolist()).material(
+                for atom in model.visible_display_atoms():
+                    radius = model.atom_radius(atom)
+                    sphere = self.scene.sphere(radius=radius, width_segments=32, height_segments=16).move(*atom.position.tolist()).material(
                         color=color_for_site(atom), opacity=0.58 + 0.42 * atom.occupancy
                     )
+                    self.atom_objects[sphere.id] = atom
+                    if self.state.display_settings.occupancy_colors == "sectors":
+                        sectors = occupancy_sectors(atom.components)
+                        if len(sectors) > 1:
+                            self.scene.atom_sectors[sphere.id] = sectors
 
                 planes, _ = parse_indices(self.state.plane_text, model, "plane", allow_multiple=True)
                 vectors, _ = parse_indices(
@@ -3976,16 +4773,39 @@ class PanelController:
                 )
                 self.draw_planes(model, planes)
                 self.draw_vectors(model, vectors)
+                geometry = marker_geometry(self.state.display_settings.markers, model)
+                if geometry:
+                    group = self.scene.group()
+                    self.scene.marker_groups[group.id] = geometry
+                    if self.simulator.show_crystal_annotations():
+                        for marker in geometry:
+                            if marker["label"]:
+                                dx, dy = marker["label_direction"]
+                                gap = marker["label_gap"]
+                                style = (f"color:{marker['label_color']};opacity:{marker['label_opacity']};"
+                                         f"font-size:{marker['label_size']}px;white-space:nowrap;pointer-events:none;"
+                                         f"translate:calc({dx * 50}% + {dx * gap}px) calc({-dy * 50}% + {-dy * gap}px);")
+                                self.scene.text(marker["label"], style=style).move(
+                                    *np.mean(marker["points"], axis=0).tolist())
+            self.scene.apply_atom_sectors()
+            self.scene.apply_markers()
             self.scene_signature = signature
 
         if not update_camera:
             return
-        view = normalize_vector(self.state.view_vector)
+        self.position_scene_camera(model, self.state.view_vector, self.state.roll)
+
+    def position_scene_camera(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> None:
+        view = normalize_vector(view_vector)
         if view is None:
             view = np.array([1.0, 0.0, 0.0])
-        _u_axis, up_axis = projection_basis(view, self.state.roll)
+        _u_axis, up_axis = projection_basis(view, roll)
         distance = calculate_camera_distance(model.limit * 1.08, REAL_SCENE_FOV_DEGREES)
         camera = view * distance
+        self.scene.client.run_javascript(f"""
+            const scene = getElement({self.scene.id});
+            if (scene?.camera) {{scene.camera.far = {max(5000, distance + 3 * model.limit)}; scene.camera.updateProjectionMatrix();}}
+        """)
         self.scene.move_camera(
             x=float(camera[0]),
             y=float(camera[1]),
@@ -4007,7 +4827,9 @@ class PanelController:
         not the original nominal ui.scene(width=440, height=280) aspect ratio.
         Otherwise the scale bar changes when the responsive layout changes.
         """
-        selector = f".comparison-panel-{self.state.panel_id} .scene-wrap"
+        if self.scene is None:
+            return None
+        selector = f"#c{self.scene.id}"
         try:
             size = await ui.run_javascript(
                 f"""
@@ -4037,6 +4859,8 @@ class PanelController:
         try:
             camera = await self.scene.get_camera()
         except Exception:
+            return
+        if not isinstance(camera, dict):
             return
         position = camera.get("position", {})
         distance = float(
@@ -4103,11 +4927,13 @@ class PanelController:
     def scene_content_signature(self, model: CrystalModel) -> tuple[Any, ...]:
         return (
             crystal_model_key(model),
+            json.dumps(asdict(crystal_display_settings(self.state.display_settings)), sort_keys=True),
             self.state.plane_text,
             self.state.vector_text,
             bool(self.simulator.show_crystal_annotations()),
             tuple(self.simulator.plane_palette(self.state.panel_id)),
             tuple(self.simulator.vector_palette(self.state.panel_id)),
+            tuple(sorted(relevant_element_colors(model, getattr(self.simulator, "element_colors", {})).items())),
         )
 
     def set_scale_bar_from_distance(
@@ -4119,7 +4945,7 @@ class PanelController:
         if self.scale_bar_line is None or self.scale_bar_label is None:
             return
         self.apply_scale_bar_visibility()
-        if not self.simulator.show_scale_bars():
+        if not self.simulator.show_scale_bars() or not self.state.display_settings.annotations.real_scale_visible:
             return
 
         viewport_height_world = max(
@@ -4143,36 +4969,47 @@ class PanelController:
             # the overlay independent of screen size and responsive layout aspect ratio.
             pixels_per_nm = height_px / max(viewport_height_world * model.scale_nm, 1e-9)
             bar_px = max(bar_nm * pixels_per_nm, 1.0)
-            self.scale_bar_line.style(replace=f"width: {bar_px:.1f}px")
+            self.scale_bar_line.style(f"width: {bar_px:.1f}px")
         else:
             fraction = bar_nm / visible_nm
-            self.scale_bar_line.style(replace=f"width: {fraction * 100:.2f}%")
+            self.scale_bar_line.style(f"width: {fraction * 100:.2f}%")
         self.scale_bar_label.set_text(f"{bar_nm:g} nm")
 
     def apply_scale_bar_visibility(self) -> None:
         if self.scale_bar_container is None:
             return
-        self.scale_bar_container.visible = self.simulator.show_scale_bars()
+        settings = self.state.display_settings.annotations
+        style = settings.real_scale
+        right, top = "right" in style.position, "top" in style.position
+        self.scale_bar_container.visible = self.simulator.show_scale_bars() and settings.real_scale_visible
+        self.scale_bar_container.style(
+            f"top: {'14px' if top else 'auto'}; bottom: {'auto' if top else '14px'}; "
+            f"display: flex; flex-direction: column; align-items: {'flex-end' if right else 'flex-start'}; opacity: {style.opacity}")
+        self.scale_bar_line.style(f"margin-left: 16px; margin-right: 16px; background: {style.color}; border-color: {style.color}")
+        self.scale_bar_label.style(f"margin-left: 16px; margin-right: 16px; color: {style.color}; font-size: {style.font_size:g}px")
         self.scale_bar_container.update()
 
     def draw_planes(self, model: CrystalModel, planes: list[ParsedIndex]) -> None:
         if self.scene is None:
             return
         palette = self.simulator.plane_palette(self.state.panel_id)
+        settings = self.state.display_settings
         for index, plane in enumerate(planes):
             vertices = clipped_plane_polygon(model, plane)
             if vertices is None:
                 continue
             color = palette[index % len(palette)]
             centroid = np.mean(vertices, axis=0)
-            for start, end in zip(vertices, np.roll(vertices, -1, axis=0)):
-                coords = [[start.tolist(), end.tolist()], [centroid.tolist(), centroid.tolist()]]
-                self.scene.texture(PLANE_FILL_TEXTURE, coords).material(color=color, opacity=0.36, side="both")
-            for start, end in zip(vertices, np.roll(vertices, -1, axis=0)):
-                self.scene.line(start.tolist(), end.tolist()).material(color=color, opacity=0.9)
-            if self.simulator.show_crystal_annotations():
+            if settings.plane_opacity > 0:
+                for start, end in zip(vertices, np.roll(vertices, -1, axis=0)):
+                    coords = [[start.tolist(), end.tolist()], [centroid.tolist(), centroid.tolist()]]
+                    self.scene.texture(PLANE_FILL_TEXTURE, coords).material(color=color, opacity=settings.plane_opacity, side="both")
+            if settings.plane_edge_opacity > 0:
+                for start, end in zip(vertices, np.roll(vertices, -1, axis=0)):
+                    self.scene.line(start.tolist(), end.tolist()).material(color=color, opacity=settings.plane_edge_opacity)
+            if self.simulator.show_crystal_annotations() and settings.plane_label_opacity > 0:
                 label_position = np.mean(vertices, axis=0)
-                self.scene.text(plane.label, style=f"color: {color}; font-size: 13px; font-weight: 700;").move(
+                self.scene.text(plane.label, style=f"color: {color}; opacity: {settings.plane_label_opacity}; font-size: {13 * settings.plane_label_scale:g}px; font-weight: 700;").move(
                     *label_position.tolist()
                 )
 
@@ -4180,17 +5017,21 @@ class PanelController:
         if self.scene is None:
             return
         palette = self.simulator.vector_palette(self.state.panel_id)
+        settings = self.state.display_settings
         for index, vector in enumerate(vectors):
             color = palette[index % len(palette)]
+            opacity = settings.reciprocal_opacity if vector.is_reciprocal else settings.vector_opacity
             if vector.is_reciprocal:
                 start, end = reciprocal_segment_for_display(vector.values, model)
-                self.draw_arrow(start, end, color, shaft_radius=0.011, head_radius=0.044, opacity=0.78)
-                self.draw_reciprocal_markers(start, end, color)
+                if opacity > 0:
+                    self.draw_arrow(start, end, color, shaft_radius=0.011, head_radius=0.044, opacity=opacity)
+                    self.draw_reciprocal_markers(start, end, color)
             else:
                 start, end = direction_segment_for_display(vector.values, model)
-                self.draw_arrow(start, end, color)
-            if self.simulator.show_crystal_annotations():
-                self.scene.text(vector.label, style=f"color: {color}; font-size: 13px; font-weight: 700;").move(
+                if opacity > 0:
+                    self.draw_arrow(start, end, color, opacity=opacity)
+            if self.simulator.show_crystal_annotations() and settings.vector_label_opacity > 0:
+                self.scene.text(vector.label, style=f"color: {color}; opacity: {settings.vector_label_opacity}; font-size: {13 * settings.vector_label_scale:g}px; font-weight: 700;").move(
                     *end.tolist()
                 )
 
@@ -4204,7 +5045,7 @@ class PanelController:
             point = start + delta * float(fraction)
             self.scene.sphere(radius=0.018, width_segments=16, height_segments=8).move(*point.tolist()).material(
                 color=color,
-                opacity=0.88,
+                opacity=min(1.0, self.state.display_settings.reciprocal_opacity * 0.88 / 0.78),
             )
 
     def draw_arrow(
@@ -4269,13 +5110,14 @@ class PanelController:
         spot_color: str,
         zone_label: str = "",
     ) -> dict[str, Any]:
+        settings = self.state.display_settings.annotations
         shapes, annotations = (
-            diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit())
+            diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit(), settings)
             if self.simulator.show_scale_bars()
             else ([], [])
         )
         if zone_label:
-            annotations.append(diffraction_zone_axis_annotation(limit, zone_label))
+            annotations.append(diffraction_zone_axis_annotation(limit, zone_label, settings, self.simulator.show_scale_bars()))
         data: list[dict[str, Any]] = []
         if len(spots):
             intensity = spots[:, 2]
@@ -4290,7 +5132,7 @@ class PanelController:
                 d_nm = plane_spacing_nm_for_hkl(h, k, l, model)
                 d_text = "infinite" if math.isinf(d_nm) else f"{d_nm:.4g} nm"
                 hover_text.append(
-                    f"Index: {label}<br>Relative intensity: {float(spot[2]):.4f}<br>d-spacing: {d_text}"
+                    f"Index: {label}<br>Relative intensity: {diffraction_intensity_text(float(spot[2]))}<br>d-spacing: {d_text}"
                 )
             data.append(
                 {
@@ -4302,13 +5144,13 @@ class PanelController:
                     "hovertemplate": "%{text}<extra></extra>",
                     "marker": {
                         "size": marker_size.tolist(),
-                        "color": [rgba_css(spot_color, 0.18 + 0.82 * float(value)) for value in intensity],
+                        "color": [rgba_css(spot_color, alpha) for alpha in self.simulator.diffraction_spot_opacities(intensity)],
                         "line": {"width": 0},
                     },
                 }
             )
             if self.simulator.show_indices():
-                annotations.extend(self.diffraction_index_annotations(spots, limit, labels))
+                annotations.extend(self.diffraction_index_annotations(spots, limit, labels, settings, marker_size))
         else:
             annotations.append(
                 {
@@ -4332,12 +5174,14 @@ class PanelController:
                     "range": [-limit, limit],
                     "scaleanchor": "y",
                     "scaleratio": 1,
+                    "constrain": "domain",
                     "fixedrange": True,
                     "zeroline": False,
                 },
                 "yaxis": {
                     "visible": False,
                     "range": [-limit, limit],
+                    "constrain": "domain",
                     "fixedrange": True,
                     "zeroline": False,
                 },
@@ -4351,7 +5195,12 @@ class PanelController:
         }
 
     @staticmethod
-    def diffraction_index_annotations(spots: np.ndarray, limit: float, labels: list[str]) -> list[dict[str, Any]]:
+    def diffraction_index_annotations(spots: np.ndarray, limit: float, labels: list[str],
+                                     settings: PanelAnnotations | None = None,
+                                     marker_sizes: np.ndarray | None = None) -> list[dict[str, Any]]:
+        settings = settings or PanelAnnotations()
+        style = settings.indices
+        dx, dy = SPOT_LABEL_DIRECTIONS[style.position]
         order = np.argsort(spots[:, 2])[::-1]
         labeled = 0
         margin = 0.94 * float(limit)
@@ -4362,6 +5211,8 @@ class PanelController:
                 continue
             x_coord = float(spots[spot_index, 0])
             y_coord = float(spots[spot_index, 1])
+            radius = float(marker_sizes[spot_index]) / 2 if marker_sizes is not None else 0
+            offset = max(0.0, radius + settings.index_offset) / math.hypot(dx, dy)
             if abs(x_coord) > margin or abs(y_coord) > margin:
                 continue
             annotations.append(
@@ -4372,10 +5223,14 @@ class PanelController:
                     "yref": "y",
                     "text": labels[spot_index],
                     "showarrow": False,
-                    "font": {"color": "#F7FAFC", "size": 9},
-                    "xanchor": "center",
-                    "yanchor": "bottom",
-                    "opacity": 0.88,
+                    "font": {"color": style.color, "size": style.font_size},
+                    "borderpad": 0,
+                    "borderwidth": 0,
+                    "xanchor": "left" if dx > 0 else "right" if dx < 0 else "center",
+                    "yanchor": "bottom" if dy > 0 else "top" if dy < 0 else "middle",
+                    "xshift": dx * offset,
+                    "yshift": dy * offset,
+                    "opacity": style.opacity,
                 }
             )
             labeled += 1
@@ -4393,6 +5248,7 @@ class ComboPanelController:
         self.source_list_container = None
         self.diffraction = None
         self.download_dialog = None
+        self.animation_dialog = None
         self.bind_checkbox = None
         self.magnify_button = None
 
@@ -4460,39 +5316,27 @@ class ComboPanelController:
         self.update_magnify_button()
 
     def open_download_dialog(self) -> None:
-        self.download_dialog = ui.dialog()
-        with self.download_dialog, ui.card().classes("download-card"):
-            with ui.row().classes("items-center justify-between full-width"):
-                ui.label(f"Download combo C{self.state.combo_id}").classes("text-h6")
-                ui.button(icon="close", on_click=self.download_dialog.close).props("flat round dense").tooltip("Close")
-            transparent_checkbox = ui.checkbox("Transparent background", value=False).props("dense")
-            filename_input = (
-                ui.input("Diffraction file name base", value=f"combo_C{self.state.combo_id}_diffraction")
-                .props("outlined dense")
-                .classes("full-width")
-            )
-            dpi_input = ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense")
-            suffix_checkbox = ui.checkbox("Add transparency and DPI suffixes", value=True).props("dense")
-            if self.simulator.direct_file_exports_enabled():
-                export_folder_label = ui.label(f"Export folder: {self.simulator.export_dir_text()}").classes("export-folder-label")
+        self.download_editor = StaticDownloadDialog(self)
+        self.download_dialog = self.download_editor.dialog
+        self.download_editor.open()
 
-                async def choose_folder() -> None:
-                    await self.simulator.choose_export_folder(export_folder_label)
+    async def open_animation_dialog(self) -> None:
+        from CrysDiS_animation import ComboAnimationDialog
 
-                ui.button("Choose export folder", icon="folder_open", on_click=choose_folder).props("outline dense")
-            with ui.row().classes("justify-end full-width"):
-                ui.button("Cancel", on_click=self.download_dialog.close).props("flat dense")
-                ui.button(
-                    "Download",
-                    icon="download",
-                    on_click=lambda: self.download_diffraction_image(
-                        float(dpi_input.value or 300),
-                        bool(transparent_checkbox.value),
-                        str(filename_input.value or ""),
-                        include_suffixes=bool(suffix_checkbox.value),
-                    ),
-                ).props("unelevated dense")
-        self.download_dialog.open()
+        if self.download_dialog is not None:
+            self.download_dialog.close()
+        available = ComboAnimationDialog.available_panel_ids(self)
+        sources = [state.panel_id for state in self.selected_sources()]
+        if not sources:
+            ui.notify("Choose source panels before creating an animation", type="warning")
+            return
+        if (self.animation_dialog is None or self.animation_dialog.available_ids != available
+                or self.animation_dialog.source_ids != sources):
+            if self.animation_dialog is not None:
+                self.animation_dialog.dialog.delete()
+            with ui.context.client.content:
+                self.animation_dialog = ComboAnimationDialog(self, sys.modules[__name__])
+        await self.animation_dialog.open()
 
     async def download_diffraction_image(
         self,
@@ -4726,13 +5570,14 @@ class ComboPanelController:
         self.diffraction.update_figure(self.build_combo_figure(sources, limit, zone_label))
 
     def build_combo_figure(self, sources: list[PanelState], limit: float, zone_label: str = "") -> dict[str, Any]:
+        settings = self.simulator.global_annotation_settings()
         shapes, annotations = (
-            diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit())
+            diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit(), settings)
             if self.simulator.show_scale_bars()
             else ([], [])
         )
         if zone_label:
-            annotations.append(diffraction_zone_axis_annotation(limit, zone_label))
+            annotations.append(diffraction_zone_axis_annotation(limit, zone_label, settings, self.simulator.show_scale_bars()))
         data: list[dict[str, Any]] = []
         for source in reversed(sources):
             model = self.simulator.model_for(source.crystal_name)
@@ -4753,7 +5598,7 @@ class ComboPanelController:
                 d_text = "infinite" if math.isinf(d_nm) else f"{d_nm:.4g} nm"
                 hover_text.append(
                     f"Source: panel {source.panel_id} - {source.crystal_name}"
-                    f"<br>Index: {label}<br>Relative intensity: {float(spot[2]):.4f}<br>d-spacing: {d_text}"
+                    f"<br>Index: {label}<br>Relative intensity: {diffraction_intensity_text(float(spot[2]))}<br>d-spacing: {d_text}"
                 )
             data.append(
                 {
@@ -4765,13 +5610,14 @@ class ComboPanelController:
                     "hovertemplate": "%{text}<extra></extra>",
                     "marker": {
                         "size": marker_size.tolist(),
-                        "color": [rgba_css(spot_color, 0.14 + 0.70 * float(value)) for value in intensity],
+                        "color": [rgba_css(spot_color, alpha) for alpha in self.simulator.diffraction_spot_opacities(intensity, combo=True)],
                         "line": {"width": 0},
                     },
                 }
             )
             if self.simulator.show_indices():
-                annotations.extend(PanelController.diffraction_index_annotations(spots, limit, labels))
+                annotations.extend(PanelController.diffraction_index_annotations(
+                    spots, limit, labels, source.display_settings.annotations, marker_size))
         if not data:
             annotations.append(
                 {
@@ -4795,10 +5641,11 @@ class ComboPanelController:
                     "range": [-limit, limit],
                     "scaleanchor": "y",
                     "scaleratio": 1,
+                    "constrain": "domain",
                     "fixedrange": True,
                     "zeroline": False,
                 },
-                "yaxis": {"visible": False, "range": [-limit, limit], "fixedrange": True, "zeroline": False},
+                "yaxis": {"visible": False, "range": [-limit, limit], "fixedrange": True, "zeroline": False, "constrain": "domain"},
                 "showlegend": False,
                 "hovermode": "closest",
                 "dragmode": False,
@@ -4809,8 +5656,990 @@ class ComboPanelController:
         }
 
 
+class StaticDownloadDialog:
+    """Low-resolution export previews without changing the live panel."""
+
+    def __init__(self, controller: PanelController | ComboPanelController) -> None:
+        self.controller = controller
+        self.combo = isinstance(controller, ComboPanelController)
+        self.closed = False
+        self.busy = False
+        self.revision = 0
+        self.timer = None
+        self.preview_lock = asyncio.Lock()
+        self.cache: dict[str, tuple[tuple, bytes]] = {}
+        self.controls: list[Any] = []
+        self.shading_by_renderer = {"png": "mild", "three": "mild"}
+        self.last_renderer = "three"
+        self.crystal = self.renderer = self.shading = self.occupancy = self.crystal_filename = None
+        self.tiles: dict[str, Any] = {}
+        self.images: dict[str, Any] = {}
+        self.errors: dict[str, Any] = {}
+        name = f"combo C{controller.state.combo_id}" if self.combo else f"panel {controller.state.panel_id}"
+        base = f"combo_C{controller.state.combo_id}" if self.combo else f"panel_{controller.state.panel_id}"
+        self.dialog = ui.dialog()
+        with self.dialog, ui.card().classes("download-card static-download-card"):
+            with ui.row().classes("items-center justify-between full-width"):
+                ui.label(f"Download {name}").classes("text-h6")
+                self.control(ui.button(icon="close", on_click=self.dialog.close).props("flat round dense").tooltip("Close"))
+            with ui.row().classes("full-width items-center"):
+                if not self.combo:
+                    self.crystal = self.control(ui.checkbox("Real-space crystal", value=True).props("dense"))
+                self.diffraction = self.control(ui.checkbox("Diffraction pattern", value=True).props("dense"))
+                if self.combo:
+                    self.diffraction.set_visibility(False)
+                self.transparent = self.control(ui.checkbox("Transparent background", value=False).props("dense"))
+            with ui.element("div").classes("static-download-options"):
+                if not self.combo:
+                    self.renderer = self.control(ui.select({"png": "Current PNG exporter", "three": "Three.js"},
+                        value="three", label="Crystal renderer").props("outlined dense"))
+                    self.renderer.tooltip("Both renderers save PNG files. Three.js uses a lit 3D scene.")
+                    self.shading = self.control(ui.select(ATOM_SHADING_OPTIONS, value="mild", label="Shading").props("outlined dense"))
+                    self.occupancy = self.control(ui.select(EXPORT_OCCUPANCY_COLOR_OPTIONS, value="panel",
+                        label="Site occupancy colors").props("outlined dense"))
+                    self.occupancy.tooltip("Viewer-facing sectors represent site occupancy; gray is unoccupied.")
+                    self.crystal_filename = self.control(ui.input("Crystal file name base", value=base + "_crystal").props("outlined dense"))
+                self.diffraction_filename = self.control(ui.input("Diffraction file name base", value=base + "_diffraction").props("outlined dense"))
+                self.dpi = self.control(ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense"))
+            self.suffix = self.control(ui.checkbox("Add transparency and DPI suffixes", value=True).props("dense"))
+            if controller.simulator.direct_file_exports_enabled():
+                folder = ui.label(f"Export folder: {controller.simulator.export_dir_text()}").classes("export-folder-label")
+
+                async def choose_folder() -> None:
+                    await controller.simulator.choose_export_folder(folder)
+
+                self.control(ui.button("Choose export folder", icon="folder_open", on_click=choose_folder).props("outline dense"))
+            with ui.row().classes("full-width items-center gap-2"):
+                ui.label("Preview").classes("text-subtitle2").tooltip("Preview resolution is limited for speed. Downloads use the selected DPI.")
+                self.spinner = ui.spinner(size="sm")
+                self.status = ui.label("Updating preview...").classes("text-caption")
+                self.control(ui.button(icon="refresh", on_click=self.refresh).props("flat round dense").tooltip("Refresh preview"))
+            with ui.element("div").classes("static-download-previews") as self.previews:
+                for kind, label in (("crystal", "Real-space crystal"), ("diffraction", "Diffraction pattern")):
+                    if self.combo and kind == "crystal":
+                        continue
+                    with ui.column().classes("static-download-tile gap-1") as self.tiles[kind]:
+                        ui.label(label).classes("text-caption")
+                        self.images[kind] = ui.image().props("fit=contain no-spinner no-transition").classes("static-download-image")
+                        self.errors[kind] = ui.label().classes("text-negative text-caption full-width")
+                        self.errors[kind].set_visibility(False)
+            with ui.row().classes("full-width items-center justify-between static-download-actions"):
+                self.control(ui.button("Create animation", icon="movie", on_click=self.open_animation).props("outline dense"))
+                with ui.row().classes("items-center gap-2"):
+                    self.control(ui.button("Cancel", on_click=self.dialog.close).props("flat dense"))
+                    self.download_button = self.control(ui.button("Download", icon="download", on_click=self.download).props("unelevated dense"))
+        for control in (self.crystal, self.diffraction, self.transparent, self.renderer, self.shading, self.occupancy, self.dpi):
+            if control is not None:
+                control.on_value_change(self.schedule_preview)
+        self.dialog.on("show", self.schedule_preview)
+        self.dialog.on("hide", self.stop)
+        self.dialog.client.on_disconnect(self.stop)
+        self.update_controls()
+
+    def control(self, element: Any) -> Any:
+        self.controls.append(element)
+        return element
+
+    def selected(self) -> list[str]:
+        return (["crystal"] if self.crystal is not None and self.crystal.value else []) + (["diffraction"] if self.diffraction.value else [])
+
+    def update_controls(self) -> None:
+        if self.renderer is not None:
+            if self.renderer.value != self.last_renderer:
+                self.shading_by_renderer[self.last_renderer] = self.shading.value
+                self.last_renderer = self.renderer.value
+                self.shading.set_value(self.shading_by_renderer[self.last_renderer])
+            for control in (self.renderer, self.shading, self.occupancy, self.crystal_filename):
+                control.set_enabled(not self.busy and bool(self.crystal.value))
+        self.diffraction_filename.set_enabled(not self.busy and bool(self.diffraction.value))
+        selected = self.selected()
+        self.download_button.set_enabled(not self.busy and bool(selected))
+        for kind, tile in self.tiles.items():
+            tile.set_visibility(kind in selected)
+            self.images[kind].classes(add="static-download-transparent" if self.transparent.value else "",
+                                      remove="static-download-transparent" if not self.transparent.value else "")
+        self.previews.classes(add="static-download-single" if len(selected) == 1 else "",
+                              remove="static-download-single" if len(selected) != 1 else "")
+
+    def open(self) -> None:
+        self.dialog.open()
+        self.schedule_preview()
+
+    def stop(self) -> None:
+        self.closed = True
+        self.revision += 1
+        if self.timer is not None:
+            self.timer.cancel()
+        self.cache.clear()
+        for image in self.images.values():
+            image.set_source("")
+
+    def refresh(self) -> None:
+        self.cache.clear()
+        self.schedule_preview()
+
+    def schedule_preview(self) -> None:
+        if self.closed or self.busy:
+            return
+        self.revision += 1
+        if self.timer is not None:
+            self.timer.cancel()
+        self.update_controls()
+        selected = self.selected()
+        self.spinner.set_visibility(bool(selected))
+        self.status.set_text("Updating preview..." if selected else "Choose at least one image")
+        for kind in selected:
+            self.images[kind].style("opacity:0.4")
+        if selected:
+            with self.dialog:
+                self.timer = ui.timer(0.25, self.update_preview, once=True, immediate=False)
+
+    async def diffraction_preview(self, dpi: float, transparent: bool) -> bytes:
+        state = self.controller.state
+        selector = f".combo-panel-{state.combo_id}" if self.combo else f".comparison-panel-{state.panel_id}"
+        # Plotly.toImage accepts a figure copy, so transparency never relayouts the live plot.
+        data_url = await ui.run_javascript(f"""
+            const root = document.querySelector({json.dumps(selector)});
+            const plot = root?.querySelector('.diffraction-plot.js-plotly-plot') || root?.querySelector('.diffraction-plot .js-plotly-plot');
+            if (!plot || !window.Plotly) throw new Error('Diffraction view is not ready');
+            const rect = plot.getBoundingClientRect();
+            const figure = JSON.parse(JSON.stringify({{data: plot.data, layout: plot.layout}}));
+            if ({json.dumps(transparent)}) {{
+                figure.layout.paper_bgcolor = 'rgba(0,0,0,0)';
+                figure.layout.plot_bgcolor = 'rgba(0,0,0,0)';
+            }}
+            return await window.Plotly.toImage(figure, {{format: 'png',
+                width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)),
+                scale: Math.min(1, 690 / Math.max(rect.width, rect.height)) * Math.min(1, {dpi} / 150)}});
+        """, timeout=30)
+        return decode_png_data_url(data_url)
+
+    async def update_preview(self) -> None:
+        revision = self.revision
+        async with self.preview_lock:
+            if self.closed or self.busy or revision != self.revision:
+                return
+            dpi = min(max(float(self.dpi.value or 300), 72), 150)
+            transparent = bool(self.transparent.value)
+            selected = self.selected()
+            failed = False
+            for kind in selected:
+                key = (dpi, transparent)
+                if kind == "crystal":
+                    key += (self.renderer.value, self.shading.value, self.occupancy.value)
+                try:
+                    cached = self.cache.get(kind)
+                    if cached is not None and cached[0] == key:
+                        png = cached[1]
+                    elif kind == "crystal":
+                        png = await self.controller.render_crystal_image(*key)
+                    else:
+                        png = await self.diffraction_preview(*key)
+                    if self.closed or self.busy or revision != self.revision:
+                        return
+                    self.cache[kind] = (key, png)
+                    self.images[kind].set_source("data:image/png;base64," + base64.b64encode(png).decode("ascii"))
+                    self.images[kind].style("opacity:1")
+                    self.errors[kind].set_visibility(False)
+                except Exception as exc:
+                    if self.closed or self.busy or revision != self.revision:
+                        return
+                    failed = True
+                    self.images[kind].set_source("")
+                    self.errors[kind].set_text(f"Preview unavailable: {exc}")
+                    self.errors[kind].set_visibility(True)
+            self.spinner.set_visibility(False)
+            self.status.set_text("Preview incomplete" if failed else "Ready")
+
+    async def open_animation(self) -> None:
+        self.stop()
+        async with self.preview_lock:
+            await self.controller.open_animation_dialog()
+
+    async def download(self) -> None:
+        if self.busy or not self.selected():
+            return
+        self.busy = True
+        self.revision += 1
+        if self.timer is not None:
+            self.timer.cancel()
+        for control in self.controls:
+            control.disable()
+        self.dialog.props("persistent")
+        self.status.set_text("Exporting...")
+        self.spinner.set_visibility(True)
+        try:
+            # Let an in-flight preview release its WebGL context before exporting at full DPI.
+            async with self.preview_lock:
+                options = dict(dpi=float(self.dpi.value or 300), transparent_background=bool(self.transparent.value),
+                               include_suffixes=bool(self.suffix.value))
+                if self.combo:
+                    await self.controller.download_diffraction_image(filename_base=self.diffraction_filename.value, **options)
+                else:
+                    await self.controller.download_images(
+                        bool(self.crystal.value), bool(self.diffraction.value),
+                        crystal_filename_base=self.crystal_filename.value, diffraction_filename_base=self.diffraction_filename.value,
+                        crystal_renderer=self.renderer.value, atom_shading=self.shading.value,
+                        occupancy_colors=self.occupancy.value, **options)
+        finally:
+            self.busy = False
+            self.dialog.props(remove="persistent")
+            for control in self.controls:
+                control.enable()
+            self.update_controls()
+            if self.dialog.value:
+                self.schedule_preview()
+
+
+class DisplaySettingsDialog:
+    """Preview private panel edits; commit them only on confirmation."""
+
+    def __init__(self, simulator: SimulatorApp, panel_id: int | None) -> None:
+        self.simulator, self.panel_id = simulator, panel_id
+        self.draft = simulator.display_settings_draft(panel_id)
+        if panel_id is not None:
+            # Start with local edits; opening the dialog does not change live inheritance.
+            self.draft.inherited.clear()
+        self.loading = True
+        self.busy = False
+        self.preview: PanelController | None = None
+        self.preview_timer = None
+        self.preview_ready = False
+        self.preview_closed = False
+        self.preview_camera = None
+        self.preview_magnified = None
+        self.preview_panes: dict[str, Any] = {}
+        self.preview_magnify_buttons: dict[str, Any] = {}
+        self.inherit_controls: dict[str, Any] = {}
+        self.section_controls: dict[str, list[Any]] = {section: [] for section in DISPLAY_SETTING_SECTIONS}
+        self.palette_containers: dict[str, Any] = {}
+        self.palette_widgets: dict[str, list[tuple[Any, bool]]] = {"vector": [], "plane": []}
+        self.palette_inputs: dict[str, list[Any]] = {"vector": [], "plane": []}
+        self.action_buttons = []
+        self.crystal_default = None
+        self.element_color_inputs: dict[str, Any] = {}
+        self.element_color_rows: dict[str, Any] = {}
+        self.element_reset_dialog = None
+        self.action_confirm_dialog = None
+        self.overlay_inputs: dict[str, dict[str, Any]] = {}
+        self.marker_editor = None
+        self.scale_visibility_inputs: dict[str, Any] = {}
+        state = simulator.panel_state_by_id(panel_id) if panel_id is not None else None
+        self.dialog = ui.dialog()
+        with self.dialog, ui.card().classes("palette-card" + (" panel-settings-card" if state else "")):
+            with ui.row().classes("items-center justify-between full-width"):
+                title = f"Panel {panel_id} settings - {state.crystal_name}" if state else "Global display settings"
+                ui.label(title).classes("text-h6 flex-1 min-w-0 break-words")
+                ui.button(icon="close", on_click=self.dialog.close).props("flat round dense").tooltip("Close")
+            with ui.element("div").classes("display-settings-body" + (" panel-settings-body" if state else "")):
+                if state is not None:
+                    self.build_preview()
+                with ui.column().classes("display-settings-controls"):
+                    self.build_controls(state)
+            with ui.row().classes("full-width justify-end display-settings-actions"):
+                if state is not None:
+                    self.action_buttons.append(ui.button("Follow global settings", icon="public", on_click=lambda: self.request_action("global")).props("outline dense"))
+                self.action_buttons.append(ui.button("Reset display", icon="restart_alt", on_click=lambda: self.request_action("reset")).props("outline dense").tooltip("Restore built-in display settings; keep element colors"))
+                self.action_buttons.append(ui.button("Apply/Close", icon="check", on_click=lambda: self.run_action("apply")).props("unelevated dense"))
+        self.load(self.draft)
+        for controls in self.section_controls.values():
+            for control in controls:
+                if hasattr(control, "on_value_change"):
+                    control.on_value_change(self.schedule_preview)
+        self.dialog.on("show", self.initialize_preview)
+        self.dialog.on("hide", self.dispose_preview)
+
+    def build_controls(self, state: PanelState | None) -> None:
+        simulator = self.simulator
+        with ui.expansion("Crystal frame", icon="crop_square").classes("full-width"):
+            self.inheritance_control("frame", "Use global frame settings")
+            self.frame_visible = ui.checkbox("Crystal frame", on_change=lambda _: self.refresh_enabled())
+            with ui.grid(columns=2).classes("full-width gap-3 panel-frame-settings"):
+                self.frame_mode = ui.select({"original": "Original cell", "all": "Every cell"}, label="Frame boundaries", value="original").props("outlined dense")
+                self.frame_width = ui.number("Frame thickness", value=1, min=0.25, max=MAX_FRAME_THICKNESS, step=0.25, suffix="x").props("outlined dense")
+                self.frame_color = ui.color_input("Frame color", preview=True).props("outlined dense")
+                self.frame_opacity = self.opacity_control("Frame opacity", self.draft.display.frame_opacity)
+            self.section_controls["frame"] = [self.frame_visible, self.frame_mode, self.frame_width, self.frame_color, self.frame_opacity]
+        with ui.expansion("Atom sizes", icon="bubble_chart").classes("full-width"):
+            self.inheritance_control("atoms", "Use global atom settings")
+            self.occupancy_colors = ui.select(OCCUPANCY_COLOR_OPTIONS, value=self.draft.display.occupancy_colors, label="Site occupancy colors").props("outlined dense").classes("full-width")
+            self.occupancy_colors.tooltip("Viewer-facing sectors represent site occupancy; gray is unoccupied.")
+            self.atom_scale = ui.number("All atom sizes", value=100, min=10, max=300, step=10, suffix="%").props("outlined dense").style("width: 240px; max-width: 100%; margin-bottom: 12px")
+            self.atom_scale.tooltip("Radius relative to the automatic atom size; element-specific factors multiply this value.")
+            elements = ({site.element for site in simulator.model_for(state.crystal_name).expanded_sites}
+                        if state else set(ELEMENTS) | set(self.draft.display.element_scales))
+            self.element_inputs = {}
+            with ui.grid(columns=3).classes("full-width gap-3 panel-element-sizes").style("max-height: 260px; overflow-y: auto"):
+                for element in sorted(elements):
+                    self.element_inputs[element] = ui.number(element, value=100, min=10, max=300, step=10, suffix="%").props("outlined dense")
+            self.section_controls["atoms"] = [self.atom_scale, self.occupancy_colors, *self.element_inputs.values()]
+        with ui.expansion("Displayed cells", icon="grid_view").classes("full-width"):
+            self.inheritance_control("cells", "Use global displayed cells")
+            with ui.grid(columns=3).classes("full-width gap-3 panel-cell-counts"):
+                self.cells = [ui.number(f"Cells along {axis}", value=1, min=-8, max=8, step=1).props("outlined dense")
+                              for axis in ("a (x)", "b (y)", "c (z)")]
+                for control in self.cells:
+                    control.tooltip("Signed total cell count, including the original: 2 spans 0 to 2; -2 spans -1 to 1. Zero is invalid.")
+            self.extend = ui.checkbox("Extend planes and vectors")
+            self.extend.tooltip("Clip planes and extend vectors to the displayed block. Otherwise annotations stay inside the original cell.")
+            self.section_controls["cells"] = [*self.cells, self.extend]
+        with ui.expansion("Vector/Plane colors", icon="palette").classes("full-width"):
+            self.inheritance_control("colors", "Use global colors")
+            if state is None:
+                self.crystal_default = ui.checkbox("Crystal default diffraction color", on_change=lambda _: self.refresh_enabled())
+                self.section_controls["colors"].append(self.crystal_default)
+            with ui.row().classes("items-center full-width gap-2"):
+                self.diffraction_color = ui.color_input("Diffraction pattern", preview=True).props("outlined dense").classes("panel-diffraction-color")
+                self.section_controls["colors"].append(self.diffraction_color)
+                if state is not None:
+                    reset_color = ui.button(icon="restart_alt", on_click=self.reset_diffraction_color).props("flat round dense").classes("panel-diffraction-reset").tooltip("Reset diffraction color")
+                    self.section_controls["colors"].append(reset_color)
+            with ui.row().classes("palette-columns"):
+                self.annotation_inputs = {}
+                for kind, label in (("vector", "Vectors"), ("plane", "Planes")):
+                    with ui.column().classes(f"palette-column palette-{kind}-column"):
+                        with ui.row().classes("items-center justify-between full-width"):
+                            ui.label(label).classes("palette-title")
+                            with ui.row().classes("palette-actions"):
+                                reset = ui.button(icon="restart_alt", on_click=lambda k=kind: self.edit_palette(k, "reset")).props("flat round dense").tooltip(f"Reset {kind} defaults")
+                                add = ui.button("Add", icon="add", on_click=lambda k=kind: self.edit_palette(k, "add")).props("outline dense")
+                                self.section_controls["colors"].extend([reset, add])
+                        for attribute, title in (
+                            (("vector_opacity", "Vector opacity"), ("reciprocal_opacity", "Reciprocal vector opacity"))
+                            if kind == "vector" else
+                            (("plane_opacity", "Plane fill opacity"), ("plane_edge_opacity", "Plane edge opacity"))
+                        ):
+                            control = self.opacity_control(title, getattr(self.draft.display, attribute)).classes("full-width")
+                            self.annotation_inputs[attribute] = control
+                            self.section_controls["colors"].append(control)
+                        text_size = ui.number(f"{kind.capitalize()} text size", value=100,
+                            min=25, max=300, step=10, suffix="%").props("outlined dense").classes("full-width")
+                        text_size.tooltip("Size relative to the original annotation text.")
+                        text_opacity = self.opacity_control(f"{kind.capitalize()} text opacity",
+                            getattr(self.draft.display, f"{kind}_label_opacity")).classes("full-width")
+                        self.annotation_inputs[f"{kind}_label_scale"] = text_size
+                        self.annotation_inputs[f"{kind}_label_opacity"] = text_opacity
+                        self.section_controls["colors"].extend([text_size, text_opacity])
+                        self.palette_containers[kind] = ui.element("div").classes("palette-list")
+        with ui.expansion("Annotations", icon="text_fields").classes("full-width"):
+            self.inheritance_control("annotations", "Use global annotation settings")
+            with ui.row().classes("items-center full-width gap-2"):
+                for name, title in (("real_scale_visible", "Real-space scale bar"),
+                                    ("reciprocal_scale_visible", "Reciprocal-space scale bar")):
+                    self.scale_visibility_inputs[name] = ui.checkbox(title)
+            for name, title in (("real_scale", "Real-space scale bar"), ("reciprocal_scale", "Reciprocal-space scale bar"),
+                                ("zone", "Current zone"), ("indices", "Spot indices")):
+                ui.label(title).classes("text-subtitle2 mt-3")
+                with ui.grid(columns=2).classes("full-width gap-3 annotation-style-grid"):
+                    positions = ({key: key.replace("_", " ").capitalize() for key in SPOT_LABEL_DIRECTIONS}
+                                 if name == "indices" else ANNOTATION_CORNERS)
+                    self.overlay_inputs[name] = {
+                        "font_size": ui.number(f"{title} font size", min=6, max=40, step=1, suffix="px").props("outlined dense"),
+                        "color": ui.color_input(f"{title} color", preview=True).props("outlined dense"),
+                        "position": ui.select(positions, label=f"{title} position").props("outlined dense"),
+                        "opacity": self.opacity_control(f"{title} opacity", 1),
+                    }
+            self.index_offset = ui.number("Spot label gap", min=-20, max=40, step=1, suffix="px").props("outlined dense").classes("full-width mt-3")
+            self.index_offset.tooltip("Negative values move text closer and may overlap the spot; positions stop at the spot center.")
+            reset = ui.button("Reset annotations", icon="restart_alt", on_click=self.reset_annotations).props("outline dense")
+            self.section_controls["annotations"] = [*self.scale_visibility_inputs.values(), self.index_offset, reset,
+                *(control for controls in self.overlay_inputs.values() for control in controls.values())]
+        if state is None:
+            with ui.expansion("Element colors", icon="science").classes("full-width"):
+                with ui.row().classes("items-center full-width gap-2 element-color-tools"):
+                    self.element_search = ui.input("Find element", on_change=self.filter_element_colors).props("outlined dense clearable").classes("flex-1 min-w-0")
+                    ui.button("Reset element colors", icon="restart_alt", on_click=self.request_reset_element_colors).props("outline dense")
+                with ui.grid(columns=3).classes("full-width gap-3 element-color-grid").style("max-height: 300px; overflow-y: auto"):
+                    for element in ELEMENTS:
+                        with ui.row().classes("items-center no-wrap gap-1 min-w-0") as row:
+                            control = ui.color_input(element, preview=True,
+                                on_change=lambda event, element=element: self.edit_element_color(element, event.value)
+                            ).props("outlined dense").classes("flex-1 min-w-0")
+                            ui.button(icon="restart_alt", on_click=lambda element=element: self.reset_element_colors(element)).props("flat round dense").tooltip(f"Reset {element} color")
+                        self.element_color_inputs[element] = control
+                        self.element_color_rows[element] = row
+        if state is not None:
+            with ui.expansion("Crystal markers", icon="edit_location_alt").classes("full-width"):
+                model = make_panel_display_model(simulator.model_for(state.crystal_name), state.display_settings,
+                                                 simulator.element_colors)
+                self.marker_editor = MarkerEditor(model, self.schedule_preview, simulator.show_crystal_annotations,
+                                                  self.marker_pick_changed)
+
+    @staticmethod
+    def opacity_control(label: str, value: float) -> Any:
+        return ui.number(label, value=100 * value, min=0, max=100, step=5, suffix="%").props("outlined dense").tooltip("0% is invisible; 100% is opaque.")
+
+    def load_annotations(self, settings: PanelAnnotations) -> None:
+        for name, control in self.scale_visibility_inputs.items():
+            control.value = getattr(settings, name)
+        for name, controls in self.overlay_inputs.items():
+            for field, control in controls.items():
+                value = getattr(getattr(settings, name), field)
+                control.value = value * 100 if field == "opacity" else value
+        if self.overlay_inputs:
+            self.index_offset.value = settings.index_offset
+
+    def read_annotations(self) -> PanelAnnotations:
+        settings = copy.deepcopy(self.draft.display.annotations)
+        for name, control in self.scale_visibility_inputs.items():
+            setattr(settings, name, bool(control.value))
+        for name, controls in self.overlay_inputs.items():
+            for field, control in controls.items():
+                value = float(control.value) if field in {"opacity", "font_size"} else str(control.value)
+                setattr(getattr(settings, name), field, value / 100 if field == "opacity" else value)
+        if self.overlay_inputs:
+            settings.index_offset = float(self.index_offset.value)
+        return settings
+
+    def reset_annotations(self) -> None:
+        if "annotations" in self.draft.inherited:
+            return
+        self.load_annotations(PanelAnnotations())
+        self.schedule_preview()
+
+    def filter_element_colors(self) -> None:
+        query = str(self.element_search.value or "").strip().lower()
+        for element, row in self.element_color_rows.items():
+            row.visible = query in element.lower()
+
+    def edit_element_color(self, element: str, value: str) -> None:
+        if not self.loading:
+            self.draft.element_colors[element] = value
+
+    def reset_element_colors(self, element: str | None = None) -> None:
+        self.loading = True
+        if element is None:
+            self.draft.element_colors.clear()
+        else:
+            self.draft.element_colors.pop(element, None)
+        for symbol in ([element] if element is not None else self.element_color_inputs):
+            self.element_color_inputs[symbol].value = color_for_element(symbol)
+        self.loading = False
+
+    def request_reset_element_colors(self) -> None:
+        if self.element_reset_dialog is not None:
+            return
+        customized = any(normalized_hex_color(value) != normalized_hex_color(color_for_element(element))
+                         for element, value in self.draft.element_colors.items())
+        if not customized:
+            self.reset_element_colors()
+            return
+        dialog = self.element_reset_dialog = ui.dialog().props("persistent")
+
+        def finish(confirmed: bool) -> None:
+            if self.element_reset_dialog is not dialog:
+                return
+            self.element_reset_dialog = None
+            if confirmed:
+                self.reset_element_colors()
+            dialog.close()
+
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("element-color-reset-card").style("width: 440px; max-width: calc(100vw - 40px)"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("warning", color="warning")
+                ui.label("Reset element colors?").classes("text-h6")
+            ui.label("You have customized element colors. Reset all of them? These edits will be discarded when you apply the settings.")
+            with ui.row().classes("justify-end full-width gap-2"):
+                ui.button("Cancel", on_click=lambda: finish(False)).props("flat")
+                ui.button("Reset element colors", icon="restart_alt", on_click=lambda: finish(True)).props("unelevated")
+        dialog.open()
+
+    def build_preview(self) -> None:
+        from CrysDiS_animation import export_snapshot
+
+        source = self.simulator.controller_by_panel_id(self.panel_id)
+        if source is None:
+            return
+        self.preview = export_snapshot(sys.modules[__name__], source, self.simulator.current_simulation_method())
+        preview = self.preview
+        # Reuse the frozen renderer, never a controller registered with the live app.
+        preview.simulator.auto_sync_view = lambda: False
+        preview.simulator.diffraction_color_for_state = lambda state: state.diffraction_color
+        preview.simulator.diffraction_spot_cache = self.simulator.diffraction_spot_cache.copy()
+        self.preview_initial_cells = preview.state.display_settings.cells
+        self.preview_initial_limit = preview.current_model.limit
+        self.preview_color = None
+        with ui.element("div").classes("display-settings-preview full-width") as self.preview_container:
+            with ui.element("div").classes("visual-stack") as self.preview_stack:
+                with ui.element("div").classes("scene-wrap settings-preview-pane settings-crystal-pane") as crystal_pane:
+                    self.preview_panes["crystal"] = crystal_pane
+                    preview.scene = CrystalScene(
+                        width=350, height=260, grid=False, background_color="#0B0F14",
+                        camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
+                        on_click=self.inspect_preview_atom, click_events=["click"],
+                    ).classes("real-scene settings-preview-scene")
+                    preview.build_atom_inspector()
+                    self.build_preview_magnify_button("crystal")
+                    # The dialog unmounts its canvas before its server-side hide callback.
+                    preview.scene.on("init", js_handler=f"""() => {{
+                        const scene = getElement({preview.scene.id});
+                        if (!scene?.renderer) return;
+                        const observer = new MutationObserver(() => {{
+                            if (scene.$el.isConnected) return;
+                            observer.disconnect();
+                            scene.camera_tween?.stop();
+                            scene.controls.dispose();
+                            scene.drag_controls.dispose();
+                            scene.scene.traverse(o => {{
+                                o.geometry?.dispose();
+                                for (const m of (Array.isArray(o.material) ? o.material : [o.material])) {{
+                                    m?.map?.dispose(); m?.dispose();
+                                }}
+                            }});
+                            scene.renderer.render = scene.controls.update = () => {{}};
+                            scene.text_renderer.render = scene.text3d_renderer.render = () => {{}};
+                            scene.renderer.dispose();
+                            scene.renderer.forceContextLoss();
+                            scene.scene.clear();
+                            scene.objects.clear();
+                            delete window['scene_c{preview.scene.id}'];
+                        }});
+                        observer.observe(document.body, {{childList: true, subtree: true}});
+                    }}""")
+                    with ui.element("div").classes("real-scale-bar") as preview.scale_bar_container:
+                        preview.scale_bar_line = ui.element("div").classes("real-scale-line")
+                        preview.scale_bar_label = ui.label("").classes("real-scale-label")
+                with ui.element("div").classes("settings-preview-pane settings-diffraction-pane") as diffraction_pane:
+                    self.preview_panes["diffraction"] = diffraction_pane
+                    preview.diffraction = ui.plotly(empty_diffraction_figure()).classes("diffraction-plot settings-preview-diffraction")
+                    self.build_preview_magnify_button("diffraction")
+            self.preview_error = ui.label("Loading preview...").classes("text-caption text-grey-5 full-width break-words")
+
+    def marker_pick_changed(self, active: bool) -> None:
+        if self.preview is None or self.preview_closed:
+            return
+        self.preview.scene.classes(add="marker-picking" if active else "", remove="" if active else "marker-picking")
+        if active:
+            self.preview.hide_atom_inspector()
+            if self.preview_magnified == "diffraction":
+                self.toggle_preview_magnified("crystal")
+
+    def inspect_preview_atom(self, event) -> None:
+        if self.preview is None or self.preview_closed:
+            return
+        atom = self.preview.atom_at_click(event)
+        if atom is not None and self.marker_editor is not None and self.marker_editor.pick_from_scene(atom, self.preview.current_model):
+            self.preview.hide_atom_inspector()
+            return
+        self.preview.inspect_atom(event)
+
+    def build_preview_magnify_button(self, kind: str) -> None:
+        self.preview_magnify_buttons[kind] = ui.button(icon="open_in_full",
+            on_click=lambda: self.toggle_preview_magnified(kind)).props(
+                f"flat round dense aria-label='Magnify {kind} preview'"
+            ).classes(f"preview-magnify preview-magnify-{kind}").tooltip(f"Magnify/shrink {kind} preview")
+
+    def toggle_preview_magnified(self, kind: str) -> None:
+        if self.preview_closed or kind not in self.preview_panes:
+            return
+        self.preview_magnified = None if self.preview_magnified == kind else kind
+        if self.preview_magnified is None:
+            self.preview_stack.classes(remove="preview-expanded")
+        else:
+            self.preview_stack.classes(add="preview-expanded")
+        for name, pane in self.preview_panes.items():
+            pane.set_visibility(self.preview_magnified in (None, name))
+            expanded = self.preview_magnified == name
+            self.preview_magnify_buttons[name].props(
+                f"icon={'close_fullscreen' if expanded else 'open_in_full'} "
+                f"aria-label='{'Restore split previews' if expanded else f'Magnify {name} preview'}'")
+        if self.preview is not None and core.is_loop_running():
+            ui.run_javascript(f"""
+                const resize = () => {{
+                    const scene = getElement({self.preview.scene.id});
+                    if (scene?.$el.clientHeight && scene.$el.clientWidth) scene.resize();
+                    const plot = getElement({self.preview.diffraction.id});
+                    if (plot?.$el.clientHeight && plot.$el.clientWidth) plot.Plotly?.Plots.resize(plot.$el);
+                }};
+                requestAnimationFrame(() => {{resize(); setTimeout(resize, 120);}});
+            """)
+
+    async def initialize_preview(self) -> None:
+        if self.preview is None or self.preview_closed:
+            return
+        preview = self.preview
+        source = self.simulator.controller_by_panel_id(self.panel_id)
+        try:
+            await asyncio.wait_for(preview.scene.initialized(), timeout=5)
+            if self.preview_closed:
+                return
+            if source is not None and source.scene is not None:
+                self.preview_camera = await ui.run_javascript(f"""
+                    const source = getElement({source.scene.id});
+                    if (!source?.camera) return null;
+                    return {{position: source.camera.position.toArray(), up: source.camera.up.toArray(),
+                             target: source.controls.target.toArray(), zoom: source.camera.zoom}};
+                """, timeout=3)
+            if self.preview_closed:
+                return
+            self.preview_ready = True
+            await self.update_preview()
+            with self.dialog:
+                preview.scale_timer = ui.timer(0.7, preview.update_scene_scale_bar)
+        except (TimeoutError, RuntimeError) as exc:
+            if not self.preview_closed:
+                self.preview_error.set_text(f"Preview unavailable: {exc}")
+
+    def schedule_preview(self) -> None:
+        if self.loading or not self.preview_ready or self.preview_closed:
+            return
+        if self.preview_timer is not None:
+            self.preview_timer.cancel()
+        with self.dialog:
+            self.preview_timer = ui.timer(0.15, self.update_preview, once=True)
+
+    async def update_preview(self) -> None:
+        if self.preview is None or not self.preview_ready or self.preview_closed:
+            return
+        preview = self.preview
+        markers, marker_errors = self.marker_editor.read_preview() if self.marker_editor is not None else (None, [])
+        hidden_markers = self.marker_editor is not None and len(markers) < len(self.marker_editor.rows)
+        notice = ""
+        try:
+            draft = self.simulator.validated_display_settings_draft(self.panel_id, self.read(preview_markers=markers))
+        except (ValueError, TypeError, OverflowError) as exc:
+            if not hidden_markers:
+                self.preview_error.set_text(f"Preview unchanged: {exc}")
+                self.preview_error.visible = True
+                return
+            # Even when another field is unfinished, do not leave an invalid marker on screen.
+            draft = DisplaySettingsDraft(
+                display=replace(preview.state.display_settings, markers=markers),
+                vector_colors=preview.simulator.vector_palette(), plane_colors=preview.simulator.plane_palette(),
+                diffraction_color=preview.state.diffraction_color)
+            notice = f"Other preview settings unchanged: {exc} "
+        try:
+            model = preview.display_model(settings=draft.display)
+        except (ValueError, TypeError, OverflowError) as exc:
+            self.preview_error.set_text(f"Preview unchanged: {exc}")
+            self.preview_error.visible = True
+            return
+        initial_view = preview.scene_signature is None
+        previous_limit = preview.current_model.limit
+        refit = (initial_view or draft.display.cells != preview.state.display_settings.cells
+                 or model.limit != preview.current_model.limit)
+        annotations_changed = draft.display.annotations != preview.state.display_settings.annotations
+        preview.state.display_settings = draft.display
+        preview.state.diffraction_color = draft.diffraction_color or self.simulator.default_diffraction_color_for_crystal(preview.state.crystal_name)
+        for kind in ("vector", "plane"):
+            colors = getattr(draft, f"{kind}_colors").copy()
+            setattr(preview.simulator, f"{kind}_palette", lambda _id=None, colors=colors: colors)
+        preview.redraw_scene(model, update_camera=False)
+        if self.marker_editor is not None:
+            self.marker_editor.update_model(model)
+        preview.apply_scale_bar_visibility()
+        if self.preview_color != preview.state.diffraction_color or annotations_changed:
+            preview.redraw_diffraction()
+            self.preview_color = preview.state.diffraction_color
+        if refit:
+            if initial_view:
+                self.position_preview_camera()
+            else:
+                self.resize_preview_camera(previous_limit, preview.current_model.limit)
+        if marker_errors:
+            notice += f"{len(marker_errors)} invalid marker{'s' if len(marker_errors) != 1 else ''} hidden."
+        self.preview_error.set_text(notice)
+        self.preview_error.visible = bool(notice)
+
+    def resize_preview_camera(self, previous_limit: float, limit: float) -> None:
+        # Keep the user's orbit, pan and zoom when a larger marker/cell block needs more room.
+        ratio = float(limit / max(previous_limit, 1e-9))
+        ui.run_javascript(f"""
+            const scene = getElement({self.preview.scene.id});
+            if (scene?.camera && scene.controls) {{
+                const target = scene.controls.target;
+                scene.camera.position.sub(target).multiplyScalar({ratio}).add(target);
+                scene.camera.far = Math.max(5000, scene.camera.position.length() + {3 * limit});
+                scene.camera.updateProjectionMatrix();
+                scene.controls.update();
+            }}
+        """)
+
+    def position_preview_camera(self) -> None:
+        preview = self.preview
+        pose = self.preview_camera
+        if pose is None:
+            preview.position_scene_camera(preview.current_model, preview.state.view_vector, preview.state.roll)
+            return
+        position, up, target = (np.array(pose[key], dtype=float) for key in ("position", "up", "target"))
+        zoom = pose["zoom"]
+        if (preview.state.display_settings.cells != self.preview_initial_cells
+                or preview.current_model.limit != self.preview_initial_limit):
+            view = normalize_vector(position)
+            if view is None:
+                view = normalize_vector(preview.state.view_vector)
+            roll = roll_from_view_and_up(view, up, preview.state.roll)
+            _, up = projection_basis(view, roll)
+            position = view * calculate_camera_distance(preview.current_model.limit * 1.08, REAL_SCENE_FOV_DEGREES)
+            target, zoom = np.zeros(3), 1.0
+        preview.scene.move_camera(
+            x=float(position[0]), y=float(position[1]), z=float(position[2]),
+            look_at_x=float(target[0]), look_at_y=float(target[1]), look_at_z=float(target[2]),
+            up_x=float(up[0]), up_y=float(up[1]), up_z=float(up[2]), duration=0,
+        )
+        ui.run_javascript(f"""
+            const scene = getElement({preview.scene.id});
+            if (scene?.camera) {{scene.camera.zoom = {float(zoom)}; scene.camera.far = {max(5000, float(np.linalg.norm(position)) + preview.current_model.limit * 3)}; scene.resize();}}
+        """)
+        preview.set_scale_bar_from_distance(float(np.linalg.norm(position)), preview.current_model)
+
+    def dispose_preview(self) -> None:
+        self.preview_closed = True
+        self.preview_ready = False
+        if self.marker_editor is not None:
+            self.marker_editor.cancel_pick()
+        if self.action_confirm_dialog is not None:
+            dialog, self.action_confirm_dialog = self.action_confirm_dialog, None
+            dialog.close()
+        if self.preview_timer is not None:
+            self.preview_timer.cancel()
+        if self.preview is not None:
+            if self.preview.scale_timer is not None:
+                self.preview.scale_timer.cancel(with_current_invocation=True)
+            self.preview_container.clear()
+            self.preview = None
+
+    def inheritance_control(self, section: str, label: str) -> None:
+        if self.panel_id is not None:
+            self.inherit_controls[section] = ui.checkbox(label, on_change=lambda event: self.change_inheritance(section, event.value))
+
+    def change_inheritance(self, section: str, follow: bool) -> None:
+        if self.loading:
+            return
+        if follow:
+            self.draft.inherited.add(section)
+            defaults = self.simulator.display_settings_draft()
+            self.draft.display = inherited_display_settings(self.draft.display, defaults.display, {section})
+            if section == "colors":
+                self.draft.vector_colors, self.draft.plane_colors = defaults.vector_colors, defaults.plane_colors
+                self.draft.diffraction_color = defaults.diffraction_color
+            self.load_section(section)
+        else:
+            self.draft.inherited.discard(section)
+        self.refresh_enabled()
+        self.schedule_preview()
+
+    def load(self, draft: DisplaySettingsDraft) -> None:
+        self.loading = True
+        self.draft = copy.deepcopy(draft)
+        for section, control in self.inherit_controls.items():
+            control.value = section in draft.inherited
+        for section in DISPLAY_SETTING_SECTIONS:
+            self.load_section(section)
+        for element, control in self.element_color_inputs.items():
+            control.value = self.draft.element_colors.get(element, color_for_element(element))
+        if self.marker_editor is not None:
+            self.marker_editor.load(self.draft.display.markers)
+        self.loading = False
+        self.refresh_enabled()
+        self.schedule_preview()
+
+    def load_section(self, section: str) -> None:
+        settings = self.draft.display
+        if section == "frame":
+            self.frame_visible.value = settings.frame_mode != "hidden"
+            self.frame_mode.value = "original" if settings.frame_mode == "hidden" else settings.frame_mode
+            self.frame_width.value, self.frame_color.value = settings.frame_width, settings.frame_color
+            self.frame_opacity.value = 100 * settings.frame_opacity
+        elif section == "atoms":
+            self.atom_scale.value = 100 * settings.atom_scale
+            self.occupancy_colors.value = settings.occupancy_colors
+            for element, control in self.element_inputs.items():
+                control.value = 100 * settings.element_scales.get(element, 1.0)
+        elif section == "cells":
+            for value, control in zip(settings.cells, self.cells):
+                control.value = value
+            self.extend.value = settings.extend_annotations
+        elif section == "annotations":
+            self.load_annotations(settings.annotations)
+        else:
+            for attribute, control in self.annotation_inputs.items():
+                control.value = 100 * getattr(settings, attribute)
+            if self.crystal_default is not None:
+                self.crystal_default.value = self.draft.diffraction_color is None
+            state = self.simulator.panel_state_by_id(self.panel_id) if self.panel_id is not None else None
+            fallback = self.simulator.default_diffraction_color_for_crystal(state.crystal_name if state else "FCC")
+            self.diffraction_color.value = self.draft.diffraction_color or fallback
+            self.refresh_palette("vector")
+            self.refresh_palette("plane")
+
+    def refresh_enabled(self) -> None:
+        if self.loading:
+            return
+        for section, controls in self.section_controls.items():
+            for control in controls:
+                control.set_enabled(section not in self.draft.inherited)
+        self.frame_mode.set_enabled("frame" not in self.draft.inherited and self.frame_visible.value)
+        use_default = self.crystal_default is not None and self.crystal_default.value
+        self.diffraction_color.set_enabled("colors" not in self.draft.inherited and not use_default)
+        for widgets in self.palette_widgets.values():
+            for widget, allowed in widgets:
+                widget.set_enabled(allowed and "colors" not in self.draft.inherited)
+
+    def reset_diffraction_color(self) -> None:
+        state = self.simulator.panel_state_by_id(self.panel_id)
+        if state is None or "colors" in self.draft.inherited:
+            return
+        self.draft.diffraction_color = None
+        self.diffraction_color.value = self.simulator.default_diffraction_color_for_crystal(state.crystal_name)
+
+    def refresh_palette(self, kind: str) -> None:
+        colors = getattr(self.draft, f"{kind}_colors")
+        container = self.palette_containers[kind]
+        container.clear()
+        self.palette_inputs[kind], self.palette_widgets[kind] = [], []
+        with container:
+            for index, color in enumerate(colors):
+                with ui.element("div").classes("palette-row"):
+                    ui.label(str(index + 1)).classes("palette-index")
+                    control = ui.color_input(value=color, preview=True).props("outlined dense").classes("palette-color-input")
+                    control.on_value_change(self.schedule_preview)
+                    self.palette_inputs[kind].append(control)
+                    self.palette_widgets[kind].append((control, True))
+                    for action, icon, tooltip, allowed in (
+                        ("up", "arrow_upward", "Move up", index > 0),
+                        ("down", "arrow_downward", "Move down", index < len(colors) - 1),
+                        ("delete", "delete", "Remove color", len(colors) > 1),
+                    ):
+                        button = ui.button(icon=icon, on_click=lambda k=kind, a=action, i=index: self.edit_palette(k, a, i)).props("flat round dense" + (" color=negative" if action == "delete" else "")).tooltip(tooltip)
+                        self.palette_widgets[kind].append((button, allowed))
+        self.refresh_enabled()
+
+    def edit_palette(self, kind: str, action: str, index: int = 0) -> None:
+        if "colors" in self.draft.inherited:
+            return
+        colors = [str(control.value) for control in self.palette_inputs[kind]]
+        defaults = self.simulator.palette_default_values(kind)
+        if action == "reset":
+            colors = defaults.copy()
+            display_defaults = PanelDisplaySettings()
+            attributes = (("vector_opacity", "reciprocal_opacity") if kind == "vector"
+                          else ("plane_opacity", "plane_edge_opacity"))
+            attributes += (f"{kind}_label_scale", f"{kind}_label_opacity")
+            for attribute in attributes:
+                value = getattr(display_defaults, attribute)
+                setattr(self.draft.display, attribute, value)
+                self.annotation_inputs[attribute].value = 100 * value
+        elif action == "add":
+            colors.append(defaults[len(colors) % len(defaults)])
+        elif action == "delete" and len(colors) > 1:
+            colors.pop(index)
+        elif action in {"up", "down"}:
+            other = min(max(index + (-1 if action == "up" else 1), 0), len(colors) - 1)
+            colors[index], colors[other] = colors[other], colors[index]
+        setattr(self.draft, f"{kind}_colors", colors)
+        self.refresh_palette(kind)
+        self.schedule_preview()
+
+    def read(self, *, preview_markers: list[CrystalMarker] | None = None) -> DisplaySettingsDraft:
+        draft = copy.deepcopy(self.draft)
+        draft.inherited = {section for section, control in self.inherit_controls.items() if control.value}
+        settings = draft.display
+        if self.marker_editor is not None:
+            settings.markers = self.marker_editor.read() if preview_markers is None else preview_markers
+        if "annotations" not in draft.inherited:
+            settings.annotations = self.read_annotations()
+        if "frame" not in draft.inherited:
+            settings.frame_mode = self.frame_mode.value if self.frame_visible.value else "hidden"
+            settings.frame_color, settings.frame_width = str(self.frame_color.value), float(self.frame_width.value)
+            settings.frame_opacity = float(self.frame_opacity.value) / 100
+        if "atoms" not in draft.inherited:
+            settings.atom_scale = float(self.atom_scale.value) / 100
+            settings.occupancy_colors = self.occupancy_colors.value
+            for element, control in self.element_inputs.items():
+                factor = float(control.value) / 100
+                if factor == 1:
+                    settings.element_scales.pop(element, None)
+                else:
+                    settings.element_scales[element] = factor
+        if "cells" not in draft.inherited:
+            settings.cells = tuple(control.value for control in self.cells)
+            settings.extend_annotations = bool(self.extend.value)
+        if "colors" not in draft.inherited:
+            for attribute, control in self.annotation_inputs.items():
+                setattr(settings, attribute, float(control.value) / 100)
+            use_default = self.crystal_default is not None and self.crystal_default.value
+            if self.crystal_default is None and self.draft.diffraction_color is None:
+                state = self.simulator.panel_state_by_id(self.panel_id)
+                fallback = self.simulator.default_diffraction_color_for_crystal(state.crystal_name)
+                use_default = str(self.diffraction_color.value).upper() == fallback.upper()
+            draft.diffraction_color = None if use_default else str(self.diffraction_color.value)
+            for kind, controls in self.palette_inputs.items():
+                setattr(draft, f"{kind}_colors", [str(control.value) for control in controls])
+        return draft
+
+    def request_action(self, action: str) -> None:
+        if self.busy or self.action_confirm_dialog is not None:
+            return
+        follow = action == "global"
+        title = "Follow global settings?" if follow else "Reset display?"
+        message = ("Replace this panel's display settings with the global defaults and follow future global changes?"
+                   if follow else "Restore the built-in display settings?")
+        message += (" Crystal markers and element colors will be kept." if follow
+                    else " Crystal markers will be removed. Element colors will be kept.")
+        if self.panel_id is not None:
+            message += " The real panel will not change until you click Apply/Close."
+        dialog = self.action_confirm_dialog = ui.dialog().props("persistent")
+
+        async def finish(confirmed: bool) -> None:
+            if self.action_confirm_dialog is not dialog:
+                return
+            self.action_confirm_dialog = None
+            dialog.close()
+            if confirmed and not self.preview_closed:
+                await self.run_action(action)
+
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("display-action-confirm").style("width: 460px; max-width: calc(100vw - 40px)"):
+            with ui.row().classes("items-center gap-2"):
+                ui.icon("warning", color="warning")
+                ui.label(title).classes("text-h6")
+            ui.label(message)
+            with ui.row().classes("justify-end full-width gap-2"):
+                ui.button("Cancel", on_click=lambda: finish(False)).props("flat")
+                ui.button("Follow global settings" if follow else "Reset display",
+                    icon="public" if follow else "restart_alt", on_click=lambda: finish(True)).props("unelevated")
+        dialog.open()
+
+    async def run_action(self, action: str) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        for button in self.action_buttons:
+            button.disable()
+        try:
+            if action == "reset":
+                # Reset live display defaults without committing or discarding pending element edits.
+                colors = self.simulator.element_colors if self.panel_id is None else self.draft.element_colors
+                draft = DisplaySettingsDraft(element_colors=colors.copy())
+            elif action == "global":
+                draft = self.simulator.display_settings_draft()
+                draft.inherited = set(DISPLAY_SETTING_SECTIONS)
+            else:
+                draft = self.read()
+            if action == "global" and self.marker_editor is not None:
+                draft.display.markers = self.marker_editor.read()
+            if self.panel_id is not None and action != "apply":
+                self.load(draft)
+            elif await self.simulator.apply_display_settings_draft(self.panel_id, draft):
+                if action == "apply":
+                    self.dialog.close()
+                    return
+                refreshed = self.simulator.display_settings_draft(self.panel_id)
+                refreshed.element_colors = self.draft.element_colors.copy()
+                self.load(refreshed)
+        except (ValueError, TypeError, OSError) as exc:
+            ui.notify(f"Cannot apply display settings: {exc}", type="negative")
+        finally:
+            self.busy = False
+            for button in self.action_buttons:
+                button.enable()
+
+
 class SimulatorApp:
     def __init__(self) -> None:
+        self.element_colors = load_element_colors()
         self.library = CrystalLibrary()
         self.model_cache: dict[tuple[str, str], CrystalModel] = {}
         self.reciprocal_table_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -4829,15 +6658,13 @@ class SimulatorApp:
         self.dark_mode = None
         self.show_indices_input = None
         self.show_scale_bar_input = None
+        self.scale_bars_enabled = True
         self.show_crystal_annotations_input = None
         self.add_combo_button = None
         self.advanced_dialog = None
         self.intro_dialog = None
         self.palette_dialog = None
-        self.palette_vector_container = None
-        self.palette_plane_container = None
-        self.palette_panel_id: int | None = None
-        self.palette_diffraction_input = None
+        self.display_settings_editor: DisplaySettingsDialog | None = None
         self.cif_dialog = None
         self.crystal_list_dialog = None
         self.crystal_list_container = None
@@ -4848,6 +6675,7 @@ class SimulatorApp:
         self.spot_threshold_input = None
         self.spot_size_scaling_input = None
         self.intensity_compression_input = None
+        self.uniform_spot_brightness_input = None
         self.camera_length_input = None
         self.snap_back_input = None
         self.hex_four_index_input = None
@@ -4855,6 +6683,8 @@ class SimulatorApp:
         self.show_zone_axis_input = None
         self.vector_colors = VECTOR_COLORS.copy()
         self.plane_colors = PLANE_COLORS.copy()
+        self.global_display_settings = PanelDisplaySettings()
+        self.global_diffraction_color: str | None = None
         self.selected_export_dir: Path | None = None
         self.builder: CrystalBuilder | None = None
 
@@ -4976,6 +6806,9 @@ Both builder Save buttons and **Export as CIF** check the sum of occupancies at 
 - `Current zone` prints the current or nearest zone axis on the diffraction panel.
 - Diffraction spot colors default to the panel crystal color and can be reassigned per panel. Combo panels keep each source pattern in its own panel color so overlapping phases can be distinguished.
 - `Advanced` contains simulation method, voltage, thickness, max hkl, camera length, intensity threshold, spot scaling, intensity compression, auto sync, snap-back view, and hexagonal four-index labeling.
+- `Uniform spot brightness` in Advanced gives every surviving reflection the same brightness. The threshold still uses compressed relative intensities, and the `Compression factor` remains adjustable from 10 to 200 in either brightness mode. Switching brightness modes does not change which spots pass the threshold. Spot sizes remain independently intensity-scaled; set `Spot size scaling effect` to zero for equal-sized spots. This setting also applies to combo patterns, image previews, and exports.
+- `Spot intensity threshold` accepts scientific notation down to `1e-10`; its default is `1e-4`. This is a visibility cutoff after compression, not a test of whether a reflection is symmetry-forbidden. The Ewald method's separate raw-intensity cutoff is unchanged. Hover over the Advanced controls for help.
+- Diffraction hover labels show relative intensities below `0.01` in scientific notation, such as `1e-5` or `1.235e-5`. Larger values retain four decimal places; exact zero is shown as `0`. This formatting does not change the calculated intensity.
 
 ### Combo panels
 Use `Add combo panel` to overlay diffraction patterns from multiple ordinary panels. This is useful for multiphase comparisons.
@@ -4993,7 +6826,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         with self.advanced_dialog, ui.card().classes("advanced-card"):
             with ui.row().classes("items-center justify-between full-width"):
                 ui.label("Advanced settings").classes("text-h6")
-                ui.button(icon="close", on_click=self.advanced_dialog.close).props("flat round dense").tooltip("Close")
+                close_button = ui.button(icon="close", on_click=self.advanced_dialog.close).props("flat round dense")
             with ui.column().classes("advanced-body"):
                 with ui.grid(columns=2).classes("advanced-grid"):
                     self.simulation_method_input = ui.select(
@@ -5036,17 +6869,20 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                         "Spot intensity threshold",
                         value=f"{DEFAULT_SPOT_INTENSITY_THRESHOLD:g}",
                         on_change=lambda _: self.refresh_diffractions(),
-                    ).props("outlined dense").tooltip("Accepts decimals or scientific notation, e.g. 1e-4 or 5e-3.")
-                    with ui.element("div").classes("advanced-slider-field"):
+                    ).props("outlined dense")
+                    self.uniform_spot_brightness_input = ui.checkbox(
+                        "Uniform spot brightness", value=False, on_change=lambda _: self.refresh_diffractions(),
+                    ).props("dense").classes("advanced-checkbox").style("grid-column: 1 / -1")
+                    with ui.element("div").classes("advanced-slider-field") as compression_field:
                         ui.label("Compression factor").classes("advanced-slider-label")
                         self.intensity_compression_input = ui.slider(
                             min=10.0,
-                            max=150.0,
+                            max=200.0,
                             step=1.0,
                             value=DEFAULT_INTENSITY_COMPRESSION_FACTOR,
                             on_change=lambda _: self.refresh_diffractions(),
                         ).props("label-always").classes("advanced-slider")
-                    with ui.element("div").classes("advanced-slider-field"):
+                    with ui.element("div").classes("advanced-slider-field") as size_scaling_field:
                         ui.label("Spot size scaling effect").classes("advanced-slider-label")
                         self.spot_size_scaling_input = ui.slider(
                             min=0.0,
@@ -5068,65 +6904,223 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                         "Auto sync crystal/diffraction",
                         value=False,
                     ).props("dense").classes("advanced-checkbox")
-                    ui.button(
-                        "Palette for vectors/planes",
-                        icon="palette",
+                    global_settings_button = ui.button(
+                        "Global display settings",
+                        icon="settings",
                         on_click=lambda: self.open_palette_dialog(),
                     ).props("outline dense").classes("advanced-palette-button")
                 self.log_box = ui.textarea("Log", value="\n".join(self.status_history)).props(
                     "outlined dense readonly rows=5"
                 ).classes("advanced-log")
+            for control, help_text in (
+                (close_button, "Close Advanced settings. Changes take effect immediately."),
+                (self.simulation_method_input,
+                 "Pymatgen calculates the nearest integer zone axis. Ewald sphere uses the continuous viewing direction and specimen thickness."),
+                (self.camera_length_input,
+                 "Camera length in millimeters. A longer camera length spreads diffraction spots farther from the central beam."),
+                (self.voltage_input,
+                 "Electron accelerating voltage in kV. Sets the electron wavelength and diffraction geometry."),
+                (self.thickness_input,
+                 "Specimen thickness in nm. Controls the intensity of off-zone reflections in the Ewald-sphere method; not used by Pymatgen."),
+                (self.max_hkl_input,
+                 "Limits the Miller indices searched for reflections. Higher values include higher-order spots but take longer to calculate."),
+                (self.spot_threshold_input,
+                 "Show spots with compressed relative intensity above this value. Range: 1e-10 to 1; default: 1e-4. Scientific notation is accepted. Applies in both brightness modes."),
+                (self.uniform_spot_brightness_input,
+                 "Draw all spots above the threshold at equal brightness. Compression still affects the cutoff, and spot size scaling remains independent."),
+                (compression_field,
+                 "Enhances weak relative intensities before applying the threshold. Higher values can reveal weaker spots. Range: 10 to 200; also active with uniform brightness."),
+                (size_scaling_field,
+                 "Controls how strongly spot size varies with compressed intensity. Zero gives equal-sized spots; one gives the full size variation. Does not change which spots pass the threshold."),
+                (self.snap_back_input,
+                 "When applying a zone axis, reset its in-plane roll to the standard view. Uncheck to retain the current roll. Any entered rotation is applied after the zone change."),
+                (self.hex_four_index_input,
+                 "Use four-index Miller-Bravais notation for hexagonal zone labels and diffraction indices. Uncheck for three-index labels. The crystal geometry does not change."),
+                (self.auto_sync_input,
+                 "Automatically update diffraction after rotating the crystal with the mouse. When unchecked, click the panel's SYNC button to update it."),
+                (global_settings_button,
+                 "Edit default display settings for new panels and panels following global settings, including frames, atom sizes, colors, and annotations."),
+                (self.log_box, "Recent status messages, input errors, and calculation messages. Read-only."),
+            ):
+                with control:
+                    ui.tooltip(help_text).props('anchor="bottom left" self="top left" :offset="[0, 8]" delay=300').classes("advanced-tooltip")
 
     def open_palette_dialog(self, panel_id: int | None = None) -> None:
         if panel_id is not None and self.panel_state_by_id(panel_id) is None:
             return
         if self.palette_dialog is not None:
+            if self.display_settings_editor is not None:
+                self.display_settings_editor.dispose_preview()
             self.palette_dialog.close()
             self.palette_dialog.delete()
-        self.palette_panel_id = panel_id
-        self.palette_vector_container = None
-        self.palette_plane_container = None
-        self.palette_diffraction_input = None
-        self.build_palette_dialog()
-        self.refresh_palette_dialog()
+        # Event callbacks can run inside the old dialog's slot. Always attach to the page.
+        with ui.context.client.content:
+            self.display_settings_editor = DisplaySettingsDialog(self, panel_id)
+        self.palette_dialog = self.display_settings_editor.dialog
         self.palette_dialog.open()
 
-    def build_palette_dialog(self) -> None:
-        panel_id = self.palette_panel_id
-        state = self.panel_state_by_id(panel_id) if panel_id is not None else None
-        self.palette_dialog = ui.dialog()
-        with self.palette_dialog, ui.card().classes("palette-card"):
-            with ui.row().classes("items-center justify-between full-width"):
-                title = f"Panel {panel_id} colors - {state.crystal_name}" if state is not None else "Palette for vectors/planes"
-                ui.label(title).classes("text-h6")
-                ui.button(icon="close", on_click=self.palette_dialog.close).props("flat round dense").tooltip("Close")
-            if state is not None:
-                with ui.row().classes("items-center full-width"):
-                    self.palette_diffraction_input = ui.color_input(
-                        "Diffraction pattern", value=self.diffraction_color_for_state(state), preview=True,
-                        on_change=lambda event: self.set_panel_diffraction_color(panel_id, event.value),
-                    ).props("outlined dense").classes("panel-diffraction-color")
-                    ui.button(icon="restart_alt", on_click=lambda: self.reset_panel_diffraction_color(panel_id)).props(
-                        "flat round dense"
-                    ).tooltip("Reset diffraction color")
-                ui.separator()
-            with ui.row().classes("palette-columns"):
-                with ui.column().classes("palette-column"):
-                    with ui.row().classes("items-center justify-between full-width"):
-                        ui.label("Vectors").classes("palette-title")
-                        with ui.row().classes("palette-actions"):
-                            ui.button("Use global default" if state is not None else "Set to default",
-                                      on_click=lambda: self.reset_palette("vector", panel_id)).props("flat dense")
-                            ui.button("Add", icon="add", on_click=lambda: self.add_palette_color("vector", panel_id)).props("outline dense")
-                    self.palette_vector_container = ui.element("div").classes("palette-list")
-                with ui.column().classes("palette-column"):
-                    with ui.row().classes("items-center justify-between full-width"):
-                        ui.label("Planes").classes("palette-title")
-                        with ui.row().classes("palette-actions"):
-                            ui.button("Use global default" if state is not None else "Set to default",
-                                      on_click=lambda: self.reset_palette("plane", panel_id)).props("flat dense")
-                            ui.button("Add", icon="add", on_click=lambda: self.add_palette_color("plane", panel_id)).props("outline dense")
-                    self.palette_plane_container = ui.element("div").classes("palette-list")
+    def display_settings_draft(self, panel_id: int | None = None) -> DisplaySettingsDraft:
+        if panel_id is None:
+            return DisplaySettingsDraft(copy.deepcopy(self.global_display_settings), set(),
+                                        self.vector_colors.copy(), self.plane_colors.copy(), self.global_diffraction_color,
+                                        self.element_colors.copy())
+        state = self.panel_state_by_id(panel_id)
+        if state is None:
+            raise ValueError("Panel no longer exists.")
+        color = self.diffraction_color_for_state(state)
+        if not state.diffraction_color_custom and color == self.default_diffraction_color_for_crystal(state.crystal_name):
+            color = None
+        if "colors" in state.global_display_sections:
+            color = self.global_diffraction_color
+        return DisplaySettingsDraft(copy.deepcopy(state.display_settings), state.global_display_sections.copy(),
+                                    self.vector_palette(panel_id).copy(), self.plane_palette(panel_id).copy(), color)
+
+    def validated_display_settings_draft(self, panel_id: int | None, draft: DisplaySettingsDraft) -> DisplaySettingsDraft:
+        draft = copy.deepcopy(draft)
+        if not draft.inherited <= DISPLAY_SETTING_SECTIONS:
+            raise ValueError("Unknown global settings section.")
+
+        def color(value: str) -> str:
+            if not re.fullmatch(r"#?[0-9a-fA-F]{6}", str(value)):
+                raise ValueError("Colors must be six-digit hex colors.")
+            return "#" + str(value).lstrip("#").upper()
+
+        if panel_id is not None:
+            draft.display = inherited_display_settings(draft.display, self.global_display_settings, draft.inherited)
+            if "colors" in draft.inherited:
+                draft.vector_colors, draft.plane_colors = self.vector_colors.copy(), self.plane_colors.copy()
+                draft.diffraction_color = self.global_diffraction_color
+        draft.display.frame_color = color(draft.display.frame_color)
+        for name in ANNOTATION_STYLE_NAMES:
+            style = getattr(draft.display.annotations, name)
+            style.color = color(style.color)
+        validate_display_settings(draft.display)
+        draft.display.cells = tuple(int(n) for n in draft.display.cells)
+        for kind in ("vector", "plane"):
+            values = getattr(draft, f"{kind}_colors")
+            if not values:
+                raise ValueError("Each palette needs at least one color.")
+            setattr(draft, f"{kind}_colors", [color(value) for value in values])
+        if draft.diffraction_color is not None:
+            draft.diffraction_color = color(draft.diffraction_color)
+        if panel_id is None:
+            draft.element_colors = validate_element_colors(draft.element_colors)
+        return draft
+
+    async def apply_display_settings_draft(self, panel_id: int | None, draft: DisplaySettingsDraft) -> bool:
+        if getattr(self, "_applying_display_settings", False):
+            return False
+        if panel_id is not None and self.panel_state_by_id(panel_id) is None:
+            return False
+        self._applying_display_settings = True
+        try:
+            draft = self.validated_display_settings_draft(panel_id, draft)
+            global_display = draft.display if panel_id is None else self.global_display_settings
+            global_vectors = draft.vector_colors if panel_id is None else self.vector_colors
+            global_planes = draft.plane_colors if panel_id is None else self.plane_colors
+            global_diffraction = draft.diffraction_color if panel_id is None else self.global_diffraction_color
+            global_annotations_changed = panel_id is None and draft.display.annotations != self.global_display_settings.annotations
+            scale_bars_enabled = (draft.display.annotations.real_scale_visible or draft.display.annotations.reciprocal_scale_visible
+                                  if panel_id is None else self.show_scale_bars())
+            master_visibility_changed = scale_bars_enabled != self.show_scale_bars()
+            element_colors = draft.element_colors if panel_id is None else self.element_colors
+            changed_elements = {element for element in self.element_colors.keys() | element_colors.keys()
+                                if self.element_colors.get(element) != element_colors.get(element)}
+            changes = []
+            # Validate every affected geometry before committing any shared defaults or panel state.
+            for state in self.panel_states:
+                if panel_id is not None and state.panel_id != panel_id:
+                    continue
+                inherited = draft.inherited.copy() if panel_id is not None else state.global_display_sections.copy()
+                settings = (copy.deepcopy(draft.display) if panel_id is not None else
+                            inherited_display_settings(state.display_settings, global_display, inherited))
+                vectors, planes, diffraction = state.vector_colors, state.plane_colors, state.diffraction_color
+                diffraction_custom = state.diffraction_color_custom
+                if "colors" in inherited:
+                    vectors = planes = None
+                    diffraction = global_diffraction or self.default_diffraction_color_for_crystal(state.crystal_name)
+                    diffraction_custom = False
+                elif panel_id is not None:
+                    vectors, planes = draft.vector_colors.copy(), draft.plane_colors.copy()
+                    diffraction = draft.diffraction_color or self.default_diffraction_color_for_crystal(state.crystal_name)
+                    diffraction_custom = draft.diffraction_color is not None
+                geometry_changed = crystal_display_settings(settings) != crystal_display_settings(state.display_settings)
+                annotations_changed = settings.annotations != state.display_settings.annotations
+                palette_changed = (self.vector_palette(state.panel_id) != (vectors or global_vectors) or
+                                   self.plane_palette(state.panel_id) != (planes or global_planes))
+                diffraction_changed = self.diffraction_color_for_state(state) != diffraction
+                controller = self.controller_by_panel_id(state.panel_id)
+                element_colors_changed = bool(changed_elements) and any(
+                    site.element.strip().capitalize() in changed_elements
+                    for site in self.model_for(state.crystal_name).expanded_sites)
+                model = None
+                if geometry_changed or element_colors_changed:
+                    try:
+                        source = self.model_for(state.crystal_name)
+                        model = (controller.display_model(source, settings=settings, element_colors=element_colors)
+                                 if controller else make_panel_display_model(source, settings, element_colors))
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError(f"Panel {state.panel_id} ({state.crystal_name}): {exc}") from exc
+                changes.append(dict(state=state, settings=settings, inherited=inherited, vectors=vectors, planes=planes,
+                                    diffraction=diffraction, controller=controller, model=model,
+                                    diffraction_custom=diffraction_custom,
+                                    redraw_scene=geometry_changed or palette_changed or element_colors_changed,
+                                    redraw_diffraction=diffraction_changed or annotations_changed or master_visibility_changed,
+                                    annotations_changed=annotations_changed or master_visibility_changed,
+                                    refit=(settings.cells != state.display_settings.cells or
+                                           model is not None and controller is not None and controller.current_model is not None
+                                           and model.limit != controller.current_model.limit), view=None, roll=None))
+            for change in changes:
+                if change["refit"] and change["controller"] is not None:
+                    change["view"], change["roll"] = await change["controller"].live_scene_orientation()
+            if panel_id is None:
+                if changed_elements:
+                    save_element_colors(element_colors)
+                self.element_colors = element_colors.copy()
+                self.global_display_settings = copy.deepcopy(draft.display)
+                self.vector_colors, self.plane_colors = draft.vector_colors.copy(), draft.plane_colors.copy()
+                self.global_diffraction_color = draft.diffraction_color
+                self.scale_bars_enabled = scale_bars_enabled
+                if self.show_scale_bar_input is not None:
+                    # Commit all panel state below before refreshing the master switch's followers.
+                    self._updating_scale_bar_checkbox = True
+                    try:
+                        self.show_scale_bar_input.value = scale_bars_enabled
+                    finally:
+                        self._updating_scale_bar_checkbox = False
+            diffraction_ids = set()
+            for change in changes:
+                state, controller = change["state"], change["controller"]
+                state.display_settings, state.global_display_sections = change["settings"], change["inherited"]
+                state.vector_colors = copy.deepcopy(change["vectors"])
+                state.plane_colors = copy.deepcopy(change["planes"])
+                state.diffraction_color = change["diffraction"]
+                state.diffraction_color_custom = change["diffraction_custom"]
+                if controller is not None and change["annotations_changed"]:
+                    controller.apply_scale_bar_visibility()
+                if controller is not None and change["redraw_scene"]:
+                    controller.redraw_scene(change["model"], update_camera=False)
+                    if change["refit"] and controller.scene is not None:
+                        controller.position_scene_camera(change["model"],
+                            change["view"] if change["view"] is not None else state.view_vector,
+                            change["roll"] if change["roll"] is not None else state.roll)
+                if change["redraw_diffraction"]:
+                    diffraction_ids.add(state.panel_id)
+            if diffraction_ids:
+                self.redraw_panel_diffractions(diffraction_ids)
+            combo_ids = {state.panel_id for state in self.panel_states} if global_annotations_changed or master_visibility_changed else diffraction_ids
+            if combo_ids:
+                self.refresh_combo_panels_for_sources(combo_ids)
+            self.set_status("Global display settings updated" if panel_id is None else f"Panel {panel_id} display settings updated")
+            return True
+        finally:
+            self._applying_display_settings = False
+
+    async def apply_panel_display_settings(self, panel_id: int, settings: PanelDisplaySettings) -> bool:
+        draft = self.display_settings_draft(panel_id)
+        draft.display = settings
+        draft.inherited.difference_update(DISPLAY_SETTING_FIELDS)
+        return await self.apply_display_settings_draft(panel_id, draft)
 
     def palette_values(self, kind: str, panel_id: int | None = None) -> list[str]:
         if panel_id is not None:
@@ -5156,17 +7150,23 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
 
     def diffraction_color_for_state(self, state: PanelState) -> str:
         fallback = self.default_diffraction_color_for_crystal(state.crystal_name)
-        color = self.normalize_palette_color(state.diffraction_color, fallback)
+        global_color = getattr(self, "global_diffraction_color", None)
+        value = global_color if "colors" in state.global_display_sections and global_color is not None else state.diffraction_color
+        color = self.normalize_palette_color(value, fallback)
         state.diffraction_color = color
         return color
 
     def set_panel_crystal(self, state: PanelState, crystal_name: str, force_default_color: bool = False) -> None:
+        """Refresh automatic colors without discarding an explicit panel color."""
         selected_name = str(crystal_name or state.crystal_name)
         if selected_name == CUSTOM_SENTINEL:
             return
         old_default = self.default_diffraction_color_for_crystal(state.crystal_name)
         current_color = self.normalize_palette_color(state.diffraction_color, old_default)
-        if force_default_color or (selected_name != state.crystal_name and current_color == old_default):
+        if "colors" in state.global_display_sections:
+            state.diffraction_color = self.global_diffraction_color or self.default_diffraction_color_for_crystal(selected_name)
+            state.diffraction_color_custom = False
+        elif not state.diffraction_color_custom and (force_default_color or selected_name != state.crystal_name):
             state.diffraction_color = self.default_diffraction_color_for_crystal(selected_name)
         else:
             state.diffraction_color = current_color
@@ -5177,6 +7177,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if state is None:
             return
         color = self.normalize_palette_color(value, self.diffraction_color_for_state(state))
+        state.global_display_sections.discard("colors")
+        state.diffraction_color_custom = True
         if color == state.diffraction_color:
             return
         state.diffraction_color = color
@@ -5188,46 +7190,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if state is None:
             return
         self.set_panel_diffraction_color(panel_id, self.default_diffraction_color_for_crystal(state.crystal_name))
-        if self.palette_panel_id == panel_id and self.palette_diffraction_input is not None:
-            self.palette_diffraction_input.value = state.diffraction_color
+        state.diffraction_color_custom = False
 
-    def refresh_palette_dialog(self) -> None:
-        self.refresh_palette_list("vector", self.palette_vector_container)
-        self.refresh_palette_list("plane", self.palette_plane_container)
 
-    def refresh_palette_list(self, kind: str, container: Any) -> None:
-        if container is None:
-            return
-        panel_id = self.palette_panel_id
-        palette = self.palette_values(kind, panel_id)
-        container.clear()
-        with container:
-            for index, color in enumerate(palette):
-                with ui.element("div").classes("palette-row"):
-                    ui.label(str(index + 1)).classes("palette-index")
-                    ui.color_input(
-                        value=color,
-                        preview=True,
-                        on_change=lambda event, k=kind, i=index, p=panel_id: self.set_palette_color(k, i, event.value, p),
-                    ).props("outlined dense").classes("palette-color-input")
-                    up = ui.button(icon="arrow_upward", on_click=lambda _=None, k=kind, i=index, p=panel_id: self.move_palette_color(k, i, -1, p)).props(
-                        "flat round dense"
-                    ).tooltip("Move up")
-                    down = ui.button(
-                        icon="arrow_downward",
-                        on_click=lambda _=None, k=kind, i=index, p=panel_id: self.move_palette_color(k, i, 1, p),
-                    ).props("flat round dense").tooltip("Move down")
-                    delete = ui.button(icon="delete", on_click=lambda _=None, k=kind, i=index, p=panel_id: self.remove_palette_color(k, i, p)).props(
-                        "flat round dense color=negative"
-                    ).tooltip("Remove color")
-                    if index == 0:
-                        up.disable()
-                    if index == len(palette) - 1:
-                        down.disable()
-                    if len(palette) <= 1:
-                        delete.disable()
-
-    def replace_palette(self, kind: str, colors: list[str] | None, panel_id: int | None, *, refresh_dialog: bool = True) -> None:
+    def replace_palette(self, kind: str, colors: list[str] | None, panel_id: int | None) -> None:
         attribute = "vector_colors" if kind == "vector" else "plane_colors"
         if panel_id is None:
             setattr(self, attribute, colors if colors is not None else self.palette_default_values(kind).copy())
@@ -5237,9 +7203,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             if state is None:
                 return
             setattr(state, attribute, colors)
+            state.global_display_sections.discard("colors")
             affected = {panel_id}
-        if refresh_dialog:
-            self.refresh_palette_dialog()
         for controller in self.controllers:
             if controller.state.panel_id in affected:
                 controller.redraw_scene(update_camera=False)
@@ -5251,7 +7216,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         color = self.normalize_palette_color(value, palette[index])
         if color != palette[index]:
             palette[index] = color
-            self.replace_palette(kind, palette, panel_id, refresh_dialog=False)
+            self.replace_palette(kind, palette, panel_id)
 
     def add_palette_color(self, kind: str, panel_id: int | None = None) -> None:
         palette = self.palette_values(kind, panel_id).copy()
@@ -5760,7 +7725,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .visual-stack {
                 display: grid;
-                grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+                grid-template-columns: repeat(2, minmax(0, 1fr));
                 gap: 8px;
                 width: 100%;
                 height: var(--panel-visual-height);
@@ -5842,6 +7807,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 overflow: hidden;
             }
             .real-scene {
+                box-sizing: border-box;
                 width: 100% !important;
                 height: 100% !important;
                 min-height: 0 !important;
@@ -5849,6 +7815,36 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 border-radius: 8px;
                 overflow: hidden;
                 border: 1px solid rgba(255, 255, 255, 0.08);
+            }
+            .atom-inspector {
+                position: absolute;
+                top: 0;
+                left: 0;
+                width: min(320px, calc(100% - 44px));
+                max-height: 100%;
+                overflow: auto;
+                z-index: 3;
+                padding: 8px 10px;
+                gap: 2px;
+                border: 1px solid #626970;
+                border-radius: 4px;
+                background: rgba(20, 23, 27, 0.95);
+                color: #f5f6f7;
+                font-size: 12px;
+                user-select: text;
+            }
+            .atom-coordinate-caption {
+                color: #b6bdc5;
+                font-size: 11px;
+                margin-top: 3px;
+            }
+            .atom-coordinate-value {
+                width: 100%;
+                overflow-wrap: anywhere;
+                font-variant-numeric: tabular-nums;
+            }
+            .marker-picking canvas {
+                cursor: crosshair;
             }
             .real-scale-bar {
                 position: absolute;
@@ -5880,7 +7876,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 font-weight: 600;
             }
             .diffraction-plot {
+                box-sizing: border-box;
                 width: 100%;
+                min-width: 0;
                 height: var(--panel-visual-height) !important;
                 min-height: var(--panel-visual-height) !important;
                 max-height: var(--panel-visual-height) !important;
@@ -5913,6 +7911,49 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 width: min(420px, calc(100vw - 40px));
                 border-radius: 8px;
                 gap: 8px;
+            }
+            .static-download-card {
+                width: 1040px;
+                max-width: calc(100vw - 32px) !important;
+                padding: 18px;
+                gap: 12px;
+            }
+            .static-download-options {
+                display: grid;
+                grid-template-columns: repeat(3, minmax(0, 1fr));
+                gap: 12px;
+                width: 100%;
+            }
+            .static-download-options .q-field { min-width: 0; }
+            .static-download-previews {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 12px;
+                width: 100%;
+            }
+            .static-download-single { grid-template-columns: minmax(0, 1fr); }
+            .static-download-tile { width: 100%; min-width: 0; }
+            .static-download-tile .text-negative { overflow-wrap: anywhere; }
+            .static-download-image {
+                width: 100%;
+                height: 300px;
+                background-color: #252525;
+                border: 1px solid #555;
+                border-radius: 4px;
+            }
+            .static-download-transparent {
+                background-image: conic-gradient(#383838 25%, #252525 0 50%, #383838 0 75%, #252525 0);
+                background-size: 20px 20px;
+            }
+            @media(max-width:700px) {
+                .static-download-options { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                .static-download-previews { grid-template-columns: minmax(0, 1fr); }
+                .static-download-image { height: 250px; }
+            }
+            @media(max-width:440px) {
+                .static-download-card { padding: 12px; }
+                .static-download-options { grid-template-columns: minmax(0, 1fr); }
+                .static-download-actions { justify-content: flex-end; }
             }
             .occupancy-warning-card {
                 width: min(560px, calc(100vw - 40px));
@@ -5964,8 +8005,123 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .palette-card {
                 width: min(760px, calc(100vw - 40px));
                 max-width: calc(100vw - 40px) !important;
+                max-height: calc(100vh - 40px);
                 border-radius: 8px;
                 gap: 10px;
+                overflow: hidden;
+                flex-wrap: nowrap;
+            }
+            .panel-settings-card {
+                width: min(1500px, calc(100vw - 40px));
+                height: calc(100vh - 40px);
+                height: calc(100dvh - 40px);
+            }
+            .palette-card > .row {
+                flex-shrink: 0;
+            }
+            .display-settings-body {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr);
+                width: 100%;
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow: hidden;
+            }
+            .panel-settings-body {
+                grid-template-columns: minmax(0, 1fr) minmax(440px, 1.15fr);
+                gap: 16px;
+            }
+            .display-settings-controls {
+                container-type: inline-size;
+                min-width: 0;
+                min-height: 0;
+                overflow-y: auto;
+                overflow-x: hidden;
+                overscroll-behavior: contain;
+                scrollbar-gutter: stable;
+                padding-right: 4px;
+                gap: 10px;
+            }
+            @container (max-width: 520px) {
+                .panel-frame-settings,
+                .panel-element-sizes,
+                .panel-cell-counts,
+                .annotation-style-grid {
+                    grid-template-columns: minmax(0, 1fr) !important;
+                }
+            }
+            .palette-card .q-field {
+                min-width: 0;
+            }
+            .display-settings-preview {
+                display: flex;
+                flex-direction: column;
+                min-width: 0;
+                min-height: 0;
+                gap: 4px;
+            }
+            .display-settings-preview .visual-stack {
+                flex: 1 1 0;
+                grid-template-columns: minmax(0, 1fr);
+                grid-template-rows: repeat(2, minmax(0, 1fr));
+                height: 100%;
+                min-height: 0;
+                max-height: none;
+            }
+            .display-settings-preview .scene-wrap,
+            .display-settings-preview .diffraction-plot {
+                height: 100% !important;
+                min-height: 0;
+                max-height: 100% !important;
+            }
+            .settings-preview-pane {
+                position: relative;
+                min-height: 0;
+                min-width: 0;
+                overflow: hidden;
+            }
+            .preview-magnify {
+                position: absolute;
+                top: 8px;
+                right: 8px;
+                z-index: 4;
+                background: rgba(20, 23, 27, 0.9);
+            }
+            .display-settings-preview .visual-stack.preview-expanded {
+                grid-template-columns: minmax(0, 1fr);
+                grid-template-rows: minmax(0, 1fr);
+            }
+            .display-settings-actions {
+                flex-wrap: wrap;
+                gap: 8px;
+            }
+            @media (max-width: 850px) {
+                .panel-settings-body {
+                    grid-template-columns: minmax(0, 1fr);
+                    grid-template-rows: minmax(140px, 36%) minmax(0, 1fr);
+                    gap: 10px;
+                }
+                .display-settings-preview .visual-stack {
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                    grid-template-rows: minmax(0, 1fr);
+                }
+            }
+            @media (max-width: 600px) {
+                .element-color-tools {
+                    flex-direction: column;
+                    align-items: stretch;
+                }
+                .panel-frame-settings,
+                .panel-element-sizes,
+                .panel-cell-counts,
+                .annotation-style-grid,
+                .element-color-grid {
+                    grid-template-columns: minmax(0, 1fr) !important;
+                }
+                .palette-card .text-h6 {
+                    font-size: 16px;
+                    overflow-wrap: anywhere;
+                }
             }
             .palette-columns {
                 width: 100%;
@@ -6074,7 +8230,18 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .advanced-checkbox {
                 min-height: 40px;
                 align-items: center;
+                align-self: center;
+                justify-self: start;
+                max-width: 100%;
                 color: #eef2f6;
+            }
+            .advanced-tooltip {
+                max-width: min(320px, calc(100vw - 24px));
+                white-space: normal;
+                overflow-wrap: anywhere;
+                font-size: 12px;
+                line-height: 1.4;
+                text-align: left;
             }
             .advanced-checkbox .q-checkbox__label {
                 font-size: 12px;
@@ -6090,7 +8257,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 margin-bottom: 2px;
             }
             .advanced-slider {
-                margin-top: 0;
+                margin: 28px 12px 0;
+                width: calc(100% - 24px);
             }
             .advanced-log {
                 width: 100%;
@@ -6489,6 +8657,45 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             return
         self.open_export_folder_path_dialog(label)
 
+    async def choose_save_file(self, filename: str, extension: str) -> Path | None:
+        suggested = self.ensure_export_dir() / sanitize_export_filename(filename, "crysdis_export", extension)
+        selection, available = None, False
+        window = app.native.main_window
+        if window is not None:
+            try:
+                import webview
+                dialog_type = webview.FileDialog.SAVE if hasattr(webview, "FileDialog") else webview.SAVE_DIALOG
+                result = await window.create_file_dialog(dialog_type=dialog_type, directory=str(suggested.parent),
+                    save_filename=suggested.name, file_types=(f"{extension[1:].upper()} files (*{extension})",))
+                selection = Path(result[0] if isinstance(result, (list, tuple)) else result) if result else None
+                available = True
+            except Exception:
+                pass
+        if not available:
+            selection, available = await asyncio.to_thread(system_save_file_dialog, suggested, extension)
+        if not available:
+            ui.notify("A native Save As dialog is unavailable. No file was saved. Install a system file picker or enable the native desktop window.", type="negative")
+            return None
+        if selection is None:
+            return None
+        # Some OS pickers do not append the selected format's extension.
+        if selection.suffix.lower() != extension.lower():
+            selection = selection.with_name(selection.name + extension)
+            if selection.exists():
+                with ui.dialog() as confirm, ui.card():
+                    ui.label(f"Replace {selection.name}?")
+                    with ui.row():
+                        ui.button("Cancel", on_click=lambda: confirm.submit(False)).props("flat")
+                        ui.button("Replace", on_click=lambda: confirm.submit(True))
+                replace_file = await confirm
+                confirm.delete()
+                if not replace_file:
+                    return None
+        if not selection.parent.is_dir():
+            raise ValueError("The selected save folder does not exist.")
+        self.selected_export_dir = selection.parent
+        return selection
+
     def save_exported_image(self, image_bytes: bytes, filename: str) -> Path:
         path = self.ensure_export_dir() / sanitize_export_filename(filename)
         path.write_bytes(image_bytes)
@@ -6526,9 +8733,24 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             controller.redraw_scene(update_camera=False)
 
     def show_scale_bars(self) -> bool:
-        return bool(getattr(getattr(self, "show_scale_bar_input", None), "value", True))
+        return bool(getattr(getattr(self, "show_scale_bar_input", None), "value", getattr(self, "scale_bars_enabled", True)))
+
+    def global_annotation_settings(self) -> PanelAnnotations:
+        settings = getattr(self, "global_display_settings", None)
+        return settings.annotations if settings is not None else PanelAnnotations()
 
     def on_scale_bar_changed(self) -> None:
+        if getattr(self, "_updating_scale_bar_checkbox", False):
+            return
+        self.scale_bars_enabled = self.show_scale_bars()
+        settings = self.global_annotation_settings()
+        # A matched pair follows the toolbar; a mixed pair is a remembered filter.
+        if settings.real_scale_visible == settings.reciprocal_scale_visible:
+            settings.real_scale_visible = settings.reciprocal_scale_visible = self.scale_bars_enabled
+            for state in self.panel_states:
+                if "annotations" in state.global_display_sections:
+                    annotations = state.display_settings.annotations
+                    annotations.real_scale_visible = annotations.reciprocal_scale_visible = self.scale_bars_enabled
         for controller in self.controllers:
             controller.apply_scale_bar_visibility()
         self.refresh_diffractions()
@@ -6587,7 +8809,22 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             compression = float(value if value is not None else DEFAULT_INTENSITY_COMPRESSION_FACTOR)
         except (TypeError, ValueError):
             compression = DEFAULT_INTENSITY_COMPRESSION_FACTOR
-        return min(max(compression, 10.0), 150.0)
+        return min(max(compression, 10.0), 200.0)
+
+    def uniform_spot_brightness(self) -> bool:
+        return bool(getattr(getattr(self, "uniform_spot_brightness_input", None), "value", False))
+
+    def diffraction_display_intensities(self, raw_intensity: np.ndarray) -> np.ndarray:
+        intensity = np.maximum(raw_intensity, 0.0)
+        compression = self.current_intensity_compression_factor()
+        return np.log1p(compression * intensity) / math.log1p(compression)
+
+    def diffraction_spot_opacities(self, intensity: np.ndarray, combo: bool = False) -> np.ndarray:
+        base, scale = (0.14, 0.70) if combo else (0.18, 0.82)
+        if self.uniform_spot_brightness():
+            # Preserve relative intensities for filtering, size scaling, labels, and hover text.
+            return np.full_like(intensity, base + scale, dtype=float)
+        return base + scale * intensity
 
     def current_camera_length_mm(self) -> float:
         value = getattr(getattr(self, "camera_length_input", None), "value", f"{DEFAULT_CAMERA_LENGTH_MM:g} mm")
@@ -6701,21 +8938,18 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             controller.refresh_source_options()
 
     def add_panel(self, *, crystal_name: str | None = None) -> None:
-        defaults = [
-            ("FCC", "100", "", ""),
-            ("BCC", "100", "", ""),
-            ("HCP", "100", "", ""),
-        ]
-        crystal, zone, plane, vector = defaults[(self.next_panel_id - 1) % len(defaults)]
-        if crystal_name is not None:
-            crystal = crystal_name
+        crystal = crystal_name
+        if crystal is None:
+            crystals = [name for name in self.library.options() if name != CUSTOM_SENTINEL]
+            crystal = crystals[(self.next_panel_id - 1) % len(crystals)]
         state = PanelState(
             panel_id=self.next_panel_id,
             crystal_name=crystal,
-            applied_zone_text=zone,
-            plane_text=plane,
-            vector_text=vector,
-            diffraction_color=self.default_diffraction_color_for_crystal(crystal),
+            applied_zone_text="100",
+            plane_text="",
+            vector_text="",
+            diffraction_color=self.global_diffraction_color or self.default_diffraction_color_for_crystal(crystal),
+            display_settings=copy.deepcopy(self.global_display_settings),
         )
         self.panel_states.append(state)
         self.layout_items.append(("panel", self.next_panel_id))
@@ -6914,7 +9148,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         for state in self.panel_states:
             if state.crystal_name in affected_names:
                 if force_default_color:
-                    state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
+                    self.set_panel_crystal(state, state.crystal_name, force_default_color=True)
                 affected_panel_ids.add(state.panel_id)
         self.refresh_panel_crystal_select_options()
         self.redraw_panel_controllers(affected_panel_ids)
@@ -6952,7 +9186,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             round(self.current_voltage_kv(), 5),
             round(self.current_thickness_nm(), 5),
             round(self.current_camera_length_mm(), 5),
-            round(self.current_spot_intensity_threshold(), 8),
+            self.current_spot_intensity_threshold(),
             round(self.current_intensity_compression_factor(), 5),
             tuple(float(value) for value in np.round(view, 6)),
             round(float(state.roll), 5),
@@ -7079,8 +9313,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 normal = np.array([1.0, 0.0, 0.0])
             u_axis, v_axis = projection_basis(normal, roll)
             detector_scale = self.current_detector_scale_mm_per_nm_inv()
-            compression = self.current_intensity_compression_factor()
-            display_intensity = np.log1p(compression * np.maximum(raw_intensity, 0.0)) / math.log1p(compression)
+            display_intensity = self.diffraction_display_intensities(raw_intensity)
             nonzero = ~np.all(hkl == 0, axis=1)
             visible = (display_intensity > threshold) & nonzero
             g_vectors = hkl[visible].astype(float) @ model.reciprocal
@@ -7137,8 +9370,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         raw_intensity[zero_beam] = max(float(raw_intensity.max(initial=1.0)), 1.0)
         if raw_intensity.max(initial=0.0) > 0:
             raw_intensity = raw_intensity / raw_intensity.max()
-        compression = self.current_intensity_compression_factor()
-        display_intensity = np.log1p(compression * raw_intensity) / math.log1p(compression)
+        display_intensity = self.diffraction_display_intensities(raw_intensity)
         visible = (display_intensity > self.current_spot_intensity_threshold()) & valid_curvature
         return np.column_stack(
             (
