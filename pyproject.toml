@@ -9,6 +9,8 @@ dependencies = [
     "numpy>=2.0",
     "plotly>=6.0",
     "matplotlib>=3.8",
+    "pillow>=10",
+    "scipy>=1.13",
     "pymatgen>=2024.0",
     "periodictable>=2.0",
     "platformdirs",
@@ -32,4 +34,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["CrysDiS"]
+py-modules = ["CrysDiS", "CrysDiS_animation", "CrysDiS_markers"]
