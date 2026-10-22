@@ -13,7 +13,7 @@ RUN apt-get update \
 
 COPY pyproject.toml ./
 COPY README.md ./
-COPY CrysDiS.py ./
+COPY CrysDiS.py CrysDiS_animation.py CrysDiS_markers.py ./
 COPY custom_crystals_local.json ./
 
 RUN pip install --no-cache-dir --upgrade pip \
