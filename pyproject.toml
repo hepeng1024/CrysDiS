@@ -34,4 +34,4 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["CrysDiS", "CrysDiS_animation", "CrysDiS_markers"]
+py-modules = ["CrysDiS", "CrysDiS_animation", "CrysDiS_markers", "CrysDiS_views"]

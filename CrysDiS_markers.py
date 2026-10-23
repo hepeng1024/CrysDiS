@@ -21,7 +21,7 @@ EDGE_STYLES = {"solid": "Solid", "dashed": "Dashed", "dotted": "Dotted", "dash_d
 LABEL_POSITIONS = {"center": (0, 0), "upper_left": (-1, 1), "up": (0, 1), "upper_right": (1, 1),
                    "left": (-1, 0), "right": (1, 0), "bottom_left": (-1, -1),
                    "bottom": (0, -1), "bottom_right": (1, -1)}
-MAX_MARKERS = 100
+MAX_MARKERS = 300
 MAX_VERTICES = 64
 COORDINATE_ZERO_TOLERANCE = 1e-14
 
@@ -310,6 +310,90 @@ def marker_extent_points(geometry: list[dict]) -> list[np.ndarray]:
     return points
 
 
+@dataclass(frozen=True)
+class CoordinateGridSettings:
+    spacing: float | None = None
+    volume: bool = False
+    extent: str = "display"
+    low: tuple[float, float, float] = (-1.0, -1.0, -1.0)
+    high: tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+    def __post_init__(self):
+        if self.spacing is not None and (not math.isfinite(self.spacing) or self.spacing <= 0):
+            raise ValueError("Grid spacing must be positive and finite.")
+        if self.extent not in {"display", "symmetric", "custom"}:
+            raise ValueError("Unknown grid extent.")
+        if self.extent == "custom":
+            low, high = np.asarray(self.low), np.asarray(self.high)
+            if low.shape != (3,) or high.shape != (3,) or not np.all(np.isfinite([low, high])):
+                raise ValueError("Enter all six grid bounds.")
+            if np.any(np.abs([low, high]) > 1000):
+                raise ValueError("Grid bounds must be between -1000 and 1000.")
+            if np.any(low >= high) or np.any(low > 0) or np.any(high < 0):
+                raise ValueError("Each minimum must be below its maximum, with the origin inside the bounds.")
+
+
+def coordinate_grid_geometry(model, low, high, markers=(), settings=None) -> dict:
+    """Bounded guides in lattice coordinates, not an orthogonal Cartesian grid."""
+    settings = settings or CoordinateGridSettings()
+    low, high = np.minimum(np.asarray(low, dtype=float), 0), np.maximum(np.asarray(high, dtype=float), 1)
+    inverse = np.linalg.inv(model.lattice)
+    for marker in markers:
+        if not marker.visible:
+            continue
+        points = np.asarray(marker.points, dtype=float)
+        fractional = points if marker.coordinates == "fractional" else points @ inverse
+        low = np.minimum(low, np.min(fractional, axis=0))
+        high = np.maximum(high, np.max(fractional, axis=0))
+    if settings.extent == "symmetric":
+        high = np.maximum(np.abs(low), np.abs(high))
+        low = -high
+    elif settings.extent == "custom":
+        low, high = np.asarray(settings.low), np.asarray(settings.high)
+    span = float(np.max(high - low))
+    if settings.spacing is None:
+        required = max(.25, span / 16)
+        step = .25 * 2 ** max(0, math.ceil(math.log2(required / .25)))
+    else:
+        # Bound geometry for large 3D extents, retaining multiples of the chosen spacing.
+        intervals = 24 if settings.volume else 64
+        step = settings.spacing * max(1, math.ceil(span / (intervals * settings.spacing)))
+    if settings.extent != "custom":
+        low, high = np.floor(low / step + 1e-10) * step, np.ceil(high / step - 1e-10) * step
+
+    def display(point):
+        return (model.display_origin + np.asarray(point) @ model.display_lattice).tolist()
+
+    segments = []
+    ticks = [np.arange(math.ceil(lo / step - 1e-10), math.floor(hi / step + 1e-10) + 1) * step
+             for lo, hi in zip(low, high)]
+    for moving in range(3):
+        a, b = [axis for axis in range(3) if axis != moving]
+        for va, vb in product(ticks[a], ticks[b]):
+            at_a, at_b = abs(va) < 1e-10, abs(vb) < 1e-10
+            if (at_a and at_b) or (not settings.volume and not (at_a or at_b)):
+                continue  # The three arrows already mark the origin axes.
+            start, end = np.zeros(3), np.zeros(3)
+            start[a] = end[a] = va
+            start[b] = end[b] = vb
+            start[moving], end[moving] = low[moving], high[moving]
+            segments.append([display(start), display(end)])
+    axes = []
+    head_length = .22
+    atom_radius = max(model.atom_radius(), max((model.atom_radius(atom) for atom in model.display_atoms), default=0))
+    for i, (label, color) in enumerate(zip("abc", ("#F28C8C", "#81D4A1", "#81BAEF"))):
+        start, end = np.zeros(3), np.zeros(3)
+        # Keep the whole arrowhead beyond boundary atoms, also on short/skew axes.
+        clearance = (atom_radius + head_length + .03) / np.linalg.norm(model.display_lattice[i])
+        start[i], end[i] = low[i], high[i] + max(step * .6, clearance)
+        axes.append({"start": display(start), "end": display(end), "label": label, "color": color,
+                     "head_length": head_length})
+    corners = [display(point) for point in product(*zip(low, high))]
+    extent = corners + [axis["end"] for axis in axes]
+    limit = max(model.limit, float(np.max(np.linalg.norm(extent, axis=1))) * 1.12)
+    return {"segments": segments, "axes": axes, "step": step, "low": low.tolist(), "high": high.tolist(), "limit": limit}
+
+
 THREE_MARKERS_SCRIPT = r"""
 function addCrystalMarkers(THREE, root, markers, sphereMaterial) {
     const V = p => new THREE.Vector3(...p);
@@ -390,12 +474,12 @@ class MarkerEditor:
                     button.tooltip("Coplanar polygon vertices in boundary order; concave polygons are supported.")
         self.container = ui.column().classes("full-width gap-1 marker-editor")
         ui.add_css(".marker-editor{container-type:inline-size}"
-                   ".marker-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;width:100%}"
+                   ".marker-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;width:100%;max-width:640px}"
                    ".marker-fields .q-field{min-width:0}"
-                   ".marker-position{grid-column:1 / -1;display:grid;grid-template-columns:minmax(0,1fr) 220px;gap:10px}"
+                   ".marker-position{grid-column:1 / -1;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,.85fr);gap:8px}"
                    ".marker-position .q-field{width:100%!important}"
                    ".marker-pick-position{display:flex;align-items:center;gap:4px;min-width:0}"
-                   ".marker-position-picking .q-field__control:before{border-color:var(--q-warning);border-width:2px}"
+                   ".marker-position-picking .q-field__control:before{border-color:var(--q-secondary);border-width:2px}"
                    ".marker-positions{grid-column:1 / -1;width:100%;gap:10px}"
                    ".marker-vertex-row{display:grid;grid-template-columns:28px minmax(0,1fr);gap:4px;width:100%;align-items:center}"
                    ".marker-vertex-fields{min-width:0;width:100%;gap:4px}"
@@ -403,8 +487,7 @@ class MarkerEditor:
                    ".marker-vertex-drag:active{cursor:grabbing}"
                    ".marker-vertex-chosen{outline:1px solid var(--q-primary);outline-offset:-1px}"
                    ".marker-vertex-ghost{background:#252525;opacity:.95!important}"
-                   "@container(max-width:520px){.marker-fields,.marker-position{grid-template-columns:minmax(0,1fr)}}"
-                   "@media(max-width:600px){.marker-fields,.marker-position{grid-template-columns:minmax(0,1fr)}}")
+                   "@container(max-width:300px){.marker-fields,.marker-position{grid-template-columns:minmax(0,1fr)}}")
         inverse = np.linalg.inv(model.display_lattice)
         self.atom_points = [(atom, (atom.position - model.display_origin) @ inverse) for atom in model.display_atoms[:500]]
 
@@ -594,7 +677,7 @@ class MarkerEditor:
                             row["points"].append(control)
                             row["pick_buttons"].append(pick)
                             options = {i: f"{atom.element}: ({point_text(frac)})" for i, (atom, frac) in enumerate(self.atom_points)}
-                            select = ui.select(options, label="Use atom position", with_input=True).props("outlined dense clearable").style("width:220px;max-width:100%")
+                            select = ui.select(options, label="Atom position", with_input=True).props("outlined dense clearable stack-label")
                             select.tooltip("Displayed atom positions, in fractional coordinates; first 500 atoms.")
                             select.on_value_change(lambda event, r=row, target=control, s=select: self.pick_atom(r, target, s, event.value))
                 row["vertices"].append(vertex)
@@ -746,7 +829,7 @@ class MarkerEditor:
             return
         self.pick_target = (row, target, button)
         target.classes(add="marker-position-picking")
-        button.props("icon=close color=warning aria-pressed=true")
+        button.props("icon=close color=secondary aria-pressed=true")
         self.on_pick_change(True)
 
     def cancel_pick(self):

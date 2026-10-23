@@ -4,6 +4,7 @@ import asyncio
 import base64
 import colorsys
 import copy
+import hashlib
 import io
 import importlib.util
 import json
@@ -15,6 +16,8 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import uuid
 import warnings
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
@@ -28,9 +31,11 @@ import numpy as np
 from nicegui import app, core, native, ui
 # Register event/marker dragging before NiceGUI builds the initial page's import map.
 from nicegui.elements import sortable as _sortable
+from CrysDiS_views import DisplayPresetStore
 from CrysDiS_markers import (CrystalMarker, MarkerEditor, THREE_MARKERS_SCRIPT,
                             marker_geometry, marker_extent_points, marker_hidden_atom_indices,
-                            validate_markers, clean_coordinate, point_text)
+                            validate_markers, clean_coordinate, point_text, coordinate_grid_geometry,
+                            CoordinateGridSettings)
 
 
 try:
@@ -210,6 +215,9 @@ BUNDLED_LIBRARY_PATH = APP_DIR / "custom_crystals_local.json"
 USER_DATA_DIR = app_data_dir()
 USER_LIBRARY_PATH = USER_DATA_DIR / "custom_crystals.json"
 ELEMENT_COLORS_PATH = USER_DATA_DIR / "element_colors.json"
+DISPLAY_PRESETS_PATH = USER_DATA_DIR / "display_presets.json"
+THEME_PATH = USER_DATA_DIR / "theme.json"
+SAVED_THEMES_PATH = USER_DATA_DIR / "saved_themes.json"
 LEGACY_LIBRARY_PATH = Path.home() / ".crystal_diffraction_simulator" / "custom_crystals.json"
 LOCAL_LIBRARY_PATH = BUNDLED_LIBRARY_PATH
 GLOBAL_LIBRARY_PATH = USER_LIBRARY_PATH
@@ -525,6 +533,7 @@ DEFAULT_DIFFRACTION_COLORS = {
     "BCC": "#F77F00",
     "HCP": "#B985FF",
 }
+LIGHT_BACKGROUND_DEMO_COLORS = {"FCC": "#087F83", "BCC": "#B45309", "HCP": "#7E45B8"}
 
 
 @dataclass
@@ -556,6 +565,7 @@ class CrystalDefinition:
     repeat_boundary_atoms: bool = True
     sites: list[AtomicSite] = field(default_factory=list)
     symmetry_operations: list[str] = field(default_factory=list)
+    structure_id: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "CrystalDefinition":
@@ -573,6 +583,7 @@ class CrystalDefinition:
             repeat_boundary_atoms=bool(data.get("repeat_boundary_atoms", True)),
             sites=sites,
             symmetry_operations=list(data.get("symmetry_operations", [])),
+            structure_id=str(data.get("structure_id", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -618,6 +629,68 @@ ANNOTATION_STYLE_NAMES = ("real_scale", "reciprocal_scale", "zone", "indices")
 
 
 @dataclass
+class PanelBackgrounds:
+    crystal: str = "#000000"
+    diffraction: str = "#000000"
+    automatic_text: bool = False
+
+
+@dataclass
+class InterfaceTheme:
+    dark: bool = True
+    primary: str = "#6E97CD"
+    secondary: str = "#88E0E5"
+    page: str = "#11161D"
+    surface: str = "#1E1E1E"
+    panel: str = "#18202A"
+    header: str = "#161C24"
+    text: str = "#EEF2F6"
+    muted: str = "#B8C0CC"
+    backgrounds: PanelBackgrounds = field(default_factory=PanelBackgrounds)
+
+
+THEME_PRESETS = {
+    "Classic dark": InterfaceTheme(),
+    "Graphite": InterfaceTheme(primary="#71C5B1", secondary="#F2BF77", page="#151515",
+                                surface="#222222", panel="#202020", header="#191919",
+                                backgrounds=PanelBackgrounds("#101414", "#0E1113", True)),
+    "Light": InterfaceTheme(dark=False, primary="#245DA8", secondary="#087E75", page="#F4F5F7",
+                             surface="#FFFFFF", panel="#FFFFFF", header="#E9EDF2", text="#20242B", muted="#58616F",
+                             backgrounds=PanelBackgrounds("#FFFFFF", "#FFFFFF", True)),
+    "Forest": InterfaceTheme(dark=False, primary="#286B50", secondary="#A3446B", page="#F2F5F3",
+                              surface="#FFFFFF", panel="#FAFCFB", header="#E5EDE8", text="#20382C", muted="#52665A",
+                              backgrounds=PanelBackgrounds("#F4FAF6", "#F9FBFA", True)),
+    "Carbon": InterfaceTheme(primary="#E3B75A", secondary="#72C9D1", page="#101010",
+                              surface="#202020", panel="#191919", header="#151515", text="#F3F3F3", muted="#BABABA",
+                              backgrounds=PanelBackgrounds("#000000", "#000000", True)),
+    "Rose": InterfaceTheme(primary="#E99AB7", secondary="#95CDB8", page="#181619",
+                            surface="#262227", panel="#211E22", header="#1D191E", text="#F5EFF3", muted="#C8BAC3",
+                            backgrounds=PanelBackgrounds("#171217", "#141116", True)),
+    "Lagoon": InterfaceTheme(dark=False, primary="#066F76", secondary="#B64B36", page="#F2F7F7",
+                              surface="#FFFFFF", panel="#FBFDFD", header="#E3EEEE", text="#203638", muted="#53696B",
+                              backgrounds=PanelBackgrounds("#F1FAFB", "#F8FCFD", True)),
+    "Ruby": InterfaceTheme(dark=False, primary="#A3324D", secondary="#326CA0", page="#F8F4F5",
+                            surface="#FFFFFF", panel="#FDFBFC", header="#F0E6E9", text="#38262D", muted="#715D66",
+                            backgrounds=PanelBackgrounds("#FDF5F7", "#FFFAFB", True)),
+    "Jade": InterfaceTheme(primary="#82D6AD", secondary="#E7AD8F", page="#141B18",
+                            surface="#222B26", panel="#1B241F", header="#18201C", text="#EEF5F0", muted="#B7C8BD",
+                            backgrounds=PanelBackgrounds("#101B16", "#0D1511", True)),
+    "Ember": InterfaceTheme(primary="#F3A08A", secondary="#8BCED8", page="#1B1919",
+                             surface="#2A2525", panel="#231F1F", header="#201B1B", text="#F7F0ED", muted="#CBBDB7",
+                             backgrounds=PanelBackgrounds("#1A1414", "#151212", True)),
+    "Orchid": InterfaceTheme(dark=False, primary="#78468C", secondary="#21796F", page="#F7F4F9",
+                              surface="#FFFFFF", panel="#FDFBFE", header="#EEE7F2", text="#33293C", muted="#6B5C73",
+                              backgrounds=PanelBackgrounds("#FAF5FD", "#FDFBFE", True)),
+    "Sky": InterfaceTheme(dark=False, primary="#245F91", secondary="#A44262", page="#F2F6FA",
+                           surface="#FFFFFF", panel="#FAFCFE", header="#E4EDF5", text="#233747", muted="#536A7C",
+                           backgrounds=PanelBackgrounds("#F2F8FD", "#FAFCFF", True)),
+}
+THEME_COLOR_LABELS = {"primary": "Accent", "secondary": "Secondary accent", "page": "Page background",
+                      "surface": "Dialogs and menus", "panel": "Panel surround", "header": "Toolbar background",
+                      "text": "Interface text", "muted": "Secondary text"}
+
+
+@dataclass
 class PanelDisplaySettings:
     frame_mode: str = "original"
     frame_color: str = "#7A8796"
@@ -636,6 +709,7 @@ class PanelDisplaySettings:
     vector_label_opacity: float = 0.95
     plane_label_scale: float = 1.0
     plane_label_opacity: float = 0.9
+    backgrounds: PanelBackgrounds = field(default_factory=PanelBackgrounds)
     annotations: PanelAnnotations = field(default_factory=PanelAnnotations)
     markers: list[CrystalMarker] = field(default_factory=list)
 
@@ -647,13 +721,36 @@ DISPLAY_SETTING_FIELDS = {
     "colors": ("vector_opacity", "reciprocal_opacity", "plane_opacity", "plane_edge_opacity",
                "vector_label_scale", "vector_label_opacity", "plane_label_scale", "plane_label_opacity"),
     "annotations": ("annotations",),
+    "backgrounds": ("backgrounds",),
 }
 DISPLAY_SETTING_SECTIONS = frozenset(DISPLAY_SETTING_FIELDS)
 
 
 def crystal_display_settings(settings: PanelDisplaySettings) -> PanelDisplaySettings:
     """Exclude 2D overlays from crystal geometry/cache invalidation."""
-    return replace(settings, annotations=PanelAnnotations())
+    return replace(settings, annotations=PanelAnnotations(), backgrounds=PanelBackgrounds())
+
+
+def contrast_text_color(background: str) -> str:
+    channels = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
+                for value in color_to_rgb(background)]
+    luminance = sum(weight * value for weight, value in zip((.2126, .7152, .0722), channels))
+    return "#000000" if luminance > .179 else "#FFFFFF"
+
+
+def crystal_text_color(settings: PanelDisplaySettings, color: str) -> str:
+    return contrast_text_color(settings.backgrounds.crystal) if settings.backgrounds.automatic_text else color
+
+
+def display_annotations(settings: PanelDisplaySettings, backgrounds: PanelBackgrounds | None = None) -> PanelAnnotations:
+    backgrounds = backgrounds or settings.backgrounds
+    if not backgrounds.automatic_text:
+        return settings.annotations
+    annotations = copy.deepcopy(settings.annotations)
+    for name in ANNOTATION_STYLE_NAMES:
+        getattr(annotations, name).color = contrast_text_color(
+            backgrounds.crystal if name == "real_scale" else backgrounds.diffraction)
+    return annotations
 
 
 @dataclass
@@ -664,6 +761,8 @@ class DisplaySettingsDraft:
     plane_colors: list[str] = field(default_factory=lambda: PLANE_COLORS.copy())
     diffraction_color: str | None = None
     element_colors: dict[str, str] = field(default_factory=dict)
+    panel_element_colors: dict[str, str] | None = None
+    annotation_visibility: dict[str, bool] = field(default_factory=dict)
 
 
 def inherited_display_settings(local: PanelDisplaySettings, defaults: PanelDisplaySettings,
@@ -731,11 +830,16 @@ class PanelState:
     roll: float = 0.0
     applied_zone_text: str = "100"
     magnified: bool = False
+    crystal_view_percent: float = 50.0
     vector_colors: list[str] | None = None
     plane_colors: list[str] | None = None
     display_settings: PanelDisplaySettings = field(default_factory=PanelDisplaySettings)
     global_display_sections: set[str] = field(default_factory=lambda: set(DISPLAY_SETTING_SECTIONS))
     diffraction_color_custom: bool = False
+    element_colors: dict[str, str] | None = None
+    annotation_visibility: dict[str, bool] = field(default_factory=dict)
+    saved_view_id: str | None = None
+    initial_camera: dict[str, Any] | None = None
 
 
 @dataclass
@@ -745,6 +849,7 @@ class ComboPanelState:
     selected_panel_id: int | None = None
     bind_motion: bool = False
     magnified: bool = False
+    source_view_percent: float = 50.0
 
 
 def atomic_site_from_dict(data: dict[str, Any]) -> AtomicSite:
@@ -760,7 +865,59 @@ def atomic_site_from_dict(data: dict[str, Any]) -> AtomicSite:
 
 
 def crystal_definition_key(definition: CrystalDefinition) -> str:
-    return json.dumps(definition.to_dict(), sort_keys=True, separators=(",", ":"))
+    data = definition.to_dict()
+    data.pop("structure_id", None)
+    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+
+
+def crystal_identity(definition: CrystalDefinition) -> str:
+    if definition.name in DEFAULT_NAMES:
+        return f"builtin:{definition.name}"
+    return definition.structure_id or str(uuid.uuid5(uuid.NAMESPACE_URL, f"CrysDiS:legacy:{definition.name}"))
+
+
+def crystal_version(definition: CrystalDefinition) -> str:
+    data = definition.to_dict()
+    for key in ("name", "structure_id"):
+        data.pop(key, None)
+    return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+SAVED_VISIBILITY_METHODS = {"indices": "show_indices", "crystal": "show_crystal_annotations",
+                            "scale": "show_scale_bars", "zone": "show_zone_axis_on_diffraction"}
+
+
+def display_settings_from_dict(data: dict) -> PanelDisplaySettings:
+    data = copy.deepcopy(data)
+    annotations = data.pop("annotations", {})
+    for name in ANNOTATION_STYLE_NAMES:
+        if name in annotations:
+            annotations[name] = AnnotationStyle(**annotations[name])
+    settings = PanelDisplaySettings(
+        annotations=PanelAnnotations(**annotations), backgrounds=PanelBackgrounds(**data.pop("backgrounds", {})),
+        markers=[CrystalMarker(**marker) for marker in data.pop("markers", [])], **data)
+    settings.cells = tuple(settings.cells)
+    validate_display_settings(settings)
+    return settings
+
+
+def validated_saved_camera(camera: dict | None) -> dict | None:
+    if camera is None:
+        return None
+    result = {}
+    for name in ("position", "target", "up"):
+        values = np.asarray(camera[name], dtype=float)
+        if values.shape != (3,) or not np.isfinite(values).all() or np.max(np.abs(values)) > 1e7:
+            raise ValueError("Invalid saved camera coordinates.")
+        result[name] = values.tolist()
+    view = np.array(result["position"]) - result["target"]
+    if np.linalg.norm(view) < 1e-6 or np.linalg.norm(np.cross(view, result["up"])) < 1e-6:
+        raise ValueError("Invalid saved camera orientation.")
+    zoom = float(camera["zoom"])
+    if not math.isfinite(zoom) or not .01 <= zoom <= 100:
+        raise ValueError("Saved zoom must be between 0.01 and 100.")
+    result["zoom"] = zoom
+    return result
 
 
 def crystal_model_key(model: CrystalModel) -> str:
@@ -1269,6 +1426,9 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
 
 def validate_display_settings(settings: PanelDisplaySettings) -> None:
     validate_markers(settings.markers)
+    for value in (settings.backgrounds.crystal, settings.backgrounds.diffraction):
+        if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ValueError("Panel backgrounds must be six-digit hex colors.")
     annotations = settings.annotations
     for name in ANNOTATION_STYLE_NAMES:
         style = getattr(annotations, name)
@@ -1323,7 +1483,7 @@ def make_panel_display_model(source: CrystalModel, settings: PanelDisplaySetting
     """Replicate drawing geometry only; keep the crystallographic unit cell intact."""
     validate_display_settings(settings)
     source = source.display_source or source
-    element_colors = relevant_element_colors(source, element_colors or {})
+    element_colors = display_element_colors(source, settings, element_colors or {})
     if settings == PanelDisplaySettings() and not element_colors:
         return source
     low, high = display_cell_bounds(settings.cells)
@@ -2110,6 +2270,20 @@ class CrystalScene(ui.scene):
                 start = null;
                 if (dragged) e.stopImmediatePropagation();
             }}, true);
+            // Split panes resize without a window resize event.
+            let frame = null;
+            const resizeObserver = new ResizeObserver(() => {{
+                cancelAnimationFrame(frame);
+                frame = requestAnimationFrame(() => {{
+                    if (scene.$el.clientWidth && scene.$el.clientHeight) scene.resize();
+                }});
+            }});
+            resizeObserver.observe(scene.$el);
+            const removalObserver = new MutationObserver(() => {{
+                if (scene.$el.isConnected) return;
+                resizeObserver.disconnect(); removalObserver.disconnect(); cancelAnimationFrame(frame);
+            }});
+            removalObserver.observe(document.body, {{childList:true, subtree:true}});
         }}""")
 
     def _handle_init(self) -> None:
@@ -2694,8 +2868,8 @@ def empty_diffraction_figure() -> dict[str, Any]:
     return {
         "data": [],
         "layout": {
-            "paper_bgcolor": "#050607",
-            "plot_bgcolor": "#050607",
+            "paper_bgcolor": "#000000",
+            "plot_bgcolor": "#000000",
             "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
             "xaxis": {"visible": False, "range": [-4, 4], "scaleanchor": "y", "scaleratio": 1, "fixedrange": True, "constrain": "domain"},
             "yaxis": {"visible": False, "range": [-4, 4], "fixedrange": True, "constrain": "domain"},
@@ -3053,6 +3227,19 @@ def relevant_element_colors(model: CrystalModel, colors: dict[str, str]) -> dict
     return {symbol: color for symbol, color in colors.items() if symbol in elements}
 
 
+def display_element_colors(model: CrystalModel, settings: PanelDisplaySettings, colors: dict[str, str]) -> dict[str, str]:
+    """Adapt only built-in demo colors; never overwrite user color preferences."""
+    result = relevant_element_colors(model, colors)
+    default = DEFAULT_CRYSTALS.get(model.definition.name)
+    if default is None or contrast_text_color(settings.backgrounds.crystal) != "#000000":
+        return result
+    site = default.sites[0]
+    if model.definition.sites and all(atom.element == site.element and str(atom.color or "").upper() == site.color.upper()
+                                      for atom in model.definition.sites):
+        result.setdefault(site.element, LIGHT_BACKGROUND_DEMO_COLORS[default.name])
+    return result
+
+
 def validate_element_colors(colors: Any) -> dict[str, str]:
     if not isinstance(colors, dict):
         raise ValueError("Element colors must be a dictionary.")
@@ -3097,6 +3284,183 @@ def save_element_colors(colors: dict[str, str], path: Path | None = None) -> Non
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def validate_theme(theme: InterfaceTheme) -> InterfaceTheme:
+    if not isinstance(theme, InterfaceTheme) or not isinstance(theme.dark, bool):
+        raise ValueError("Invalid interface theme.")
+    values = {}
+    for name in THEME_COLOR_LABELS:
+        value = normalized_hex_color(getattr(theme, name))
+        if value is None:
+            raise ValueError(f"{THEME_COLOR_LABELS[name]} must be a six-digit hex color.")
+        values[name] = value
+    backgrounds = theme.backgrounds
+    if not isinstance(backgrounds, PanelBackgrounds) or type(backgrounds.automatic_text) is not bool:
+        raise ValueError("Invalid theme panel backgrounds.")
+    colors = [normalized_hex_color(value) for value in (backgrounds.crystal, backgrounds.diffraction)]
+    if any(value is None for value in colors):
+        raise ValueError("Panel backgrounds must be six-digit hex colors.")
+    return replace(theme, backgrounds=PanelBackgrounds(*colors, backgrounds.automatic_text), **values)
+
+
+def load_theme(path: Path | None = None) -> InterfaceTheme:
+    path = path or THEME_PATH
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("version") not in (1, 2) or not isinstance(payload.get("theme"), dict):
+            raise ValueError("Unsupported theme preferences format.")
+        values = payload["theme"].copy()
+        values["backgrounds"] = PanelBackgrounds(**values.get("backgrounds", {}))
+        return validate_theme(InterfaceTheme(**values))
+    except FileNotFoundError:
+        return InterfaceTheme()
+    except (OSError, ValueError, TypeError) as exc:
+        warnings.warn(f"Could not load theme from {path}: {exc}. Using the default theme.")
+        return InterfaceTheme()
+
+
+def save_theme(theme: InterfaceTheme, path: Path | None = None) -> None:
+    path = path or THEME_PATH
+    payload = {"version": 2, "theme": asdict(validate_theme(theme))}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+class SavedThemeStore:
+    _lock = threading.RLock()
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+
+    @staticmethod
+    def name(value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Enter a theme name.")
+        value = value.strip()
+        if not value or len(value) > 80 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("Use a theme name between 1 and 80 characters, without control characters.")
+        if value.casefold() in {name.casefold() for name in (*THEME_PRESETS, "Custom")}:
+            raise ValueError("This name is reserved. Choose a name different from the built-in themes and Custom.")
+        return value
+
+    def read(self) -> dict[str, InterfaceTheme]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"Cannot read saved themes: {exc}. The file has not been changed.") from exc
+        try:
+            if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("themes"), dict):
+                raise ValueError("Unsupported saved-theme format.")
+            themes, names = {}, set()
+            for name, values in payload["themes"].items():
+                if self.name(name) != name or name.casefold() in names or not isinstance(values, dict):
+                    raise ValueError("Invalid or duplicate saved-theme name.")
+                values = values.copy()
+                values["backgrounds"] = PanelBackgrounds(**values.get("backgrounds", {}))
+                themes[name] = validate_theme(InterfaceTheme(**values))
+                names.add(name.casefold())
+            return themes
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Cannot read saved themes: {exc}. The file has not been changed.") from exc
+
+    def _write(self, themes: dict[str, InterfaceTheme]) -> None:
+        payload = {"version": 1, "themes": {name: asdict(validate_theme(theme)) for name, theme in themes.items()}}
+        text = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.path.parent, suffix=".tmp", delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def save(self, name: str, theme: InterfaceTheme) -> dict[str, InterfaceTheme]:
+        name, theme = self.name(name), validate_theme(theme)
+        with self._lock:
+            themes = self.read()
+            if any(saved.casefold() == name.casefold() for saved in themes):
+                raise ValueError("A saved theme with this name already exists. Choose another name or update that theme.")
+            themes[name] = theme
+            self._write(themes)
+            return themes
+
+    def change(self, name: str, action: str, value=None, *, expected: InterfaceTheme) -> dict[str, InterfaceTheme]:
+        with self._lock:
+            themes = self.read()
+            if name not in themes or themes[name] != expected:
+                raise ValueError("This saved theme changed or was removed. Reopen Theme before trying again.")
+            if action == "update":
+                themes[name] = validate_theme(value)
+            elif action == "rename":
+                renamed = self.name(value)
+                if any(saved != name and saved.casefold() == renamed.casefold() for saved in themes):
+                    raise ValueError("A saved theme with this name already exists.")
+                theme = themes.pop(name)
+                themes[renamed] = theme
+            elif action == "delete":
+                del themes[name]
+            else:
+                raise ValueError("Unknown saved-theme action.")
+            self._write(themes)
+            return themes
+
+
+def theme_css(theme: InterfaceTheme) -> str:
+    theme = validate_theme(theme)
+    variables = ";".join(f"--crys-{name}:{getattr(theme, name)}" for name in THEME_COLOR_LABELS)
+    return f"""
+        :root {{{variables}; --q-primary:{theme.primary}; --q-secondary:{theme.secondary};
+                 --q-dark:{theme.surface}; --q-dark-page:{theme.page};
+                 --crys-accent-text:{contrast_text_color(theme.primary)};
+                 --crys-border:{rgba_css(theme.text, .18)};}}
+        body.body--dark, body.body--light {{background:var(--crys-page);color:var(--crys-text);}}
+        .app-header {{background:var(--crys-header);color:var(--crys-text);border-color:var(--crys-border);}}
+        .comparison-panel, .combo-panel {{background:var(--crys-panel);border-color:var(--crys-border);}}
+        .q-dialog__inner > .q-card, .q-menu {{background:var(--crys-surface);color:var(--crys-text);}}
+        .q-field__native, .q-field__input, .q-field__prefix, .q-field__suffix,
+        .q-field__marginal, .q-checkbox__label, .q-item {{color:var(--crys-text);}}
+        .q-field__label {{color:var(--crys-muted);}}
+        /* Layered important rules take precedence over unlayered ones in Quasar. */
+        @layer overrides {{
+            .q-btn.bg-primary {{color:var(--crys-accent-text)!important;}}
+            .q-btn:is(.animation-drag, .marker-vertex-drag, .combo-source-drag):is(:hover, :active, :focus-visible):not([disabled]),
+            :is(.animation-drag-active, .animation-drag-preview) .animation-drag,
+            :is(.marker-vertex-chosen, .marker-vertex-ghost) .marker-vertex-drag,
+            :is(.combo-source-chosen, .combo-source-ghost) .combo-source-drag {{color:var(--q-secondary)!important;}}
+        }}
+        .top-checkbox, .panel-number, .combo-number, .combo-bind-checkbox,
+        .combo-source-header, .combo-source-row, .intro-text, .intro-text h3,
+        .crystal-list-name, .palette-title, .advanced-checkbox {{color:var(--crys-text);}}
+        .combo-source-list, .combo-source-ghost, .marker-vertex-ghost,
+        .animation-drag-preview {{background:var(--crys-surface);}}
+        .export-folder-label, .crystal-list-meta, .advanced-slider-label,
+        .palette-index {{color:var(--crys-muted);}}
+        .atom-inspector {{background:var(--crys-surface);color:var(--crys-text);border-color:var(--crys-border);}}
+        .atom-coordinate-caption {{color:var(--crys-muted);}}
+        .combo-bind-checkbox[aria-checked="true"] .q-checkbox__label {{color:var(--q-secondary);}}
+        .panel-split-handle::after {{background:var(--crys-muted);}}
+        .panel-splitter > .q-splitter__separator:hover .panel-split-handle::after,
+        .panel-splitter.q-splitter--active > .q-splitter__separator .panel-split-handle::after {{background:var(--q-secondary);}}
+    """
 
 
 def color_to_rgb(color: str) -> tuple[float, float, float]:
@@ -3153,6 +3517,8 @@ class CrystalLibrary:
     def save(self, definition: CrystalDefinition, scope: str) -> CrystalDefinition:
         definition = CrystalDefinition.from_dict(definition.to_dict())
         definition.name = self._custom_name(definition.name)
+        definition.structure_id = (crystal_identity(self.get(definition.name)) if self.exists(definition.name)
+                                   else str(uuid.uuid4()))
         path = self.path_for_scope(scope)
         saved = self._load_path(path)
         saved[definition.name] = definition
@@ -3169,6 +3535,7 @@ class CrystalLibrary:
             raise ValueError(
                 f"A structure named {definition.name!r} already exists. Change the name or use SAVE EDITED STRUCTURE."
             )
+        definition.structure_id = str(uuid.uuid4())
         path = self.path_for_scope(scope)
         saved = self._load_path(path)
         saved[definition.name] = definition
@@ -3184,6 +3551,10 @@ class CrystalLibrary:
         original_name = (original_name or "").strip()
         if original_name and original_name not in DEFAULT_NAMES and definition.name != original_name and self.exists(definition.name):
             raise ValueError(f"A structure named {definition.name!r} already exists. Choose another name or save as a new structure.")
+
+        definition.structure_id = (crystal_identity(self.get(original_name))
+                                   if original_name not in DEFAULT_NAMES and self.exists(original_name)
+                                   else str(uuid.uuid4()))
 
         target_path = self.path_for_scope(scope)
         target_saved = self._load_path(target_path)
@@ -3250,6 +3621,7 @@ class CrystalLibrary:
             )
             if needs_refresh:
                 imported.name = path.stem
+                imported.structure_id = crystal_identity(existing)
                 self.definitions[path.stem] = imported
 
     @staticmethod
@@ -3843,6 +4215,47 @@ class CrystalBuilder:
         self.dialog.close()
 
 
+class PanelViewSplitter(ui.splitter):
+    """Shared, ten-percent view divider with client-side snapping while dragging."""
+
+    def __init__(self, value, on_change, label, *, responsive=True):
+        self.handle = None
+        super().__init__(value=value, limits=(0, 100), on_change=on_change)
+        self.classes("panel-splitter").props("emit-immediately")
+        if responsive:
+            self.props(':horizontal="Quasar.Screen.lt.sm"')
+        with self.separator:
+            self.handle = ui.element("div").classes("panel-split-handle").props(
+                f'role=separator aria-label="{label}" aria-valuemin=0 aria-valuemax=100 '
+                f'aria-valuenow={self.value:g} aria-orientation=vertical')
+            if responsive:
+                self.handle.props(':aria-orientation="Quasar.Screen.lt.sm ? \'horizontal\' : \'vertical\'"')
+            self.handle.on("dblclick", lambda: self.set_value(50))
+        # Quasar writes a continuous size directly during a drag. Snap that size
+        # locally too, so rendering does not wait for a server round trip.
+        self.on("update:model-value", js_handler=f'''value => {{
+            const percent = Math.max(0, Math.min(100, Math.round(value / 10) * 10));
+            const root = getElement({self.id}).$el;
+            const before = root.querySelector(':scope > .q-splitter__before');
+            before.style[root.classList.contains('q-splitter--horizontal') ? 'height' : 'width'] = percent + '%';
+            root.classList.toggle('split-at-start', percent === 0);
+            root.classList.toggle('split-at-end', percent === 100);
+            root.querySelector('.panel-split-handle').setAttribute('aria-valuenow', percent);
+        }}''')
+
+    def set_value(self, value):
+        if value is None or not math.isfinite(float(value)):
+            return self
+        return super().set_value(min(100.0, max(0.0, 10.0 * math.floor(float(value) / 10 + .5))))
+
+    def _handle_value_change(self, value):
+        super()._handle_value_change(value)
+        self.classes(add="split-at-start" if value == 0 else "", remove="split-at-start" if value != 0 else "")
+        self.classes(add="split-at-end" if value == 100 else "", remove="split-at-end" if value != 100 else "")
+        if self.handle is not None:
+            self.handle.props(f"aria-valuenow={value:g}")
+
+
 class PanelController:
     def __init__(self, simulator: "SimulatorApp", state: PanelState) -> None:
         self.simulator = simulator
@@ -3861,6 +4274,12 @@ class PanelController:
         self.animation_dialog = None
         self.close_button = None
         self.magnify_button = None
+        self.view_splitter = None
+        self.split_handle = None
+        self.coordinate_grid_enabled = False
+        self.coordinate_grid_settings = CoordinateGridSettings()
+        self.coordinate_grid_step = None
+        self.coordinate_grid_limit = None
         self.scale_bar_line = None
         self.scale_bar_label = None
         self.scale_bar_container = None
@@ -3932,21 +4351,26 @@ class PanelController:
                     on_click=lambda: self.simulator.remove_panel(self.state.panel_id),
                 ).props("flat round dense").classes("panel-close-button").tooltip("Remove panel")
 
-            with ui.element("div").classes("visual-stack"):
-                with ui.element("div").classes("scene-wrap"):
-                    self.scene = CrystalScene(
-                        width=440,
-                        height=280,
-                        grid=False,
-                        background_color="#0B0F14",
-                        camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
-                        on_click=self.inspect_atom, click_events=["click"],
-                    ).classes("real-scene")
-                    self.build_atom_inspector()
-                    with ui.element("div").classes("real-scale-bar") as self.scale_bar_container:
-                        self.scale_bar_line = ui.element("div").classes("real-scale-line")
-                        self.scale_bar_label = ui.label("1 nm").classes("real-scale-label")
-                self.diffraction = ui.plotly(empty_diffraction_figure()).classes("diffraction-plot")
+            with PanelViewSplitter(self.state.crystal_view_percent,
+                                   lambda event: setattr(self.state, "crystal_view_percent", event.value),
+                                   "Resize crystal and diffraction views") as self.view_splitter:
+                self.split_handle = self.view_splitter.handle
+                with self.view_splitter.before:
+                    with ui.element("div").classes("scene-wrap"):
+                        self.scene = CrystalScene(
+                            width=440,
+                            height=280,
+                            grid=False,
+                            background_color=self.state.display_settings.backgrounds.crystal,
+                            camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
+                            on_click=self.inspect_atom, click_events=["click"],
+                        ).classes("real-scene")
+                        self.build_atom_inspector()
+                        with ui.element("div").classes("real-scale-bar") as self.scale_bar_container:
+                            self.scale_bar_line = ui.element("div").classes("real-scale-line")
+                            self.scale_bar_label = ui.label("1 nm").classes("real-scale-label")
+                with self.view_splitter.after:
+                    self.diffraction = ui.plotly(empty_diffraction_figure()).classes("diffraction-plot")
             self.scale_timer = ui.timer(0.7, self.update_scene_scale_bar)
 
         self.apply(initial=True)
@@ -3963,6 +4387,10 @@ class PanelController:
             ui.label("Cartesian (nm)").classes("atom-coordinate-caption")
             self.atom_cartesian = ui.label("").classes("atom-coordinate-value")
         self.atom_inspector.set_visibility(False)
+
+    def set_view_split(self, value: float) -> None:
+        if self.view_splitter is not None:
+            self.view_splitter.set_value(value)
 
     def hide_atom_inspector(self) -> None:
         if self.atom_inspector is not None:
@@ -4049,14 +4477,16 @@ class PanelController:
             self.state.view_vector = zone[0].vector
             self.state.roll = 0.0
             self.state.applied_zone_text = zone_text
+        self.simulator.apply_default_saved_view(self.state)
         self._updating_inputs = True
         if self.plane_input is not None:
-            self.plane_input.value = ""
+            self.plane_input.value = self.state.plane_text
         if self.vector_input is not None:
-            self.vector_input.value = ""
+            self.vector_input.value = self.state.vector_text
         self.zone_input.value = ""
         self.rotation_input.value = ""
         self._updating_inputs = False
+        self.set_view_split(self.state.crystal_view_percent)
         self.redraw_scene(model)
         self.redraw_diffraction(model)
         self.simulator.refresh_combo_panels_for_sources({self.state.panel_id})
@@ -4080,12 +4510,55 @@ class PanelController:
                 self.state.display_settings = settings
                 self.state.global_display_sections.discard("cells")
                 self.simulator.set_status(f"Panel {self.state.panel_id}: displayed cells reset to one; replication would exceed 30,000 atoms")
-        colors = relevant_element_colors(source, getattr(self.simulator, "element_colors", {}) if element_colors is None else element_colors)
+        colors = display_element_colors(source, settings, self.effective_element_colors() if element_colors is None else element_colors)
         key = (id(source), crystal_model_key(source), json.dumps(asdict(crystal_display_settings(settings)), sort_keys=True), tuple(sorted(colors.items())))
         if key != self._display_model_key:
             self._display_model = make_panel_display_model(source, settings, colors)
             self._display_model_key = key
         return self._display_model
+
+    def effective_element_colors(self) -> dict[str, str]:
+        return (getattr(self.simulator, "element_colors", {}) if self.state.element_colors is None
+                else self.state.element_colors)
+
+    def annotation_visible(self, kind: str) -> bool:
+        if kind in self.state.annotation_visibility:
+            return self.state.annotation_visibility[kind]
+        return getattr(self.simulator, SAVED_VISIBILITY_METHODS[kind])()
+
+    async def capture_camera_pose(self) -> dict | None:
+        if self.scene is None:
+            return None
+        try:
+            pose = await ui.run_javascript(f"""
+                const scene = getElement({self.scene.id});
+                if (!scene?.camera || !scene.controls) return null;
+                return {{position:scene.camera.position.toArray(), target:scene.controls.target.toArray(),
+                         up:scene.camera.up.toArray(), zoom:scene.camera.zoom}};
+            """, timeout=3)
+            return validated_saved_camera(pose)
+        except (TimeoutError, RuntimeError):
+            return None
+
+    def restore_camera_pose(self, pose: dict, model: CrystalModel) -> None:
+        position, up, target = (pose[key] for key in ("position", "up", "target"))
+        self.scene.move_camera(x=position[0], y=position[1], z=position[2],
+            look_at_x=target[0], look_at_y=target[1], look_at_z=target[2],
+            up_x=up[0], up_y=up[1], up_z=up[2], duration=0)
+        script = f"""
+            const scene = getElement({self.scene.id});
+            if (scene?.camera && scene.controls) {{
+                scene.camera_tween?.stop();
+                scene.camera.position.fromArray({json.dumps(position)});
+                scene.camera.up.fromArray({json.dumps(up)});
+                scene.controls.target.fromArray({json.dumps(target)});
+                scene.camera.zoom = {pose['zoom']};
+                scene.camera.far = {max(5000, float(np.linalg.norm(position)) + model.limit * 3)};
+                scene.controls.update(); scene.camera.updateProjectionMatrix(); scene.resize();
+            }}
+        """
+        self.scene.on("init", js_handler=f"() => {{{script}}}")
+        self.scene.client.run_javascript(script)
 
     def render_crystal_png(
         self,
@@ -4173,7 +4646,7 @@ class PanelController:
             width = height * (frame_size[0] / frame_size[1] if frame_size else figure_aspect)
 
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
-        background_color = (0.0, 0.0, 0.0, 0.0) if transparent_background else "#0B0F14"
+        background_color = (0.0, 0.0, 0.0, 0.0) if transparent_background else self.state.display_settings.backgrounds.crystal
         figsize = (frame_size[0] / dpi, frame_size[1] / dpi) if frame_size else (4.6, 3.6)
         fig = Figure(figsize=figsize, dpi=dpi, facecolor=background_color)
         FigureCanvasAgg(fig)
@@ -4220,7 +4693,7 @@ class PanelController:
             points = screen_points(np.array([start, end]))
             add_line(points[0], points[1], (*color_to_rgb(settings.frame_color), settings.frame_opacity), 1.25 * settings.frame_width)
 
-        atom_edge_rgb = (0.0, 0.0, 0.0) if transparent_background else color_to_rgb("#0B0F14")
+        atom_edge_rgb = (0.0, 0.0, 0.0) if transparent_background else color_to_rgb(self.state.display_settings.backgrounds.crystal)
         for atom in model.visible_display_atoms():
             center = screen_points(np.array([atom.position]))[0]
             radius_factor = model.atom_radius_scale * occupancy_radius_factor(atom.occupancy) * atom.radius_multiplier / model.display_extent_scale
@@ -4259,12 +4732,12 @@ class PanelController:
                     path, depth_at, face_color=rgba if fill else None,
                     edge_color=rgba, linewidth=2.4, dashed=vector.is_reciprocal and not fill,
                 ))
-            if self.simulator.show_crystal_annotations() and settings.vector_label_opacity > 0:
+            if self.annotation_visible("crystal") and settings.vector_label_opacity > 0:
                 ax.text(
                     x1 + 0.025 * width,
                     y1 + 0.025 * height,
                     vector.label,
-                    color=color,
+                    color=crystal_text_color(settings, color),
                     alpha=settings.vector_label_opacity,
                     fontsize=9 * settings.vector_label_scale,
                     weight="bold",
@@ -4330,27 +4803,27 @@ class PanelController:
                         color_at=crystal_atom_shader(center, radius, rgb, atom_shading) if use_shader else None))
                     if use_shader:
                         layers.append(CrystalExportLayer(path, marker_depth, edge_color=edge, linewidth=.4))
-            if marker["label"] and self.simulator.show_crystal_annotations():
+            if marker["label"] and self.annotation_visible("crystal"):
                 x, y = project(np.mean(marker["points"], axis=0))
                 dx, dy = marker["label_direction"]
                 gap = marker["label_gap"] * 9 / 13
                 ax.annotate(marker["label"], (x, y), xytext=(dx * gap, dy * gap), textcoords="offset points",
-                    color=marker["label_color"], alpha=marker["label_opacity"], fontsize=9 * marker["label_size"] / 13,
+                    color=crystal_text_color(settings, marker["label_color"]), alpha=marker["label_opacity"], fontsize=9 * marker["label_size"] / 13,
                     ha="left" if dx > 0 else "right" if dx < 0 else "center",
                     va="bottom" if dy > 0 else "top" if dy < 0 else "center", zorder=6, parse_math=False)
 
         pixels = composite_crystal_export(layers, pixel_width, pixel_height, dpi)
         fig.figimage(pixels, origin="upper", zorder=-1)
 
-        if self.simulator.show_crystal_annotations() and settings.plane_label_opacity > 0:
+        if self.annotation_visible("crystal") and settings.plane_label_opacity > 0:
             for index, (plane, polygon) in enumerate(plane_polygons):
                 color = plane_palette[index % len(plane_palette)]
                 x, y = project(np.mean(polygon, axis=0))
-                ax.text(x, y, plane.label, color=color, alpha=settings.plane_label_opacity,
+                ax.text(x, y, plane.label, color=crystal_text_color(settings, color), alpha=settings.plane_label_opacity,
                         fontsize=9 * settings.plane_label_scale, weight="bold", ha="center", va="center", zorder=6)
 
-        if self.simulator.show_scale_bars() and settings.annotations.real_scale_visible:
-            style = settings.annotations.real_scale
+        if self.annotation_visible("scale") and settings.annotations.real_scale_visible:
+            style = display_annotations(settings).real_scale
             right, top = "right" in style.position, "top" in style.position
             visible_nm = max(width * model.scale_nm, 1e-9)
             bar_nm = choose_scale_bar(visible_nm)
@@ -4538,15 +5011,15 @@ class PanelController:
             try {{
                 dataUrl = await window.Plotly.toImage(plot, {{
                     format: 'png',
-                    width: Math.max(1, Math.round(rect.width)),
-                    height: Math.max(1, Math.round(rect.height)),
+                    width: Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440)),
+                    height: Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280)),
                     scale,
                 }});
             }} finally {{
                 if (transparentBackground) {{
                     await window.Plotly.relayout(plot, {{
-                        paper_bgcolor: originalPaper || '#050607',
-                        plot_bgcolor: originalPlot || '#050607',
+                        paper_bgcolor: originalPaper || '#000000',
+                        plot_bgcolor: originalPlot || '#000000',
                     }});
                 }}
             }}
@@ -4729,6 +5202,11 @@ class PanelController:
     def redraw_scene(self, model: CrystalModel | None = None, *, update_camera: bool = True) -> None:
         if self.scene is None:
             return
+        background = self.state.display_settings.backgrounds.crystal
+        if self.scene._props.get("background-color") != background:
+            self.scene.props(f"background-color={background}")
+            if core.is_loop_running():
+                ui.run_javascript(f"const scene=getElement({self.scene.id}); scene?.renderer?.setClearColor({json.dumps(background)});")
         model = self.display_model(model)
         self.current_model = model
         signature = self.scene_content_signature(model)
@@ -4739,6 +5217,8 @@ class PanelController:
             self.scene.atom_sectors = {}
             self.scene.marker_groups = {}
             with self.scene:
+                if self.coordinate_grid_enabled:
+                    self.draw_coordinate_grid(model)
                 for start, end in model.display_edges:
                     settings = self.state.display_settings
                     if settings.frame_opacity == 0:
@@ -4777,12 +5257,12 @@ class PanelController:
                 if geometry:
                     group = self.scene.group()
                     self.scene.marker_groups[group.id] = geometry
-                    if self.simulator.show_crystal_annotations():
+                    if self.annotation_visible("crystal"):
                         for marker in geometry:
                             if marker["label"]:
                                 dx, dy = marker["label_direction"]
                                 gap = marker["label_gap"]
-                                style = (f"color:{marker['label_color']};opacity:{marker['label_opacity']};"
+                                style = (f"color:{crystal_text_color(self.state.display_settings, marker['label_color'])};opacity:{marker['label_opacity']};"
                                          f"font-size:{marker['label_size']}px;white-space:nowrap;pointer-events:none;"
                                          f"translate:calc({dx * 50}% + {dx * gap}px) calc({-dy * 50}% + {-dy * gap}px);")
                                 self.scene.text(marker["label"], style=style).move(
@@ -4796,6 +5276,10 @@ class PanelController:
         self.position_scene_camera(model, self.state.view_vector, self.state.roll)
 
     def position_scene_camera(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> None:
+        if self.state.initial_camera is not None:
+            pose, self.state.initial_camera = self.state.initial_camera, None
+            self.restore_camera_pose(pose, model)
+            return
         view = normalize_vector(view_vector)
         if view is None:
             view = np.array([1.0, 0.0, 0.0])
@@ -4928,12 +5412,15 @@ class PanelController:
         return (
             crystal_model_key(model),
             json.dumps(asdict(crystal_display_settings(self.state.display_settings)), sort_keys=True),
+            crystal_text_color(self.state.display_settings, ""),
             self.state.plane_text,
             self.state.vector_text,
-            bool(self.simulator.show_crystal_annotations()),
+            self.annotation_visible("crystal"),
+            self.coordinate_grid_enabled,
+            self.coordinate_grid_settings if self.coordinate_grid_enabled else None,
             tuple(self.simulator.plane_palette(self.state.panel_id)),
             tuple(self.simulator.vector_palette(self.state.panel_id)),
-            tuple(sorted(relevant_element_colors(model, getattr(self.simulator, "element_colors", {})).items())),
+            tuple(sorted(display_element_colors(model, self.state.display_settings, self.effective_element_colors()).items())),
         )
 
     def set_scale_bar_from_distance(
@@ -4945,7 +5432,7 @@ class PanelController:
         if self.scale_bar_line is None or self.scale_bar_label is None:
             return
         self.apply_scale_bar_visibility()
-        if not self.simulator.show_scale_bars() or not self.state.display_settings.annotations.real_scale_visible:
+        if not self.annotation_visible("scale") or not self.state.display_settings.annotations.real_scale_visible:
             return
 
         viewport_height_world = max(
@@ -4978,16 +5465,33 @@ class PanelController:
     def apply_scale_bar_visibility(self) -> None:
         if self.scale_bar_container is None:
             return
-        settings = self.state.display_settings.annotations
+        settings = display_annotations(self.state.display_settings)
         style = settings.real_scale
         right, top = "right" in style.position, "top" in style.position
-        self.scale_bar_container.visible = self.simulator.show_scale_bars() and settings.real_scale_visible
+        self.scale_bar_container.visible = self.annotation_visible("scale") and settings.real_scale_visible
         self.scale_bar_container.style(
             f"top: {'14px' if top else 'auto'}; bottom: {'auto' if top else '14px'}; "
-            f"display: flex; flex-direction: column; align-items: {'flex-end' if right else 'flex-start'}; opacity: {style.opacity}")
-        self.scale_bar_line.style(f"margin-left: 16px; margin-right: 16px; background: {style.color}; border-color: {style.color}")
+            f"display: flex; flex-direction: column; align-items: {'flex-end' if right else 'flex-start'}; opacity: {style.opacity};"
+            f"text-shadow: {'none' if self.state.display_settings.backgrounds.automatic_text else '0 1px 3px rgba(0,0,0,.85)'}")
+        self.scale_bar_line.style(f"margin-left: 16px; margin-right: 16px; background: {style.color}; border-color: {style.color};"
+                                 f"box-shadow: {'none' if self.state.display_settings.backgrounds.automatic_text else '0 1px 4px rgba(0,0,0,.7)'}")
         self.scale_bar_label.style(f"margin-left: 16px; margin-right: 16px; color: {style.color}; font-size: {style.font_size:g}px")
         self.scale_bar_container.update()
+
+    def draw_coordinate_grid(self, model: CrystalModel) -> None:
+        low, high = display_cell_bounds(self.state.display_settings.cells)
+        grid = coordinate_grid_geometry(model, low, high, self.state.display_settings.markers,
+                                        self.coordinate_grid_settings)
+        self.coordinate_grid_step = grid["step"]
+        self.coordinate_grid_limit = grid["limit"]
+        with self.scene.group().with_name("coordinate-grid"):
+            for start, end in grid["segments"]:
+                self.scene.line(start, end).material(color="#A1ABB6", opacity=.22)
+            for axis in grid["axes"]:
+                self.draw_arrow(np.array(axis["start"]), np.array(axis["end"]), axis["color"],
+                                shaft_radius=.006, head_radius=.028, opacity=.9, head_length=axis["head_length"])
+                self.scene.text(axis["label"], style=f"color:{axis['color']};font-size:14px;font-weight:700;"
+                                "pointer-events:none;translate:8px -10px;text-shadow:0 1px 3px #000;").move(*axis["end"])
 
     def draw_planes(self, model: CrystalModel, planes: list[ParsedIndex]) -> None:
         if self.scene is None:
@@ -5007,9 +5511,9 @@ class PanelController:
             if settings.plane_edge_opacity > 0:
                 for start, end in zip(vertices, np.roll(vertices, -1, axis=0)):
                     self.scene.line(start.tolist(), end.tolist()).material(color=color, opacity=settings.plane_edge_opacity)
-            if self.simulator.show_crystal_annotations() and settings.plane_label_opacity > 0:
+            if self.annotation_visible("crystal") and settings.plane_label_opacity > 0:
                 label_position = np.mean(vertices, axis=0)
-                self.scene.text(plane.label, style=f"color: {color}; opacity: {settings.plane_label_opacity}; font-size: {13 * settings.plane_label_scale:g}px; font-weight: 700;").move(
+                self.scene.text(plane.label, style=f"color: {crystal_text_color(settings, color)}; opacity: {settings.plane_label_opacity}; font-size: {13 * settings.plane_label_scale:g}px; font-weight: 700;").move(
                     *label_position.tolist()
                 )
 
@@ -5030,8 +5534,8 @@ class PanelController:
                 start, end = direction_segment_for_display(vector.values, model)
                 if opacity > 0:
                     self.draw_arrow(start, end, color, opacity=opacity)
-            if self.simulator.show_crystal_annotations() and settings.vector_label_opacity > 0:
-                self.scene.text(vector.label, style=f"color: {color}; opacity: {settings.vector_label_opacity}; font-size: {13 * settings.vector_label_scale:g}px; font-weight: 700;").move(
+            if self.annotation_visible("crystal") and settings.vector_label_opacity > 0:
+                self.scene.text(vector.label, style=f"color: {crystal_text_color(settings, color)}; opacity: {settings.vector_label_opacity}; font-size: {13 * settings.vector_label_scale:g}px; font-weight: 700;").move(
                     *end.tolist()
                 )
 
@@ -5056,6 +5560,7 @@ class PanelController:
         shaft_radius: float = 0.018,
         head_radius: float = 0.055,
         opacity: float = 0.95,
+        head_length: float = 0.18,
     ) -> None:
         if self.scene is None:
             return
@@ -5064,7 +5569,7 @@ class PanelController:
         if length < 1e-8:
             return
         direction = delta / length
-        head_length = min(0.18, length * 0.28)
+        head_length = min(head_length, length * 0.28)
         shaft_length = max(length - head_length, length * 0.5)
         rotation = rotation_matrix_from_y(direction)
         shaft_center = start + direction * (shaft_length * 0.5)
@@ -5081,7 +5586,7 @@ class PanelController:
             return
         model = model or self.simulator.model_for(self.state.crystal_name)
         spots = self.simulator.diffraction_spots_for_state(self.state, model)
-        spot_color = self.simulator.diffraction_color_for_state(self.state)
+        spot_color = self.simulator.display_diffraction_color(self.state)
         limit = self.simulator.current_diffraction_limit()
         zone_label = (
             zone_axis_label_from_view(
@@ -5089,7 +5594,7 @@ class PanelController:
                 self.state.view_vector,
                 use_hex_four_index=self.simulator.use_hex_four_index_basis(),
             )
-            if self.simulator.show_zone_axis_on_diffraction()
+            if self.annotation_visible("zone")
             else ""
         )
         self.diffraction.update_figure(
@@ -5110,14 +5615,15 @@ class PanelController:
         spot_color: str,
         zone_label: str = "",
     ) -> dict[str, Any]:
-        settings = self.state.display_settings.annotations
+        settings = display_annotations(self.state.display_settings)
+        background = self.state.display_settings.backgrounds.diffraction
         shapes, annotations = (
             diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit(), settings)
-            if self.simulator.show_scale_bars()
+            if self.annotation_visible("scale")
             else ([], [])
         )
         if zone_label:
-            annotations.append(diffraction_zone_axis_annotation(limit, zone_label, settings, self.simulator.show_scale_bars()))
+            annotations.append(diffraction_zone_axis_annotation(limit, zone_label, settings, self.annotation_visible("scale")))
         data: list[dict[str, Any]] = []
         if len(spots):
             intensity = spots[:, 2]
@@ -5149,7 +5655,7 @@ class PanelController:
                     },
                 }
             )
-            if self.simulator.show_indices():
+            if self.annotation_visible("indices"):
                 annotations.extend(self.diffraction_index_annotations(spots, limit, labels, settings, marker_size))
         else:
             annotations.append(
@@ -5160,14 +5666,14 @@ class PanelController:
                     "yref": "y",
                     "text": "No reflections in Ewald condition",
                     "showarrow": False,
-                    "font": {"color": "#B8C0CC", "size": 12},
+                    "font": {"color": contrast_text_color(background), "size": 12},
                 }
             )
         return {
             "data": data,
             "layout": {
-                "paper_bgcolor": "#050607",
-                "plot_bgcolor": "#050607",
+                "paper_bgcolor": background,
+                "plot_bgcolor": background,
                 "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
                 "xaxis": {
                     "visible": False,
@@ -5246,6 +5752,9 @@ class ComboPanelController:
         self.card = None
         self.source_select = None
         self.source_list_container = None
+        self.source_rows = self.source_sortable = None
+        self.source_row_panel_ids = {}
+        self.view_splitter = None
         self.diffraction = None
         self.download_dialog = None
         self.animation_dialog = None
@@ -5278,7 +5787,7 @@ class ComboPanelController:
                     "Bind crystal motion",
                     value=self.state.bind_motion,
                     on_change=self.on_bind_motion_changed,
-                ).props("dense").classes("combo-bind-checkbox")
+                ).props("dense color=secondary").classes("combo-bind-checkbox")
                 ui.button(icon="photo_camera", on_click=self.open_download_dialog).props("flat round dense").classes(
                     "combo-download-button"
                 ).tooltip("Download combo diffraction")
@@ -5290,9 +5799,25 @@ class ComboPanelController:
                     "flat round dense"
                 ).classes("panel-close-button").tooltip("Remove combo panel")
 
-            with ui.element("div").classes("combo-stack"):
-                self.source_list_container = ui.element("div").classes("combo-source-list")
-                self.diffraction = ui.plotly(empty_diffraction_figure()).classes("diffraction-plot combo-diffraction-plot")
+            with PanelViewSplitter(self.state.source_view_percent,
+                                   lambda event: setattr(self.state, "source_view_percent", event.value),
+                                   "Resize source list and diffraction views") as self.view_splitter:
+                with self.view_splitter.before:
+                    with ui.element("div").classes("combo-source-list") as self.source_list_container:
+                        with ui.element("div").classes("combo-source-header"):
+                            ui.element("div")
+                            ui.label("Panel")
+                            ui.label("Crystal")
+                            ui.label("Zone")
+                            ui.label("")
+                        self.source_rows = ui.column().classes("combo-source-rows full-width gap-0")
+                        self.source_sortable = self.source_rows.make_sortable(
+                            options={"forceFallback": True, "fallbackTolerance": 4,
+                                     "chosenClass": "combo-source-chosen", "fallbackClass": "combo-source-ghost"},
+                            handle=".combo-source-drag", on_end=self.on_sources_sorted)
+                        self.source_sortable.move(self.source_list_container)
+                with self.view_splitter.after:
+                    self.diffraction = ui.plotly(empty_diffraction_figure()).classes("diffraction-plot combo-diffraction-plot")
 
         self.refresh()
         self.update_magnify_button()
@@ -5388,15 +5913,15 @@ class ComboPanelController:
             try {{
                 dataUrl = await window.Plotly.toImage(plot, {{
                     format: 'png',
-                    width: Math.max(1, Math.round(rect.width)),
-                    height: Math.max(1, Math.round(rect.height)),
+                    width: Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440)),
+                    height: Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280)),
                     scale,
                 }});
             }} finally {{
                 if (transparentBackground) {{
                     await window.Plotly.relayout(plot, {{
-                        paper_bgcolor: originalPaper || '#050607',
-                        plot_bgcolor: originalPlot || '#050607',
+                        paper_bgcolor: originalPaper || '#000000',
+                        plot_bgcolor: originalPlot || '#000000',
                     }});
                 }}
             }}
@@ -5482,18 +6007,24 @@ class ComboPanelController:
         self.simulator.set_status(f"Combo C{self.state.combo_id}: removed panel {panel_id}")
 
     def move_source(self, panel_id: int, direction: int) -> None:
+        if panel_id in self.state.source_panel_ids:
+            self.move_source_to(panel_id, self.state.source_panel_ids.index(panel_id) + direction)
+
+    def move_source_to(self, panel_id: int, new_index: int) -> None:
         try:
             index = self.state.source_panel_ids.index(panel_id)
         except ValueError:
             return
-        new_index = min(max(index + direction, 0), len(self.state.source_panel_ids) - 1)
+        new_index = min(max(new_index, 0), len(self.state.source_panel_ids) - 1)
         if new_index == index:
             return
-        self.state.source_panel_ids[index], self.state.source_panel_ids[new_index] = (
-            self.state.source_panel_ids[new_index],
-            self.state.source_panel_ids[index],
-        )
+        self.state.source_panel_ids.insert(new_index, self.state.source_panel_ids.pop(index))
         self.refresh()
+
+    def on_sources_sorted(self, event) -> None:
+        panel_id = self.source_row_panel_ids.get(event.item.id)
+        if panel_id is not None:
+            self.move_source_to(panel_id, event.new_index)
 
     def refresh(self) -> None:
         self.simulator.repair_combo_sources(self.state)
@@ -5515,16 +6046,12 @@ class ComboPanelController:
         self.source_select.update()
 
     def refresh_source_list(self) -> None:
-        if self.source_list_container is None:
+        if self.source_rows is None:
             return
         sources = self.selected_sources()
-        self.source_list_container.clear()
-        with self.source_list_container:
-            with ui.element("div").classes("combo-source-header"):
-                ui.label("Panel")
-                ui.label("Crystal")
-                ui.label("Zone")
-                ui.label("")
+        self.source_rows.clear()
+        self.source_row_panel_ids.clear()
+        with self.source_rows:
             for index, source in enumerate(sources):
                 model = self.simulator.model_for(source.crystal_name)
                 zone = zone_axis_label_from_view(
@@ -5532,7 +6059,10 @@ class ComboPanelController:
                     source.view_vector,
                     use_hex_four_index=self.simulator.use_hex_four_index_basis(),
                 ).replace(" zone", "")
-                with ui.element("div").classes("combo-source-row"):
+                with ui.element("div").classes("combo-source-row") as row:
+                    self.source_row_panel_ids[row.id] = source.panel_id
+                    ui.button(icon="drag_indicator").props("flat round dense size=sm aria-label='Reorder crystal'").classes(
+                        "combo-source-drag").tooltip("Hold and drag to reorder crystal")
                     ui.label(str(source.panel_id)).classes("combo-source-panel-id")
                     ui.label(source.crystal_name).classes("combo-source-name")
                     ui.label(zone).classes("combo-source-zone")
@@ -5570,7 +6100,8 @@ class ComboPanelController:
         self.diffraction.update_figure(self.build_combo_figure(sources, limit, zone_label))
 
     def build_combo_figure(self, sources: list[PanelState], limit: float, zone_label: str = "") -> dict[str, Any]:
-        settings = self.simulator.global_annotation_settings()
+        display = self.simulator.global_display_settings
+        settings = display_annotations(display)
         shapes, annotations = (
             diffraction_scale_bar_items(limit, self.simulator.current_reciprocal_units_per_plot_unit(), settings)
             if self.simulator.show_scale_bars()
@@ -5585,7 +6116,7 @@ class ComboPanelController:
             if not len(spots):
                 continue
             intensity = spots[:, 2]
-            spot_color = self.simulator.diffraction_color_for_state(source)
+            spot_color = self.simulator.display_diffraction_color(source, display.backgrounds.diffraction)
             size_scaling = self.simulator.current_spot_size_scaling_effect()
             marker_size = BASE_DIFFRACTION_MARKER_SIZE + EXTRA_DIFFRACTION_MARKER_SIZE * size_scaling * intensity**1.18
             labels = []
@@ -5617,7 +6148,7 @@ class ComboPanelController:
             )
             if self.simulator.show_indices():
                 annotations.extend(PanelController.diffraction_index_annotations(
-                    spots, limit, labels, source.display_settings.annotations, marker_size))
+                    spots, limit, labels, display_annotations(source.display_settings, display.backgrounds), marker_size))
         if not data:
             annotations.append(
                 {
@@ -5627,14 +6158,14 @@ class ComboPanelController:
                     "yref": "y",
                     "text": "No source reflections to overlay",
                     "showarrow": False,
-                    "font": {"color": "#B8C0CC", "size": 12},
+                    "font": {"color": contrast_text_color(display.backgrounds.diffraction), "size": 12},
                 }
             )
         return {
             "data": data,
             "layout": {
-                "paper_bgcolor": "#050607",
-                "plot_bgcolor": "#050607",
+                "paper_bgcolor": display.backgrounds.diffraction,
+                "plot_bgcolor": display.backgrounds.diffraction,
                 "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
                 "xaxis": {
                     "visible": False,
@@ -5803,14 +6334,16 @@ class StaticDownloadDialog:
             const plot = root?.querySelector('.diffraction-plot.js-plotly-plot') || root?.querySelector('.diffraction-plot .js-plotly-plot');
             if (!plot || !window.Plotly) throw new Error('Diffraction view is not ready');
             const rect = plot.getBoundingClientRect();
+            const width = Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440));
+            const height = Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280));
             const figure = JSON.parse(JSON.stringify({{data: plot.data, layout: plot.layout}}));
             if ({json.dumps(transparent)}) {{
                 figure.layout.paper_bgcolor = 'rgba(0,0,0,0)';
                 figure.layout.plot_bgcolor = 'rgba(0,0,0,0)';
             }}
             return await window.Plotly.toImage(figure, {{format: 'png',
-                width: Math.max(1, Math.round(rect.width)), height: Math.max(1, Math.round(rect.height)),
-                scale: Math.min(1, 690 / Math.max(rect.width, rect.height)) * Math.min(1, {dpi} / 150)}});
+                width, height,
+                scale: Math.min(1, 690 / Math.max(width, height)) * Math.min(1, {dpi} / 150)}});
         """, timeout=30)
         return decode_png_data_url(data_url)
 
@@ -5891,6 +6424,267 @@ class StaticDownloadDialog:
                 self.schedule_preview()
 
 
+class ThemeDialog:
+    def __init__(self, simulator: "SimulatorApp") -> None:
+        self.simulator = simulator
+        self.loading = True
+        self.busy = False
+        self.theme_inputs: dict[str, Any] = {}
+        self.theme_store = SavedThemeStore(SAVED_THEMES_PATH)
+        self.saved_theme_name: str | None = None
+        self.action_dialog = None
+        storage_error = ""
+        try:
+            self.saved_themes = self.theme_store.read()
+        except ValueError as exc:
+            self.saved_themes = {}
+            storage_error = str(exc)
+        self.dialog = ui.dialog()
+        with self.dialog, ui.card().classes("theme-card"):
+            with ui.row().classes("items-center justify-between full-width"):
+                ui.label("Theme").classes("text-h6")
+                ui.button(icon="close", on_click=self.dialog.close).props("flat round dense").tooltip("Close")
+            with ui.column().classes("theme-dialog-body full-width"):
+                self.theme_preset = ui.select(self.preset_options(), label="Theme", value="Custom",
+                                             on_change=self.choose_theme).props("outlined dense").classes("full-width")
+                with ui.row().classes("items-center gap-1 theme-preset-actions"):
+                    self.save_button = ui.button("Save theme", icon="bookmark_add", on_click=self.open_save_theme).props(
+                        "outline dense").tooltip("Save a new named copy of these colors")
+                    self.update_button = ui.button(icon="save", on_click=lambda: self.confirm_saved_theme_action("update")).props(
+                        'flat round dense aria-label="Update saved theme"').tooltip("Update saved theme")
+                    self.rename_button = ui.button(icon="edit", on_click=lambda: self.open_save_theme(rename=True)).props(
+                        'flat round dense aria-label="Rename saved theme"').tooltip("Rename saved theme")
+                    self.delete_button = ui.button(icon="delete", on_click=lambda: self.confirm_saved_theme_action("delete")).props(
+                        'flat round dense color=negative aria-label="Delete saved theme"').tooltip("Delete saved theme")
+                self.theme_dark = ui.checkbox("Dark controls", on_change=self.customize_theme)
+                self.theme_dark.tooltip("Use dark styling for inputs, menus, and checkboxes; panel backgrounds are set separately.")
+                with ui.grid(columns=2).classes("full-width gap-3 theme-color-grid"):
+                    for name, label in THEME_COLOR_LABELS.items():
+                        self.theme_inputs[name] = ui.color_input(label, preview=True, on_change=self.customize_theme).props("outlined dense")
+                    self.crystal_background = ui.color_input("Crystal background", preview=True,
+                        on_change=self.customize_theme).props("outlined dense")
+                    self.diffraction_background = ui.color_input("Diffraction background", preview=True,
+                        on_change=self.customize_theme).props("outlined dense")
+                self.background_auto_text = ui.checkbox("Automatic text contrast", on_change=self.customize_theme)
+                self.background_auto_text.tooltip("Use black or white annotations against each panel background. Panel-specific background overrides are kept.")
+                with ui.row().classes("items-center gap-2"):
+                    ui.button("White background", icon="light_mode", on_click=lambda:
+                              self.set_backgrounds(PanelBackgrounds("#FFFFFF", "#FFFFFF", True))).props("outline dense")
+                    ui.button("Black background", icon="dark_mode", on_click=lambda:
+                              self.set_backgrounds(PanelBackgrounds("#000000", "#000000", True))).props("outline dense")
+                with ui.element("div").classes("theme-sample full-width") as self.theme_sample:
+                    with ui.row().classes("items-center justify-between full-width"):
+                        ui.label("CrysDiS").classes("text-subtitle1")
+                        ui.icon("palette").classes("theme-sample-accent").tooltip("Accent color preview")
+                    with ui.row().classes("full-width no-wrap gap-2"):
+                        self.crystal_sample = ui.label("Crystal").classes("theme-panel-sample")
+                        self.diffraction_sample = ui.label("Diffraction").classes("theme-panel-sample")
+            with ui.row().classes("full-width justify-end gap-2"):
+                self.reset_button = ui.button("Reset theme", icon="restart_alt",
+                    on_click=lambda: self.set_theme_draft(InterfaceTheme(), preset_name="Classic dark")).props("outline dense")
+                self.apply_button = ui.button("Apply/Close", icon="check", on_click=self.apply).props("unelevated dense")
+        self.set_theme_draft(simulator.theme)
+        self.loading = False
+        if storage_error:
+            ui.notify(storage_error, type="warning")
+
+    def preset_options(self) -> dict[str, str]:
+        return {**{name: name for name in THEME_PRESETS},
+                **{name: f"{name} (saved)" for name in sorted(self.saved_themes, key=str.casefold)}, "Custom": "Custom"}
+
+    def refresh_saved_theme_controls(self) -> None:
+        saved = self.saved_theme_name in self.saved_themes
+        self.save_button.set_enabled(not self.busy)
+        self.rename_button.set_enabled(saved and not self.busy)
+        self.delete_button.set_enabled(saved and not self.busy)
+        try:
+            modified = saved and self.read_theme() != self.saved_themes[self.saved_theme_name]
+        except (ValueError, TypeError):
+            modified = False
+        self.update_button.set_enabled(bool(modified) and not self.busy)
+
+    def refresh_preset_options(self) -> None:
+        loading, self.loading = self.loading, True
+        value = self.theme_preset.value
+        options = self.preset_options()
+        self.theme_preset.set_options(options, value=value if value in options else "Custom")
+        self.loading = loading
+
+    def clear_action_dialog(self, dialog) -> None:
+        if self.action_dialog is dialog:
+            self.action_dialog = None
+
+    def open_save_theme(self, *, rename: bool = False) -> None:
+        if self.busy or self.action_dialog is not None:
+            return
+        original = self.saved_theme_name if rename else None
+        if rename and original not in self.saved_themes:
+            return
+        try:
+            theme = self.read_theme()
+        except (ValueError, TypeError) as exc:
+            ui.notify(f"Cannot save theme: {exc}", type="negative")
+            return
+        previous = copy.deepcopy(self.saved_themes.get(original))
+        with self.dialog:
+            dialog = self.action_dialog = ui.dialog()
+        dialog.on("hide", lambda: self.clear_action_dialog(dialog))
+        with dialog, ui.card().classes("theme-name-card"):
+            ui.label("Rename saved theme" if rename else "Save theme").classes("text-h6")
+            name = ui.input("Theme name", value=original or "").props("outlined dense autofocus maxlength=80").classes("full-width")
+            error = ui.label().classes("text-negative full-width break-words")
+            error.visible = False
+
+            def save() -> None:
+                try:
+                    saved_name = self.theme_store.name(name.value)
+                    themes = (self.theme_store.change(original, "rename", saved_name, expected=previous) if rename
+                              else self.theme_store.save(saved_name, theme))
+                except (OSError, ValueError, TypeError) as exc:
+                    error.set_text(str(exc))
+                    error.visible = True
+                    return
+                selected = self.theme_preset.value
+                self.saved_themes = themes
+                self.refresh_preset_options()
+                if rename:
+                    self.saved_theme_name = saved_name
+                    if selected == original:
+                        loading, self.loading = self.loading, True
+                        self.theme_preset.value = saved_name
+                        self.loading = loading
+                    self.refresh_saved_theme_controls()
+                else:
+                    self.set_theme_draft(theme, preset_name=saved_name)
+                dialog.close()
+                self.clear_action_dialog(dialog)
+                ui.notify("Theme renamed" if rename else "Theme saved", type="positive")
+
+            name.on("keydown.enter", save)
+            with ui.row().classes("full-width justify-end gap-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                ui.button("Rename" if rename else "Save", icon="save", on_click=save).props("unelevated dense")
+        dialog.open()
+
+    def confirm_saved_theme_action(self, action: str) -> None:
+        name = self.saved_theme_name
+        if self.busy or self.action_dialog is not None or name not in self.saved_themes:
+            return
+        try:
+            theme = self.read_theme() if action == "update" else None
+        except (ValueError, TypeError) as exc:
+            ui.notify(f"Cannot update theme: {exc}", type="negative")
+            return
+        previous = copy.deepcopy(self.saved_themes[name])
+        with self.dialog:
+            dialog = self.action_dialog = ui.dialog()
+        dialog.on("hide", lambda: self.clear_action_dialog(dialog))
+        with dialog, ui.card().classes("theme-name-card"):
+            ui.label("Update saved theme?" if action == "update" else "Delete saved theme?").classes("text-h6")
+            ui.label(f'Replace the saved colors in "{name}"?' if action == "update" else
+                     f'Delete "{name}" from saved themes? Your current appearance will stay unchanged.').classes("full-width break-words")
+            error = ui.label().classes("text-negative full-width break-words")
+            error.visible = False
+
+            def confirm() -> None:
+                try:
+                    themes = self.theme_store.change(name, action, theme, expected=previous)
+                except (OSError, ValueError, TypeError) as exc:
+                    error.set_text(str(exc))
+                    error.visible = True
+                    return
+                self.saved_themes = themes
+                self.refresh_preset_options()
+                if action == "update":
+                    self.set_theme_draft(theme, preset_name=name)
+                else:
+                    self.saved_theme_name = None
+                    self.customize_theme()
+                dialog.close()
+                self.clear_action_dialog(dialog)
+                ui.notify("Saved theme updated" if action == "update" else "Saved theme deleted", type="positive")
+
+            with ui.row().classes("full-width justify-end gap-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                ui.button("Update" if action == "update" else "Delete", icon="save" if action == "update" else "delete",
+                          on_click=confirm).props("unelevated dense" + (" color=negative" if action == "delete" else ""))
+        dialog.open()
+
+    def read_theme(self) -> InterfaceTheme:
+        return validate_theme(InterfaceTheme(dark=bool(self.theme_dark.value),
+            backgrounds=PanelBackgrounds(str(self.crystal_background.value), str(self.diffraction_background.value),
+                                         bool(self.background_auto_text.value)),
+            **{name: control.value for name, control in self.theme_inputs.items()}))
+
+    def set_theme_draft(self, theme: InterfaceTheme, *, preset_name: str | None = None) -> None:
+        loading, self.loading = self.loading, True
+        self.theme_dark.value = theme.dark
+        for name, control in self.theme_inputs.items():
+            control.value = getattr(theme, name)
+        self.crystal_background.value = theme.backgrounds.crystal
+        self.diffraction_background.value = theme.backgrounds.diffraction
+        self.background_auto_text.value = theme.backgrounds.automatic_text
+        presets = {**self.saved_themes, **THEME_PRESETS}
+        preferred = preset_name or self.saved_theme_name
+        selected = (preferred if preferred in presets and presets[preferred] == theme else
+                    next((name for name, preset in presets.items() if preset == theme), "Custom"))
+        self.saved_theme_name = selected if selected in self.saved_themes else None
+        self.theme_preset.value = selected
+        self.loading = loading
+        self.update_theme_sample()
+        self.refresh_saved_theme_controls()
+
+    def set_backgrounds(self, backgrounds: PanelBackgrounds) -> None:
+        loading, self.loading = self.loading, True
+        self.crystal_background.value = backgrounds.crystal
+        self.diffraction_background.value = backgrounds.diffraction
+        self.background_auto_text.value = backgrounds.automatic_text
+        self.loading = loading
+        self.customize_theme()
+
+    def choose_theme(self) -> None:
+        if not self.loading:
+            name = self.theme_preset.value
+            presets = {**THEME_PRESETS, **self.saved_themes}
+            if name in presets:
+                self.set_theme_draft(presets[name], preset_name=name)
+
+    def customize_theme(self) -> None:
+        if not self.loading:
+            self.theme_preset.value = "Custom"
+            self.update_theme_sample()
+            self.refresh_saved_theme_controls()
+
+    def update_theme_sample(self) -> None:
+        try:
+            theme = self.read_theme()
+        except (ValueError, TypeError):
+            return
+        self.theme_sample.style(f"background:{theme.surface};color:{theme.text};border-color:{theme.primary};"
+                               f"--sample-accent:{theme.primary};--sample-ink:{contrast_text_color(theme.primary)}")
+        for sample, background in ((self.crystal_sample, theme.backgrounds.crystal),
+                                   (self.diffraction_sample, theme.backgrounds.diffraction)):
+            sample.style(f"background:{background};color:{contrast_text_color(background)}")
+
+    async def apply(self) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        self.apply_button.disable()
+        self.reset_button.disable()
+        self.refresh_saved_theme_controls()
+        try:
+            if await self.simulator.apply_theme_settings(self.read_theme()):
+                self.dialog.close()
+        except (ValueError, TypeError, OSError) as exc:
+            ui.notify(f"Cannot apply theme: {exc}", type="negative")
+        finally:
+            self.busy = False
+            self.apply_button.enable()
+            self.reset_button.enable()
+            self.refresh_saved_theme_controls()
+
+
 class DisplaySettingsDialog:
     """Preview private panel edits; commit them only on confirmation."""
 
@@ -5907,6 +6701,8 @@ class DisplaySettingsDialog:
         self.preview_ready = False
         self.preview_closed = False
         self.preview_camera = None
+        self.preview_view_limit = None
+        self.settings_splitter = None
         self.preview_magnified = None
         self.preview_panes: dict[str, Any] = {}
         self.preview_magnify_buttons: dict[str, Any] = {}
@@ -5923,6 +6719,9 @@ class DisplaySettingsDialog:
         self.action_confirm_dialog = None
         self.overlay_inputs: dict[str, dict[str, Any]] = {}
         self.marker_editor = None
+        self.coordinate_grid = None
+        self.grid_spacing = self.grid_volume = self.grid_extent = self.grid_notice = None
+        self.grid_bounds = []
         self.scale_visibility_inputs: dict[str, Any] = {}
         state = simulator.panel_state_by_id(panel_id) if panel_id is not None else None
         self.dialog = ui.dialog()
@@ -5931,13 +6730,21 @@ class DisplaySettingsDialog:
                 title = f"Panel {panel_id} settings - {state.crystal_name}" if state else "Global display settings"
                 ui.label(title).classes("text-h6 flex-1 min-w-0 break-words")
                 ui.button(icon="close", on_click=self.dialog.close).props("flat round dense").tooltip("Close")
-            with ui.element("div").classes("display-settings-body" + (" panel-settings-body" if state else "")):
+            with ui.element("div").classes("display-settings-body"):
                 if state is not None:
-                    self.build_preview()
-                with ui.column().classes("display-settings-controls"):
-                    self.build_controls(state)
+                    with PanelViewSplitter(50, None, "Resize settings previews and controls", responsive=False).classes(
+                            "panel-settings-body") as self.settings_splitter:
+                        with self.settings_splitter.before:
+                            self.build_preview()
+                        with self.settings_splitter.after:
+                            with ui.column().classes("display-settings-controls"):
+                                self.build_controls(state)
+                else:
+                    with ui.column().classes("display-settings-controls"):
+                        self.build_controls(state)
             with ui.row().classes("full-width justify-end display-settings-actions"):
                 if state is not None:
+                    self.action_buttons.append(ui.button("Save view", icon="bookmark_add", on_click=self.open_save_view).props("outline dense"))
                     self.action_buttons.append(ui.button("Follow global settings", icon="public", on_click=lambda: self.request_action("global")).props("outline dense"))
                 self.action_buttons.append(ui.button("Reset display", icon="restart_alt", on_click=lambda: self.request_action("reset")).props("outline dense").tooltip("Restore built-in display settings; keep element colors"))
                 self.action_buttons.append(ui.button("Apply/Close", icon="check", on_click=lambda: self.run_action("apply")).props("unelevated dense"))
@@ -5948,6 +6755,61 @@ class DisplaySettingsDialog:
                     control.on_value_change(self.schedule_preview)
         self.dialog.on("show", self.initialize_preview)
         self.dialog.on("hide", self.dispose_preview)
+
+    async def open_save_view(self) -> None:
+        if self.preview is None or not self.preview_ready or self.preview_closed:
+            ui.notify("Wait for the settings preview before saving a view.", type="warning")
+            return
+        try:
+            draft = self.simulator.validated_display_settings_draft(self.panel_id, self.read())
+            await self.update_preview()
+            camera = await self.preview.capture_camera_pose()
+            if camera is None:
+                raise ValueError("The preview camera is not ready. Please try again.")
+            definition, payload = self.simulator.saved_view_payload(self.panel_id, draft, camera)
+            views = self.simulator.view_store.for_crystal(crystal_identity(definition))
+        except (ValueError, TypeError, OSError) as exc:
+            ui.notify(str(exc), type="negative")
+            return
+        dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("saved-view-dialog"):
+            ui.label(f"Save view - {definition.name}").classes("text-h6 break-words")
+            target = ui.select({"new": "New saved view", **{v["id"]: v["name"] for v in views}},
+                               label="Save target", value="new").props("outlined dense").classes("full-width")
+            names = {view["name"].casefold() for view in views}
+            number = 1
+            while f"View {number}".casefold() in names:
+                number += 1
+            name = ui.input("View name", value=f"View {number}").props("outlined dense maxlength=120").classes("full-width")
+            default = ui.checkbox("Use as default for this crystal", value=False)
+            error = ui.label("").classes("text-negative text-caption break-words")
+
+            def change_target():
+                view = next((v for v in views if v["id"] == target.value), None)
+                name.value = view["name"] if view else f"View {number}"
+                default.value = view["default"] if view else False
+                save.text = "Update view" if view else "Save view"
+                error.text = ""
+
+            def save_view():
+                try:
+                    record = self.simulator.view_store.save(
+                        crystal_identity(definition), crystal_version(definition), name.value, payload,
+                        view_id=None if target.value == "new" else target.value, default=default.value)
+                except (ValueError, OSError) as exc:
+                    error.text = str(exc)
+                    return
+                self.simulator.refresh_crystal_list()
+                self.simulator.set_status(f"Saved view: {definition.name} / {record['name']}")
+                ui.notify(f"Saved view: {record['name']}", type="positive")
+                dialog.close()
+
+            with ui.row().classes("full-width justify-end gap-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                save = ui.button("Save view", icon="save", on_click=save_view).props("unelevated dense")
+            target.on_value_change(change_target)
+        dialog.open()
 
     def build_controls(self, state: PanelState | None) -> None:
         simulator = self.simulator
@@ -6021,6 +6883,18 @@ class DisplaySettingsDialog:
                         self.annotation_inputs[f"{kind}_label_opacity"] = text_opacity
                         self.section_controls["colors"].extend([text_size, text_opacity])
                         self.palette_containers[kind] = ui.element("div").classes("palette-list")
+        with ui.expansion("Panel background colors", icon="format_color_fill").classes("full-width"):
+            self.inheritance_control("backgrounds", "Use global background settings")
+            with ui.grid(columns=2).classes("full-width gap-3 panel-background-settings"):
+                self.crystal_background = ui.color_input("Crystal background", preview=True).props("outlined dense")
+                self.diffraction_background = ui.color_input("Diffraction background", preview=True).props("outlined dense")
+            self.background_auto_text = ui.checkbox("Automatic text contrast")
+            self.background_auto_text.tooltip("Use black or white annotations against each panel background. Uncheck to restore your annotation colors.")
+            with ui.row().classes("items-center gap-2"):
+                white = ui.button("White background", icon="light_mode", on_click=self.white_background).props("outline dense")
+                black = ui.button("Black background", icon="dark_mode", on_click=self.black_background).props("outline dense")
+            self.section_controls["backgrounds"] = [self.crystal_background, self.diffraction_background,
+                                                   self.background_auto_text, white, black]
         with ui.expansion("Annotations", icon="text_fields").classes("full-width"):
             self.inheritance_control("annotations", "Use global annotation settings")
             with ui.row().classes("items-center full-width gap-2"):
@@ -6060,14 +6934,57 @@ class DisplaySettingsDialog:
                         self.element_color_rows[element] = row
         if state is not None:
             with ui.expansion("Crystal markers", icon="edit_location_alt").classes("full-width"):
+                self.coordinate_grid = ui.checkbox("Coordinate grid", value=False,
+                                                  on_change=self.schedule_preview).props("dense")
+                self.coordinate_grid.tooltip("Preview only: not included in export")
+                with ui.column().classes("full-width gap-3 coordinate-grid-options").bind_visibility_from(self.coordinate_grid, "value"):
+                    with ui.grid().classes("full-width gap-3 coordinate-grid-fields"):
+                        self.grid_spacing = ui.select(
+                            {.1: "0.1", .2: "0.2", .25: "0.25", 1/3: "1/3", .5: "0.5", 1.0: "1"},
+                            label="Spacing (cell fractions)", value=.25, on_change=self.schedule_preview).props("outlined dense")
+                        self.grid_extent = ui.select(
+                            {"display": "Displayed cells + markers", "symmetric": "Both sides of origin", "custom": "Custom bounds"},
+                            label="Grid extent", value="display", on_change=self.schedule_preview).props("outlined dense")
+                    self.grid_volume = ui.checkbox("Full 3D grid", value=False, on_change=self.schedule_preview).props("dense")
+                    with ui.grid(columns=2).classes("full-width gap-3 coordinate-grid-bounds").bind_visibility_from(
+                            self.grid_extent, "value", backward=lambda value: value == "custom"):
+                        for axis in "abc":
+                            self.grid_bounds.append(tuple(ui.number(
+                                f"{axis} {label}", value=value, min=-1000, max=1000, step=.25,
+                                on_change=self.schedule_preview).props("outlined dense")
+                                for label, value in (("min", -1), ("max", 1))))
+                    self.grid_notice = ui.label("").classes("text-caption full-width break-words")
+                    self.grid_notice.set_visibility(False)
                 model = make_panel_display_model(simulator.model_for(state.crystal_name), state.display_settings,
-                                                 simulator.element_colors)
-                self.marker_editor = MarkerEditor(model, self.schedule_preview, simulator.show_crystal_annotations,
+                                                 simulator.element_colors_for_state(state))
+                self.marker_editor = MarkerEditor(model, self.schedule_preview,
+                                                  lambda: self.preview.annotation_visible("crystal") if self.preview else simulator.show_crystal_annotations(),
                                                   self.marker_pick_changed)
 
     @staticmethod
     def opacity_control(label: str, value: float) -> Any:
         return ui.number(label, value=100 * value, min=0, max=100, step=5, suffix="%").props("outlined dense").tooltip("0% is invisible; 100% is opaque.")
+
+    def white_background(self) -> None:
+        self.crystal_background.value = self.diffraction_background.value = "#FFFFFF"
+        self.background_auto_text.value = True
+        self.schedule_preview()
+
+    def black_background(self) -> None:
+        self.crystal_background.value = self.diffraction_background.value = "#000000"
+        self.background_auto_text.value = True
+        self.schedule_preview()
+
+    def read_coordinate_grid(self) -> CoordinateGridSettings:
+        bounds = {}
+        if self.grid_extent.value == "custom":
+            try:
+                bounds = {"low": tuple(float(pair[0].value) for pair in self.grid_bounds),
+                          "high": tuple(float(pair[1].value) for pair in self.grid_bounds)}
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Enter all six grid bounds.") from exc
+        return CoordinateGridSettings(spacing=float(self.grid_spacing.value), volume=bool(self.grid_volume.value),
+                                      extent=self.grid_extent.value, **bounds)
 
     def load_annotations(self, settings: PanelAnnotations) -> None:
         for name, control in self.scale_visibility_inputs.items():
@@ -6156,6 +7073,7 @@ class DisplaySettingsDialog:
         # Reuse the frozen renderer, never a controller registered with the live app.
         preview.simulator.auto_sync_view = lambda: False
         preview.simulator.diffraction_color_for_state = lambda state: state.diffraction_color
+        preview.simulator.global_diffraction_color = None
         preview.simulator.diffraction_spot_cache = self.simulator.diffraction_spot_cache.copy()
         self.preview_initial_cells = preview.state.display_settings.cells
         self.preview_initial_limit = preview.current_model.limit
@@ -6165,7 +7083,7 @@ class DisplaySettingsDialog:
                 with ui.element("div").classes("scene-wrap settings-preview-pane settings-crystal-pane") as crystal_pane:
                     self.preview_panes["crystal"] = crystal_pane
                     preview.scene = CrystalScene(
-                        width=350, height=260, grid=False, background_color="#0B0F14",
+                        width=350, height=260, grid=False, background_color=preview.state.display_settings.backgrounds.crystal,
                         camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
                         on_click=self.inspect_preview_atom, click_events=["click"],
                     ).classes("real-scene settings-preview-scene")
@@ -6307,36 +7225,59 @@ class DisplaySettingsDialog:
             draft = DisplaySettingsDraft(
                 display=replace(preview.state.display_settings, markers=markers),
                 vector_colors=preview.simulator.vector_palette(), plane_colors=preview.simulator.plane_palette(),
-                diffraction_color=preview.state.diffraction_color)
+                diffraction_color=preview.state.diffraction_color,
+                panel_element_colors=copy.deepcopy(preview.state.element_colors),
+                annotation_visibility=preview.state.annotation_visibility.copy())
             notice = f"Other preview settings unchanged: {exc} "
         try:
-            model = preview.display_model(settings=draft.display)
+            colors = self.simulator.element_colors if draft.panel_element_colors is None else draft.panel_element_colors
+            model = preview.display_model(settings=draft.display, element_colors=colors)
         except (ValueError, TypeError, OverflowError) as exc:
             self.preview_error.set_text(f"Preview unchanged: {exc}")
             self.preview_error.visible = True
             return
         initial_view = preview.scene_signature is None
-        previous_limit = preview.current_model.limit
-        refit = (initial_view or draft.display.cells != preview.state.display_settings.cells
-                 or model.limit != preview.current_model.limit)
-        annotations_changed = draft.display.annotations != preview.state.display_settings.annotations
+        previous_limit = self.preview_view_limit or preview.current_model.limit
+        annotations_changed = (draft.display.annotations != preview.state.display_settings.annotations or
+                               draft.display.backgrounds != preview.state.display_settings.backgrounds or
+                               draft.annotation_visibility != preview.state.annotation_visibility)
         preview.state.display_settings = draft.display
+        preview.state.element_colors = colors.copy()
+        preview.state.annotation_visibility = draft.annotation_visibility.copy()
         preview.state.diffraction_color = draft.diffraction_color or self.simulator.default_diffraction_color_for_crystal(preview.state.crystal_name)
+        preview.state.diffraction_color_custom = draft.diffraction_color is not None
         for kind in ("vector", "plane"):
             colors = getattr(draft, f"{kind}_colors").copy()
             setattr(preview.simulator, f"{kind}_palette", lambda _id=None, colors=colors: colors)
+        preview.coordinate_grid_enabled = bool(self.coordinate_grid and self.coordinate_grid.value)
+        grid_notice = ""
+        if preview.coordinate_grid_enabled:
+            try:
+                preview.coordinate_grid_settings = self.read_coordinate_grid()
+            except (TypeError, ValueError) as exc:
+                grid_notice = f"Grid unchanged: {exc}"
         preview.redraw_scene(model, update_camera=False)
+        if preview.coordinate_grid_enabled and not grid_notice:
+            requested = preview.coordinate_grid_settings.spacing
+            if requested is not None and preview.coordinate_grid_step > requested * (1 + 1e-10):
+                grid_notice = f"Effective grid spacing: {preview.coordinate_grid_step:g} (density limit)"
+        if self.grid_notice is not None:
+            self.grid_notice.set_text(grid_notice)
+            self.grid_notice.set_visibility(bool(grid_notice))
+        self.preview_view_limit = max(model.limit, preview.coordinate_grid_limit or 0) if preview.coordinate_grid_enabled else model.limit
         if self.marker_editor is not None:
             self.marker_editor.update_model(model)
         preview.apply_scale_bar_visibility()
         if self.preview_color != preview.state.diffraction_color or annotations_changed:
             preview.redraw_diffraction()
             self.preview_color = preview.state.diffraction_color
-        if refit:
+        if initial_view or not math.isclose(previous_limit, self.preview_view_limit):
             if initial_view:
                 self.position_preview_camera()
+                if self.preview_view_limit > model.limit:
+                    self.resize_preview_camera(model.limit, self.preview_view_limit)
             else:
-                self.resize_preview_camera(previous_limit, preview.current_model.limit)
+                self.resize_preview_camera(previous_limit, self.preview_view_limit)
         if marker_errors:
             notice += f"{len(marker_errors)} invalid marker{'s' if len(marker_errors) != 1 else ''} hidden."
         self.preview_error.set_text(notice)
@@ -6453,6 +7394,10 @@ class DisplaySettingsDialog:
             self.extend.value = settings.extend_annotations
         elif section == "annotations":
             self.load_annotations(settings.annotations)
+        elif section == "backgrounds":
+            self.crystal_background.value = settings.backgrounds.crystal
+            self.diffraction_background.value = settings.backgrounds.diffraction
+            self.background_auto_text.value = settings.backgrounds.automatic_text
         else:
             for attribute, control in self.annotation_inputs.items():
                 control.value = 100 * getattr(settings, attribute)
@@ -6536,6 +7481,9 @@ class DisplaySettingsDialog:
         draft = copy.deepcopy(self.draft)
         draft.inherited = {section for section, control in self.inherit_controls.items() if control.value}
         settings = draft.display
+        if "backgrounds" not in draft.inherited:
+            settings.backgrounds = PanelBackgrounds(str(self.crystal_background.value),
+                str(self.diffraction_background.value), bool(self.background_auto_text.value))
         if self.marker_editor is not None:
             settings.markers = self.marker_editor.read() if preview_markers is None else preview_markers
         if "annotations" not in draft.inherited:
@@ -6576,7 +7524,7 @@ class DisplaySettingsDialog:
         title = "Follow global settings?" if follow else "Reset display?"
         message = ("Replace this panel's display settings with the global defaults and follow future global changes?"
                    if follow else "Restore the built-in display settings?")
-        message += (" Crystal markers and element colors will be kept." if follow
+        message += (" Crystal markers will be kept. Saved-view color and visibility overrides will follow global settings." if follow
                     else " Crystal markers will be removed. Element colors will be kept.")
         if self.panel_id is not None:
             message += " The real panel will not change until you click Apply/Close."
@@ -6613,6 +7561,7 @@ class DisplaySettingsDialog:
                 # Reset live display defaults without committing or discarding pending element edits.
                 colors = self.simulator.element_colors if self.panel_id is None else self.draft.element_colors
                 draft = DisplaySettingsDraft(element_colors=colors.copy())
+                draft.panel_element_colors = copy.deepcopy(self.draft.panel_element_colors)
             elif action == "global":
                 draft = self.simulator.display_settings_draft()
                 draft.inherited = set(DISPLAY_SETTING_SECTIONS)
@@ -6640,7 +7589,14 @@ class DisplaySettingsDialog:
 class SimulatorApp:
     def __init__(self) -> None:
         self.element_colors = load_element_colors()
+        self.theme = load_theme()
+        self.theme_style = None
+        self.theme_colors = None
+        self.theme_editor: ThemeDialog | None = None
         self.library = CrystalLibrary()
+        self.view_store = DisplayPresetStore(DISPLAY_PRESETS_PATH)
+        self.expanded_crystal_views: set[str] = set()
+        self.saved_view_warnings: set[str] = set()
         self.model_cache: dict[tuple[str, str], CrystalModel] = {}
         self.reciprocal_table_cache: dict[tuple[str, int], tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         self.diffraction_spot_cache: dict[tuple[Any, ...], np.ndarray] = {}
@@ -6683,15 +7639,19 @@ class SimulatorApp:
         self.show_zone_axis_input = None
         self.vector_colors = VECTOR_COLORS.copy()
         self.plane_colors = PLANE_COLORS.copy()
-        self.global_display_settings = PanelDisplaySettings()
+        self.global_display_settings = PanelDisplaySettings(backgrounds=copy.deepcopy(self.theme.backgrounds))
+        self.panel_states[0].display_settings = copy.deepcopy(self.global_display_settings)
         self.global_diffraction_color: str | None = None
         self.selected_export_dir: Path | None = None
         self.builder: CrystalBuilder | None = None
+        self.apply_default_saved_view(self.panel_states[0])
 
     def build(self) -> None:
         ui.page_title("CrysDiS")
-        self.dark_mode = ui.dark_mode(value=True)
+        self.dark_mode = ui.dark_mode(value=self.theme.dark)
         self.add_styles()
+        self.theme_style = ui.html("", sanitize=False).style("display:none")
+        self.apply_interface_theme()
         with ui.header().classes("app-header items-center"):
             ui.label("CrysDiS").classes("app-title")
             ui.button("Intro", icon="help_outline", on_click=self.open_intro_dialog).props("flat dense").classes("intro-button")
@@ -6699,17 +7659,17 @@ class SimulatorApp:
             self.show_zone_axis_input = ui.checkbox(
                 "Current zone",
                 value=False,
-                on_change=lambda _: self.refresh_diffractions(),
+                on_change=lambda _: self.on_annotation_visibility_changed("zone"),
             ).classes("top-checkbox")
             self.show_indices_input = ui.checkbox(
                 "Spot indices",
                 value=False,
-                on_change=lambda _: self.refresh_diffractions(),
+                on_change=lambda _: self.on_annotation_visibility_changed("indices"),
             ).classes("top-checkbox")
             self.show_crystal_annotations_input = ui.checkbox(
                 "Crystal annotations",
                 value=True,
-                on_change=lambda _: self.refresh_crystal_scenes(),
+                on_change=lambda _: self.on_annotation_visibility_changed("crystal"),
             ).classes("top-checkbox")
             self.show_scale_bar_input = ui.checkbox(
                 "Scale bar",
@@ -6742,6 +7702,17 @@ class SimulatorApp:
         self.update_add_combo_button()
         self.build_panels()
         ui.timer(0.5, self.prewarm_builtin_zone_axis_cache, once=True, immediate=False)
+
+    def apply_interface_theme(self) -> None:
+        if self.dark_mode is not None:
+            self.dark_mode.value = self.theme.dark
+        if self.theme_style is not None:
+            if self.theme_colors is not None:
+                self.theme_colors.delete()
+            with self.theme_style.parent_slot:
+                self.theme_colors = ui.colors(primary=self.theme.primary, secondary=self.theme.secondary,
+                                             dark=self.theme.surface, dark_page=self.theme.page)
+            self.theme_style.set_content(f"<style>{theme_css(self.theme)}</style>")
 
     async def prewarm_builtin_zone_axis_cache(self) -> None:
         await asyncio.to_thread(self._prewarm_builtin_zone_axis_cache)
@@ -6904,11 +7875,14 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                         "Auto sync crystal/diffraction",
                         value=False,
                     ).props("dense").classes("advanced-checkbox")
-                    global_settings_button = ui.button(
-                        "Global display settings",
-                        icon="settings",
-                        on_click=lambda: self.open_palette_dialog(),
-                    ).props("outline dense").classes("advanced-palette-button")
+                    with ui.column().classes("full-width gap-2"):
+                        global_settings_button = ui.button(
+                            "Global display settings",
+                            icon="settings",
+                            on_click=lambda: self.open_palette_dialog(),
+                        ).props("outline dense").classes("advanced-palette-button full-width")
+                        theme_button = ui.button("Theme", icon="palette", on_click=self.open_theme_dialog).props(
+                            "outline dense").classes("full-width")
                 self.log_box = ui.textarea("Log", value="\n".join(self.status_history)).props(
                     "outlined dense readonly rows=5"
                 ).classes("advanced-log")
@@ -6940,10 +7914,26 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                  "Automatically update diffraction after rotating the crystal with the mouse. When unchecked, click the panel's SYNC button to update it."),
                 (global_settings_button,
                  "Edit default display settings for new panels and panels following global settings, including frames, atom sizes, colors, and annotations."),
+                (theme_button,
+                 "Choose or customize interface colors and global panel backgrounds. Apply/Close saves them for future sessions; local panel overrides stay unchanged."),
                 (self.log_box, "Recent status messages, input errors, and calculation messages. Read-only."),
             ):
                 with control:
                     ui.tooltip(help_text).props('anchor="bottom left" self="top left" :offset="[0, 8]" delay=300').classes("advanced-tooltip")
+
+    def open_theme_dialog(self) -> None:
+        if self.theme_editor is not None:
+            self.theme_editor.dialog.close()
+            self.theme_editor.dialog.delete()
+        with ui.context.client.content:
+            self.theme_editor = ThemeDialog(self)
+        self.theme_editor.dialog.open()
+
+    async def apply_theme_settings(self, theme: InterfaceTheme) -> bool:
+        theme = validate_theme(theme)
+        draft = self.display_settings_draft()
+        draft.display.backgrounds = copy.deepcopy(theme.backgrounds)
+        return await self.apply_display_settings_draft(None, draft, theme=theme)
 
     def open_palette_dialog(self, panel_id: int | None = None) -> None:
         if panel_id is not None and self.panel_state_by_id(panel_id) is None:
@@ -6973,7 +7963,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if "colors" in state.global_display_sections:
             color = self.global_diffraction_color
         return DisplaySettingsDraft(copy.deepcopy(state.display_settings), state.global_display_sections.copy(),
-                                    self.vector_palette(panel_id).copy(), self.plane_palette(panel_id).copy(), color)
+                                    self.vector_palette(panel_id).copy(), self.plane_palette(panel_id).copy(), color,
+                                    panel_element_colors=copy.deepcopy(state.element_colors),
+                                    annotation_visibility=state.annotation_visibility.copy())
 
     def validated_display_settings_draft(self, panel_id: int | None, draft: DisplaySettingsDraft) -> DisplaySettingsDraft:
         draft = copy.deepcopy(draft)
@@ -6991,6 +7983,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 draft.vector_colors, draft.plane_colors = self.vector_colors.copy(), self.plane_colors.copy()
                 draft.diffraction_color = self.global_diffraction_color
         draft.display.frame_color = color(draft.display.frame_color)
+        draft.display.backgrounds.crystal = color(draft.display.backgrounds.crystal)
+        draft.display.backgrounds.diffraction = color(draft.display.backgrounds.diffraction)
         for name in ANNOTATION_STYLE_NAMES:
             style = getattr(draft.display.annotations, name)
             style.color = color(style.color)
@@ -7005,9 +7999,15 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             draft.diffraction_color = color(draft.diffraction_color)
         if panel_id is None:
             draft.element_colors = validate_element_colors(draft.element_colors)
+        elif draft.panel_element_colors is not None:
+            draft.panel_element_colors = validate_element_colors(draft.panel_element_colors)
+        if (not set(draft.annotation_visibility) <= set(SAVED_VISIBILITY_METHODS)
+                or any(type(value) is not bool for value in draft.annotation_visibility.values())):
+            raise ValueError("Invalid annotation visibility.")
         return draft
 
-    async def apply_display_settings_draft(self, panel_id: int | None, draft: DisplaySettingsDraft) -> bool:
+    async def apply_display_settings_draft(self, panel_id: int | None, draft: DisplaySettingsDraft,
+                                          *, theme: InterfaceTheme | None = None) -> bool:
         if getattr(self, "_applying_display_settings", False):
             return False
         if panel_id is not None and self.panel_state_by_id(panel_id) is None:
@@ -7015,13 +8015,17 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self._applying_display_settings = True
         try:
             draft = self.validated_display_settings_draft(panel_id, draft)
+            next_theme = (validate_theme(replace(theme or self.theme, backgrounds=copy.deepcopy(draft.display.backgrounds)))
+                          if panel_id is None else self.theme)
             global_display = draft.display if panel_id is None else self.global_display_settings
             global_vectors = draft.vector_colors if panel_id is None else self.vector_colors
             global_planes = draft.plane_colors if panel_id is None else self.plane_colors
             global_diffraction = draft.diffraction_color if panel_id is None else self.global_diffraction_color
-            global_annotations_changed = panel_id is None and draft.display.annotations != self.global_display_settings.annotations
+            global_annotations_changed = panel_id is None and (
+                draft.display.annotations != self.global_display_settings.annotations or
+                draft.display.backgrounds != self.global_display_settings.backgrounds)
             scale_bars_enabled = (draft.display.annotations.real_scale_visible or draft.display.annotations.reciprocal_scale_visible
-                                  if panel_id is None else self.show_scale_bars())
+                                  if panel_id is None and theme is None else self.show_scale_bars())
             master_visibility_changed = scale_bars_enabled != self.show_scale_bars()
             element_colors = draft.element_colors if panel_id is None else self.element_colors
             changed_elements = {element for element in self.element_colors.keys() | element_colors.keys()
@@ -7033,10 +8037,15 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     continue
                 inherited = draft.inherited.copy() if panel_id is not None else state.global_display_sections.copy()
                 settings = (copy.deepcopy(draft.display) if panel_id is not None else
-                            inherited_display_settings(state.display_settings, global_display, inherited))
+                            inherited_display_settings(state.display_settings, global_display,
+                                                       inherited & {"backgrounds"} if theme is not None else inherited))
+                panel_colors = draft.panel_element_colors if panel_id is not None else state.element_colors
+                visibility = draft.annotation_visibility.copy() if panel_id is not None else state.annotation_visibility.copy()
+                if panel_id is None and master_visibility_changed:
+                    visibility.pop("scale", None)
                 vectors, planes, diffraction = state.vector_colors, state.plane_colors, state.diffraction_color
                 diffraction_custom = state.diffraction_color_custom
-                if "colors" in inherited:
+                if "colors" in inherited and theme is None:
                     vectors = planes = None
                     diffraction = global_diffraction or self.default_diffraction_color_for_crystal(state.crystal_name)
                     diffraction_custom = False
@@ -7045,26 +8054,30 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     diffraction = draft.diffraction_color or self.default_diffraction_color_for_crystal(state.crystal_name)
                     diffraction_custom = draft.diffraction_color is not None
                 geometry_changed = crystal_display_settings(settings) != crystal_display_settings(state.display_settings)
-                annotations_changed = settings.annotations != state.display_settings.annotations
+                backgrounds_changed = settings.backgrounds != state.display_settings.backgrounds
+                visibility_changed = visibility != state.annotation_visibility
+                annotations_changed = settings.annotations != state.display_settings.annotations or backgrounds_changed or visibility_changed
                 palette_changed = (self.vector_palette(state.panel_id) != (vectors or global_vectors) or
                                    self.plane_palette(state.panel_id) != (planes or global_planes))
                 diffraction_changed = self.diffraction_color_for_state(state) != diffraction
                 controller = self.controller_by_panel_id(state.panel_id)
-                element_colors_changed = bool(changed_elements) and any(
+                element_colors_changed = panel_colors != state.element_colors or (panel_colors is None and bool(changed_elements) and any(
                     site.element.strip().capitalize() in changed_elements
-                    for site in self.model_for(state.crystal_name).expanded_sites)
+                    for site in self.model_for(state.crystal_name).expanded_sites))
                 model = None
                 if geometry_changed or element_colors_changed:
                     try:
                         source = self.model_for(state.crystal_name)
-                        model = (controller.display_model(source, settings=settings, element_colors=element_colors)
-                                 if controller else make_panel_display_model(source, settings, element_colors))
+                        effective_colors = panel_colors if panel_colors is not None else element_colors
+                        model = (controller.display_model(source, settings=settings, element_colors=effective_colors)
+                                 if controller else make_panel_display_model(source, settings, effective_colors))
                     except (ValueError, TypeError) as exc:
                         raise ValueError(f"Panel {state.panel_id} ({state.crystal_name}): {exc}") from exc
                 changes.append(dict(state=state, settings=settings, inherited=inherited, vectors=vectors, planes=planes,
+                                    panel_colors=copy.deepcopy(panel_colors), visibility=visibility,
                                     diffraction=diffraction, controller=controller, model=model,
                                     diffraction_custom=diffraction_custom,
-                                    redraw_scene=geometry_changed or palette_changed or element_colors_changed,
+                                    redraw_scene=geometry_changed or palette_changed or element_colors_changed or backgrounds_changed or visibility_changed,
                                     redraw_diffraction=diffraction_changed or annotations_changed or master_visibility_changed,
                                     annotations_changed=annotations_changed or master_visibility_changed,
                                     refit=(settings.cells != state.display_settings.cells or
@@ -7074,8 +8087,19 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 if change["refit"] and change["controller"] is not None:
                     change["view"], change["roll"] = await change["controller"].live_scene_orientation()
             if panel_id is None:
-                if changed_elements:
-                    save_element_colors(element_colors)
+                theme_changed = next_theme != self.theme
+                if theme_changed:
+                    save_theme(next_theme)
+                try:
+                    if changed_elements:
+                        save_element_colors(element_colors)
+                except OSError:
+                    if theme_changed:
+                        save_theme(self.theme)
+                    raise
+                self.theme = copy.deepcopy(next_theme)
+                if theme_changed:
+                    self.apply_interface_theme()
                 self.element_colors = element_colors.copy()
                 self.global_display_settings = copy.deepcopy(draft.display)
                 self.vector_colors, self.plane_colors = draft.vector_colors.copy(), draft.plane_colors.copy()
@@ -7092,6 +8116,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             for change in changes:
                 state, controller = change["state"], change["controller"]
                 state.display_settings, state.global_display_sections = change["settings"], change["inherited"]
+                state.element_colors, state.annotation_visibility = change["panel_colors"], change["visibility"]
                 state.vector_colors = copy.deepcopy(change["vectors"])
                 state.plane_colors = copy.deepcopy(change["planes"])
                 state.diffraction_color = change["diffraction"]
@@ -7111,7 +8136,20 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             combo_ids = {state.panel_id for state in self.panel_states} if global_annotations_changed or master_visibility_changed else diffraction_ids
             if combo_ids:
                 self.refresh_combo_panels_for_sources(combo_ids)
-            self.set_status("Global display settings updated" if panel_id is None else f"Panel {panel_id} display settings updated")
+            if panel_id is None:
+                editor = self.display_settings_editor
+                if editor is not None and editor.panel_id is None:
+                    loading, editor.loading = editor.loading, True
+                    editor.draft.display.backgrounds = copy.deepcopy(self.global_display_settings.backgrounds)
+                    editor.load_section("backgrounds")
+                    editor.loading = loading
+                if self.theme_editor is not None:
+                    if theme is not None:
+                        self.theme_editor.set_theme_draft(self.theme)
+                    else:
+                        self.theme_editor.set_backgrounds(self.theme.backgrounds)
+            self.set_status("Theme updated" if theme is not None else
+                            "Global display settings updated" if panel_id is None else f"Panel {panel_id} display settings updated")
             return True
         finally:
             self._applying_display_settings = False
@@ -7140,7 +8178,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             return ("#" + text.lstrip("#")).upper()
         return fallback
 
-    def default_diffraction_color_for_crystal(self, crystal_name: str) -> str:
+    def default_diffraction_color_for_crystal(self, crystal_name: str, *, background: str | None = None) -> str:
+        if crystal_name in LIGHT_BACKGROUND_DEMO_COLORS and background is not None and contrast_text_color(background) == "#000000":
+            return LIGHT_BACKGROUND_DEMO_COLORS[crystal_name]
         fallback = DEFAULT_DIFFRACTION_COLORS.get(str(crystal_name or ""), "#31F7F1")
         try:
             definition = self.library.get(str(crystal_name or ""))
@@ -7156,11 +8196,26 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         state.diffraction_color = color
         return color
 
-    def set_panel_crystal(self, state: PanelState, crystal_name: str, force_default_color: bool = False) -> None:
+    def display_diffraction_color(self, state: PanelState, background: str | None = None) -> str:
+        color = self.diffraction_color_for_state(state)
+        custom = state.diffraction_color_custom or (
+            "colors" in state.global_display_sections and getattr(self, "global_diffraction_color", None) is not None)
+        if not custom and color == DEFAULT_DIFFRACTION_COLORS.get(state.crystal_name):
+            return self.default_diffraction_color_for_crystal(state.crystal_name,
+                background=background if background is not None else state.display_settings.backgrounds.diffraction)
+        return color
+
+    def set_panel_crystal(self, state: PanelState, crystal_name: str, force_default_color: bool = False,
+                          *, preserve_saved_view: bool = False) -> None:
         """Refresh automatic colors without discarding an explicit panel color."""
         selected_name = str(crystal_name or state.crystal_name)
         if selected_name == CUSTOM_SENTINEL:
             return
+        if selected_name != state.crystal_name and not preserve_saved_view:
+            state.element_colors = None
+            state.annotation_visibility.clear()
+            state.saved_view_id = None
+            state.initial_camera = None
         old_default = self.default_diffraction_color_for_crystal(state.crystal_name)
         current_color = self.normalize_palette_color(state.diffraction_color, old_default)
         if "colors" in state.global_display_sections:
@@ -7189,8 +8244,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         state = self.panel_state_by_id(panel_id)
         if state is None:
             return
-        self.set_panel_diffraction_color(panel_id, self.default_diffraction_color_for_crystal(state.crystal_name))
+        state.global_display_sections.discard("colors")
+        state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
         state.diffraction_color_custom = False
+        self.redraw_panel_diffractions({panel_id})
+        self.refresh_combo_panels_for_sources({panel_id})
 
 
     def replace_palette(self, kind: str, colors: list[str] | None, panel_id: int | None) -> None:
@@ -7257,6 +8315,175 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 on_upload=self.load_cif_upload,
             ).props("accept=.cif").classes("full-width")
 
+    def element_colors_for_state(self, state: PanelState) -> dict[str, str]:
+        return self.element_colors if state.element_colors is None else state.element_colors
+
+    def saved_view_payload(self, panel_id: int, draft: DisplaySettingsDraft, camera: dict | None) -> tuple[CrystalDefinition, dict]:
+        state = self.panel_state_by_id(panel_id)
+        if state is None:
+            raise ValueError("Panel no longer exists.")
+        definition = copy.deepcopy(self.library.get(state.crystal_name))
+        camera = validated_saved_camera(camera)
+        view, roll = state.view_vector.copy(), state.roll
+        if camera is not None:
+            view = normalize_vector(np.array(camera["position"]) - camera["target"])
+            roll = roll_from_view_and_up(view, np.array(camera["up"]), roll)
+        colors = self.element_colors if draft.panel_element_colors is None else draft.panel_element_colors
+        payload = dict(display=asdict(draft.display), element_colors=colors.copy(),
+                       vector_colors=draft.vector_colors.copy(), plane_colors=draft.plane_colors.copy(),
+                       diffraction_color=draft.diffraction_color or self.default_diffraction_color_for_crystal(
+                           state.crystal_name, background=draft.display.backgrounds.diffraction),
+                       view_vector=np.asarray(view).tolist(), roll=float(roll), camera=camera,
+                       plane_text=state.plane_text, vector_text=state.vector_text, applied_zone_text=state.applied_zone_text,
+                       crystal_view_percent=state.crystal_view_percent,
+                       visibility={key: draft.annotation_visibility.get(key, getattr(self, method)())
+                                   for key, method in SAVED_VISIBILITY_METHODS.items()})
+        # Validate the complete snapshot, including marker geometry, before offering to save it.
+        probe = PanelState(panel_id=panel_id, crystal_name=state.crystal_name)
+        self.restore_saved_view(probe, dict(id="validation", crystal_id=crystal_identity(definition), payload=payload))
+        return definition, payload
+
+    def restore_saved_view(self, state: PanelState, view: dict) -> None:
+        definition = self.library.get(state.crystal_name)
+        if view["crystal_id"] != crystal_identity(definition):
+            raise ValueError("This saved view belongs to another crystal.")
+        data = view["payload"]
+        try:
+            settings = display_settings_from_dict(data["display"])
+            colors = validate_element_colors(data["element_colors"])
+            direction = np.asarray(data["view_vector"], dtype=float)
+            roll, split = float(data["roll"]), float(data["crystal_view_percent"])
+            if (direction.shape != (3,) or not np.isfinite(direction).all() or np.linalg.norm(direction) < 1e-10
+                    or not math.isfinite(roll) or not math.isfinite(split) or not 0 <= split <= 100):
+                raise ValueError("Invalid orientation or panel divider position.")
+            camera = validated_saved_camera(data.get("camera"))
+            visibility = data["visibility"]
+            if (not isinstance(visibility, dict) or set(visibility) != set(SAVED_VISIBILITY_METHODS)
+                    or any(type(value) is not bool for value in visibility.values())):
+                raise ValueError("Invalid annotation visibility.")
+            palettes = {}
+            for kind in ("vector", "plane"):
+                palette = data[f"{kind}_colors"]
+                if not isinstance(palette, list) or not palette or any(normalized_hex_color(v) is None for v in palette):
+                    raise ValueError("Invalid saved palette.")
+                palettes[kind] = [normalized_hex_color(v) for v in palette]
+            diffraction_color = normalized_hex_color(data["diffraction_color"])
+            if diffraction_color is None:
+                raise ValueError("Invalid diffraction color.")
+            source = self.model_for(state.crystal_name)
+            for key, kind in (("plane_text", "plane"), ("vector_text", "direction")):
+                if not isinstance(data[key], str) or len(data[key]) > 10000:
+                    raise ValueError("Invalid saved indices.")
+                _, errors = parse_indices(data[key], source, kind, True, kind == "direction")
+                if errors:
+                    raise ValueError("; ".join(errors[:3]))
+            if not isinstance(data["applied_zone_text"], str):
+                raise ValueError("Invalid saved zone.")
+            make_panel_display_model(source, settings, colors)
+        except (TypeError, KeyError, AttributeError, OverflowError) as exc:
+            raise ValueError(f"Invalid saved-view settings: {exc}") from exc
+        state.display_settings = settings
+        state.global_display_sections.clear()
+        state.element_colors = colors
+        state.annotation_visibility = visibility.copy()
+        state.vector_colors, state.plane_colors = palettes["vector"], palettes["plane"]
+        state.diffraction_color, state.diffraction_color_custom = diffraction_color, True
+        state.view_vector, state.roll = normalize_vector(direction), roll
+        state.initial_camera = camera
+        state.plane_text, state.vector_text = data["plane_text"], data["vector_text"]
+        state.applied_zone_text = data["applied_zone_text"]
+        state.zone_text = state.rotation_text = ""
+        state.crystal_view_percent = round(split / 10) * 10
+        state.saved_view_id = view["id"]
+
+    def saved_view_problem(self, message: str) -> None:
+        if message in self.saved_view_warnings:
+            return
+        self.saved_view_warnings.add(message)
+        self.set_status(message)
+        if core.is_loop_running():
+            ui.notify(message, type="warning", timeout=8000)
+
+    def apply_default_saved_view(self, state: PanelState) -> bool:
+        definition = self.library.get(state.crystal_name)
+        try:
+            view = next((v for v in self.view_store.for_crystal(crystal_identity(definition)) if v["default"]), None)
+            if view is None:
+                return False
+            if view["structure_version"] != crystal_version(definition):
+                self.saved_view_problem(f"{state.crystal_name}: default view '{view['name']}' was skipped because the crystal changed. Review it in Crystal list.")
+                return False
+            self.restore_saved_view(state, view)
+            return True
+        except (ValueError, OSError) as exc:
+            self.saved_view_problem(f"Could not load the saved default for {state.crystal_name}: {exc}")
+            return False
+
+    def open_saved_view(self, name: str, view_id: str) -> None:
+        try:
+            definition = self.library.get(name)
+            view = next((v for v in self.view_store.for_crystal(crystal_identity(definition)) if v["id"] == view_id), None)
+            if view is None:
+                raise ValueError("This saved view no longer exists.")
+        except (ValueError, OSError) as exc:
+            ui.notify(str(exc), type="negative")
+            return
+
+        def open_view():
+            try:
+                self.add_panel(crystal_name=name, saved_view=view)
+            except (ValueError, OSError) as exc:
+                ui.notify(str(exc), type="negative")
+                return
+            self.crystal_list_dialog.close()
+            self.set_status(f"Opened saved view: {name} / {view['name']}")
+
+        if view["structure_version"] == crystal_version(definition):
+            open_view()
+            return
+        with ui.context.client.content:
+            dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("saved-view-dialog"):
+            ui.label("Crystal changed").classes("text-h6")
+            ui.label(f"{name} has changed since '{view['name']}' was saved. Markers and viewing directions may no longer match. Open it with the current structure?").classes("break-words")
+            with ui.row().classes("full-width justify-end gap-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                ui.button("Open anyway", on_click=lambda: (dialog.close(), open_view())).props("unelevated dense")
+        dialog.open()
+
+    def change_saved_view(self, view_id: str, action: str, value=None) -> bool:
+        try:
+            self.view_store.change(view_id, action, value)
+        except (ValueError, OSError) as exc:
+            ui.notify(str(exc), type="negative")
+            return False
+        self.refresh_crystal_list()
+        return True
+
+    def edit_saved_view_entry(self, view: dict, *, delete: bool = False) -> None:
+        # List refreshes replace their rows; keep dialogs outside those temporary slots.
+        with ui.context.client.content:
+            dialog = ui.dialog()
+        dialog.on("hide", dialog.delete)
+        with dialog, ui.card().classes("saved-view-dialog"):
+            ui.label("Delete saved view?" if delete else "Rename saved view").classes("text-h6")
+            if delete:
+                ui.label(f"Delete '{view['name']}'? The crystal and open panels will not be changed.").classes("break-words")
+                name = None
+            else:
+                name = ui.input("View name", value=view["name"]).props("outlined dense maxlength=120").classes("full-width")
+
+            def confirm():
+                if self.change_saved_view(view["id"], "delete" if delete else "rename", name.value if name else None):
+                    dialog.close()
+
+            with ui.row().classes("full-width justify-end gap-2"):
+                ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                ui.button("Delete" if delete else "Rename", icon="delete" if delete else "edit", on_click=confirm,
+                          color="negative" if delete else "primary").props("unelevated dense")
+        dialog.open()
+
     def build_crystal_list_dialog(self) -> None:
         self.crystal_list_dialog = ui.dialog()
         with self.crystal_list_dialog, ui.card().classes("crystal-list-card"):
@@ -7273,6 +8500,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def refresh_crystal_list(self) -> None:
         if self.crystal_list_container is None:
             return
+        try:
+            saved_views = self.view_store.read()
+        except (ValueError, OSError) as exc:
+            saved_views = []
+            self.saved_view_problem(str(exc))
         self.crystal_list_container.clear()
         with self.crystal_list_container:
             for name in self.library.options():
@@ -7284,25 +8516,74 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     f"{definition.lattice_system}, {space_group_symbol(definition.space_group)}, "
                     f"{len(definition.sites)} site(s)"
                 )
-                with ui.row().classes("crystal-list-row"):
-                    swatch = ui.element("div").classes("crystal-list-swatch")
-                    swatch.style(f"background: {dominant_color(definition)}")
-                    with ui.column().classes("crystal-list-info"):
-                        ui.label(name).classes("crystal-list-name")
-                        ui.label(f"{status} · {summary}").classes("crystal-list-meta")
-                    ui.button(
-                        icon="download",
-                        on_click=lambda _=None, n=name: self.open_crystal_cif_export_dialog(n),
-                    ).props("flat round dense").tooltip("Export CIF")
-                    ui.button(icon="edit", on_click=lambda _=None, n=name: self.edit_crystal_from_list(n)).props(
-                        "flat round dense"
-                    ).tooltip("Edit crystal")
-                    delete = ui.button(icon="delete", on_click=lambda _=None, n=name: self.delete_crystal_from_list(n)).props(
-                        "flat round dense color=negative"
-                    )
-                    delete.tooltip("Delete crystal")
-                    if name in DEFAULT_NAMES:
-                        delete.disable()
+                identity = crystal_identity(definition)
+                views = [view for view in saved_views if view["crystal_id"] == identity]
+                with ui.column().classes("full-width gap-0 crystal-list-entry"):
+                    with ui.row().classes("crystal-list-row" + (" crystal-list-has-views" if views else "")):
+                        if views:
+                            expanded = identity in self.expanded_crystal_views
+                            toggle = ui.button(icon="expand_more" if expanded else "chevron_right").props(
+                                f"flat round dense aria-expanded={'true' if expanded else 'false'}"
+                            ).classes("saved-view-toggle").tooltip(f"{len(views)} saved view(s)")
+                            toggle._props["aria-label"] = f"Saved views for {name}"
+                        swatch = ui.element("div").classes("crystal-list-swatch")
+                        swatch.style(f"background: {dominant_color(definition)}")
+                        with ui.column().classes("crystal-list-info"):
+                            ui.label(name).classes("crystal-list-name")
+                            ui.label(f"{status} · {summary}").classes("crystal-list-meta")
+                        open_button = ui.button(icon="open_in_new", on_click=lambda _=None, n=name:
+                                                self.open_crystal_in_new_panel(n)).props("flat round dense").classes(
+                                                    "crystal-list-open").tooltip("Open in new panel")
+                        open_button._props["aria-label"] = f"Open {name} in new panel"
+                        ui.button(
+                            icon="download",
+                            on_click=lambda _=None, n=name: self.open_crystal_cif_export_dialog(n),
+                        ).props("flat round dense").tooltip("Export CIF")
+                        ui.button(icon="edit", on_click=lambda _=None, n=name: self.edit_crystal_from_list(n)).props(
+                            "flat round dense"
+                        ).tooltip("Edit crystal")
+                        delete = ui.button(icon="delete", on_click=lambda _=None, n=name: self.delete_crystal_from_list(n)).props(
+                            "flat round dense color=negative"
+                        )
+                        delete.tooltip("Delete crystal")
+                        if name in DEFAULT_NAMES:
+                            delete.disable()
+                    if views:
+                        with ui.column().classes("saved-view-list") as children:
+                            for view in views:
+                                with ui.row().classes("saved-view-row"):
+                                    ui.button(view["name"], icon="open_in_new", on_click=lambda _=None, n=name, v=view:
+                                              self.open_saved_view(n, v["id"])).props("flat dense no-caps align=left").classes(
+                                                  "saved-view-open").tooltip(f"Open {view['name']} in a new panel")
+                                    if view["structure_version"] != crystal_version(definition):
+                                        ui.icon("warning", color="warning").tooltip("Crystal changed since this view was saved")
+                                    else:
+                                        ui.element("span")
+                                    ui.button(icon="star" if view["default"] else "star_border",
+                                        on_click=lambda _=None, v=view: self.change_saved_view(v["id"], "default", not v["default"])
+                                    ).props("flat round dense").tooltip("Remove default view" if view["default"] else "Use as default view")
+                                    ui.button(icon="edit", on_click=lambda _=None, v=view: self.edit_saved_view_entry(v)).props(
+                                        "flat round dense").tooltip("Rename saved view")
+                                    ui.button(icon="delete", on_click=lambda _=None, v=view: self.edit_saved_view_entry(v, delete=True)).props(
+                                        "flat round dense color=negative").tooltip("Delete saved view")
+                        children.set_visibility(expanded)
+
+                        def toggle_views(_=None, key=identity, group=children, button=toggle):
+                            visible = key not in self.expanded_crystal_views
+                            if visible:
+                                self.expanded_crystal_views.add(key)
+                            else:
+                                self.expanded_crystal_views.discard(key)
+                            group.set_visibility(visible)
+                            button.props(f"icon={'expand_more' if visible else 'chevron_right'} aria-expanded={'true' if visible else 'false'}")
+
+                        toggle.on_click(toggle_views)
+
+    def open_crystal_in_new_panel(self, name: str) -> None:
+        self.add_panel(crystal_name=name)
+        if self.crystal_list_dialog is not None:
+            self.crystal_list_dialog.close()
+        self.set_status(f"Opened {name} in a new panel")
 
     def edit_crystal_from_list(self, name: str) -> None:
         if self.crystal_list_dialog is not None:
@@ -7392,10 +8673,33 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if dialog is not None:
             dialog.close()
 
-    def delete_crystal_from_list(self, name: str) -> None:
+    def delete_crystal_from_list(self, name: str, confirmed: bool = False) -> None:
+        identity = crystal_identity(self.library.get(name))
+        try:
+            views = self.view_store.for_crystal(identity)
+        except (ValueError, OSError) as exc:
+            ui.notify(str(exc), type="negative")
+            return
+        if views and not confirmed and name not in DEFAULT_NAMES:
+            with ui.context.client.content:
+                dialog = ui.dialog()
+            dialog.on("hide", dialog.delete)
+            with dialog, ui.card().classes("saved-view-dialog"):
+                ui.label("Delete crystal and saved views?").classes("text-h6")
+                ui.label(f"Delete {name} and its {len(views)} saved view(s)?").classes("break-words")
+                with ui.row().classes("full-width justify-end gap-2"):
+                    ui.button("Cancel", on_click=dialog.close).props("flat dense")
+                    ui.button("Delete", color="negative", on_click=lambda: (
+                        dialog.close(), self.delete_crystal_from_list(name, confirmed=True))).props("unelevated dense")
+            dialog.open()
+            return
         if not self.library.delete(name):
             ui.notify(f"Could not delete {name}", type="warning")
             return
+        try:
+            self.view_store.delete_crystal(identity)
+        except (ValueError, OSError) as exc:
+            ui.notify(f"Crystal deleted, but saved-view cleanup failed: {exc}", type="warning")
         self.model_cache.clear()
         self.clear_scientific_caches()
         affected_panel_ids: set[int] = set()
@@ -7734,16 +9038,106 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 align-items: stretch;
                 overflow: hidden;
             }
-            .combo-stack {
-                display: grid;
-                grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
-                gap: 8px;
+            .panel-splitter {
                 width: 100%;
                 height: var(--panel-visual-height);
                 min-height: var(--panel-visual-height);
                 max-height: var(--panel-visual-height);
-                align-items: stretch;
                 overflow: hidden;
+            }
+            .panel-splitter > .q-splitter__panel {
+                min-width: 0;
+                min-height: 0;
+                overflow: hidden;
+            }
+            .panel-splitter .scene-wrap,
+            .panel-splitter .real-scene,
+            .panel-splitter .combo-source-list,
+            .panel-splitter .diffraction-plot {
+                height: 100% !important;
+                min-height: 0 !important;
+                max-height: 100% !important;
+            }
+            .panel-splitter > .q-splitter__separator {
+                background: transparent;
+                flex-shrink: 0;
+            }
+            .panel-splitter.q-splitter--vertical > .q-splitter__separator {
+                width: 0;
+            }
+            .panel-splitter.q-splitter--horizontal > .q-splitter__separator {
+                height: 0;
+            }
+            .panel-splitter.q-splitter--vertical > .q-splitter__before {
+                padding-right: 5px;
+            }
+            .panel-splitter.q-splitter--vertical > .q-splitter__after {
+                padding-left: 5px;
+            }
+            .panel-splitter.q-splitter--horizontal > .q-splitter__before {
+                padding-bottom: 5px;
+            }
+            .panel-splitter.q-splitter--horizontal > .q-splitter__after {
+                padding-top: 5px;
+            }
+            .panel-splitter.split-at-start > .q-splitter__panel,
+            .panel-splitter.split-at-end > .q-splitter__panel {
+                padding: 0;
+            }
+            .panel-splitter.split-at-start > .q-splitter__before,
+            .panel-splitter.split-at-end > .q-splitter__after {
+                visibility: hidden;
+                pointer-events: none;
+            }
+            .panel-splitter.q-splitter--vertical.split-at-start .q-splitter__separator-area {
+                left: 0;
+                right: -12px;
+            }
+            .panel-splitter.q-splitter--vertical.split-at-end .q-splitter__separator-area {
+                left: -12px;
+                right: 0;
+            }
+            .panel-splitter.q-splitter--horizontal.split-at-start .q-splitter__separator-area {
+                top: 0;
+                bottom: -12px;
+            }
+            .panel-splitter.q-splitter--horizontal.split-at-end .q-splitter__separator-area {
+                top: -12px;
+                bottom: 0;
+            }
+            .panel-splitter .panel-split-handle {
+                position: absolute;
+                inset: 0;
+                width: 100%;
+                height: 100%;
+                transform: none;
+                touch-action: none;
+                outline: none;
+            }
+            .panel-split-handle::after {
+                content: '';
+                position: absolute;
+                width: 3px;
+                height: 40px;
+                left: 50%;
+                top: 50%;
+                transform: translate(-50%, -50%);
+                border-radius: 2px;
+                background: #59697B;
+            }
+            .q-splitter--horizontal .panel-split-handle::after {
+                width: 40px;
+                height: 3px;
+            }
+            .panel-split-handle:hover::after {
+                background: #8BBFFF;
+            }
+            @media (max-width: 599px) {
+                .panel-splitter {
+                    height: calc(2 * var(--panel-visual-height) + 10px);
+                    min-height: calc(2 * var(--panel-visual-height) + 10px);
+                    max-height: calc(2 * var(--panel-visual-height) + 10px);
+                }
             }
             .combo-source-list {
                 width: 100%;
@@ -7758,9 +9152,29 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             .combo-source-header,
             .combo-source-row {
                 display: grid;
-                grid-template-columns: 34px minmax(0, 1fr) minmax(64px, 0.58fr) 86px;
+                grid-template-columns: 24px 34px minmax(48px, 1fr) minmax(54px, 0.58fr) 86px;
                 gap: 5px;
                 align-items: center;
+            }
+            .combo-source-header,
+            .combo-source-rows {
+                min-width: 266px;
+            }
+            .combo-source-drag {
+                width: 24px;
+                min-width: 24px;
+                height: 32px;
+                cursor: grab;
+                touch-action: none;
+                user-select: none;
+            }
+            .combo-source-chosen { background: rgba(120, 170, 220, 0.12); }
+            .combo-source-ghost { background: #1b222b; opacity: 0.85; }
+            .coordinate-grid-fields > .q-field,
+            .coordinate-grid-bounds > .q-field { min-width: 0; }
+            .coordinate-grid-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+            @media (max-width: 599px) {
+                .coordinate-grid-fields { grid-template-columns: minmax(0, 1fr); }
             }
             .combo-source-header {
                 color: #eff6ff;
@@ -7772,6 +9186,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .combo-source-row {
                 min-height: 36px;
+                width: 100%;
                 color: #edf2f7;
                 font-size: 11.5px;
                 border-bottom: 1px solid rgba(255, 255, 255, 0.06);
@@ -7884,8 +9299,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 max-height: var(--panel-visual-height) !important;
                 border-radius: 8px;
                 overflow: hidden;
-                background: #050607;
-                border: 1px solid rgba(255, 255, 255, 0.08);
+                background: transparent;
+                border: 0;
             }
             .diffraction-plot,
             .diffraction-plot > div,
@@ -8027,9 +9442,21 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 min-height: 0;
                 overflow: hidden;
             }
-            .panel-settings-body {
-                grid-template-columns: minmax(0, 1fr) minmax(440px, 1.15fr);
-                gap: 16px;
+            .panel-splitter.panel-settings-body {
+                height: 100%;
+                min-height: 0;
+                max-height: 100%;
+            }
+            .panel-settings-body .display-settings-preview,
+            .panel-settings-body .display-settings-controls {
+                height: 100%;
+            }
+            .panel-settings-body > .q-splitter__after {
+                overflow-x: auto;
+            }
+            .panel-settings-body .display-settings-controls {
+                min-width: 280px;
+                width: 100%;
             }
             .display-settings-controls {
                 container-type: inline-size;
@@ -8042,16 +9469,56 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 padding-right: 4px;
                 gap: 10px;
             }
-            @container (max-width: 520px) {
+            .panel-frame-settings, .panel-element-sizes, .panel-cell-counts,
+            .panel-background-settings, .annotation-style-grid, .theme-color-grid {
+                max-width: 640px;
+            }
+            @container (max-width: 340px) {
                 .panel-frame-settings,
                 .panel-element-sizes,
                 .panel-cell-counts,
+                .panel-background-settings,
+                .theme-color-grid,
                 .annotation-style-grid {
                     grid-template-columns: minmax(0, 1fr) !important;
                 }
             }
             .palette-card .q-field {
                 min-width: 0;
+            }
+            .theme-sample {
+                padding: 12px;
+                border: 1px solid;
+                border-radius: 4px;
+                display: flex;
+                align-items: center;
+                flex-wrap: wrap;
+                gap: 12px;
+            }
+            .theme-card {
+                width: 680px;
+                max-width: calc(100vw - 40px);
+                max-height: calc(100dvh - 48px);
+                flex-wrap: nowrap;
+            }
+            .theme-dialog-body { min-height: 0; overflow-y: auto; }
+            .theme-name-card { width: 420px; max-width: calc(100vw - 40px); }
+            .theme-card > :first-child, .theme-card > :last-child { flex-shrink: 0; }
+            .theme-panel-sample {
+                flex: 1;
+                min-width: 0;
+                padding: 20px 8px;
+                text-align: center;
+                border-radius: 4px;
+            }
+            @media (max-width: 480px) {
+                .theme-card .theme-color-grid { grid-template-columns: minmax(0, 1fr) !important; }
+            }
+            .theme-sample-accent {
+                padding: 8px;
+                border-radius: 4px;
+                background: var(--sample-accent);
+                color: var(--sample-ink);
             }
             .display-settings-preview {
                 display: flex;
@@ -8095,26 +9562,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 flex-wrap: wrap;
                 gap: 8px;
             }
-            @media (max-width: 850px) {
-                .panel-settings-body {
-                    grid-template-columns: minmax(0, 1fr);
-                    grid-template-rows: minmax(140px, 36%) minmax(0, 1fr);
-                    gap: 10px;
-                }
-                .display-settings-preview .visual-stack {
-                    grid-template-columns: repeat(2, minmax(0, 1fr));
-                    grid-template-rows: minmax(0, 1fr);
-                }
-            }
             @media (max-width: 600px) {
                 .element-color-tools {
                     flex-direction: column;
                     align-items: stretch;
                 }
-                .panel-frame-settings,
-                .panel-element-sizes,
-                .panel-cell-counts,
-                .annotation-style-grid,
                 .element-color-grid {
                     grid-template-columns: minmax(0, 1fr) !important;
                 }
@@ -8188,8 +9640,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             }
             .crystal-list-row {
                 width: 100%;
+                position: relative;
                 display: grid;
-                grid-template-columns: 20px minmax(0, 1fr) 34px 34px 34px;
+                grid-template-columns: 20px minmax(0, 1fr) repeat(4, 34px);
                 align-items: center;
                 gap: 8px;
                 padding: 6px 4px;
@@ -8201,9 +9654,38 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 border-radius: 50%;
                 border: 1px solid rgba(255, 255, 255, 0.36);
             }
+            .crystal-list-entry { padding-left: 24px; }
+            .crystal-list-row > .q-btn:not(.saved-view-toggle) {
+                min-width: 0;
+                width: 100%;
+                padding: 0;
+            }
+            .saved-view-toggle.q-btn {
+                position: absolute;
+                left: -24px;
+                min-width: 24px;
+                width: 24px;
+            }
+            .saved-view-list {
+                width: 100%;
+                padding: 4px 0 8px 30px;
+                gap: 4px;
+            }
+            .saved-view-row {
+                width: 100%;
+                display: grid;
+                grid-template-columns: minmax(0, 1fr) 18px 28px 28px 28px;
+                align-items: center;
+                gap: 3px;
+            }
+            .saved-view-row .q-btn { min-width: 0; }
+            .saved-view-open .q-btn__content { flex-wrap: nowrap; min-width: 0; }
+            .saved-view-open .block { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .saved-view-dialog { width: 440px; max-width: calc(100vw - 40px); }
             .crystal-list-info {
                 gap: 0;
                 min-width: 0;
+                overflow-wrap: anywhere;
             }
             .crystal-list-name {
                 font-size: 13px;
@@ -8214,6 +9696,13 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 color: #9aa7b5;
                 font-size: 11px;
                 line-height: 1.2;
+            }
+            @media (max-width: 480px) {
+                .crystal-list-row {
+                    grid-template-columns: 14px minmax(0, 1fr) repeat(4, 26px);
+                    gap: 2px;
+                    padding: 6px 0;
+                }
             }
             .advanced-body {
                 width: 100%;
@@ -8383,7 +9872,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     grid-template-columns: 34px minmax(0, 1fr) 30px 30px 28px;
                     grid-template-areas:
                         "combo-number combo-select combo-download combo-magnify combo-close"
-                        "combo-number combo-add combo-remove . ."
+                        "combo-number combo-add combo-add combo-remove combo-remove"
                         "combo-number combo-bind combo-bind combo-bind .";
                 }
                 .combo-action-button {
@@ -8530,18 +10019,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     max-height: none;
                     overflow: visible;
                 }
-                .combo-stack {
-                    grid-template-columns: 1fr;
-                    height: auto;
-                    min-height: 0;
-                    max-height: none;
-                    overflow: visible;
-                }
                 .combo-toolbar {
                     grid-template-columns: 34px minmax(0, 1fr) 30px 30px 28px;
                     grid-template-areas:
                         "combo-number combo-select combo-download combo-magnify combo-close"
-                        "combo-number combo-add combo-remove . ."
+                        "combo-number combo-add combo-add combo-remove combo-remove"
                         "combo-number combo-bind combo-bind combo-bind .";
                 }
                 .combo-action-button {
@@ -8719,6 +10201,14 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def show_indices(self) -> bool:
         return bool(getattr(getattr(self, "show_indices_input", None), "value", False))
 
+    def on_annotation_visibility_changed(self, kind: str) -> None:
+        for state in self.panel_states:
+            state.annotation_visibility.pop(kind, None)
+        if kind == "crystal":
+            self.refresh_crystal_scenes()
+        else:
+            self.refresh_diffractions()
+
     def show_crystal_annotations(self) -> bool:
         return bool(getattr(getattr(self, "show_crystal_annotations_input", None), "value", True))
 
@@ -8742,6 +10232,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def on_scale_bar_changed(self) -> None:
         if getattr(self, "_updating_scale_bar_checkbox", False):
             return
+        for state in self.panel_states:
+            state.annotation_visibility.pop("scale", None)
         self.scale_bars_enabled = self.show_scale_bars()
         settings = self.global_annotation_settings()
         # A matched pair follows the toolbar; a mixed pair is a remembered filter.
@@ -8937,7 +10429,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         for controller in self.combo_controllers:
             controller.refresh_source_options()
 
-    def add_panel(self, *, crystal_name: str | None = None) -> None:
+    def add_panel(self, *, crystal_name: str | None = None, saved_view: dict | None = None) -> None:
         crystal = crystal_name
         if crystal is None:
             crystals = [name for name in self.library.options() if name != CUSTOM_SENTINEL]
@@ -8951,6 +10443,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             diffraction_color=self.global_diffraction_color or self.default_diffraction_color_for_crystal(crystal),
             display_settings=copy.deepcopy(self.global_display_settings),
         )
+        if saved_view is not None:
+            self.restore_saved_view(state, saved_view)
+        else:
+            self.apply_default_saved_view(state)
         self.panel_states.append(state)
         self.layout_items.append(("panel", self.next_panel_id))
         self.next_panel_id += 1
@@ -9138,12 +10634,14 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         affected_panel_ids: set[int] = set()
         for state in self.panel_states:
             if state.crystal_name == CUSTOM_SENTINEL or state.crystal_name not in self.library.definitions:
-                self.set_panel_crystal(state, selected_name, force_default_color=True)
+                self.set_panel_crystal(state, selected_name, force_default_color=True,
+                                       preserve_saved_view=state.crystal_name in affected_names)
                 affected_panel_ids.add(state.panel_id)
         if target_panel_id is not None:
             target = self.panel_state_by_id(target_panel_id)
             if target is not None:
-                self.set_panel_crystal(target, selected_name, force_default_color=force_default_color)
+                self.set_panel_crystal(target, selected_name, force_default_color=force_default_color,
+                                       preserve_saved_view=target.crystal_name in affected_names)
                 affected_panel_ids.add(target.panel_id)
         for state in self.panel_states:
             if state.crystal_name in affected_names:

@@ -236,8 +236,9 @@ def export_snapshot(api: Any, controller: Any, method: str) -> Any:
     """Reuse the scientific methods with private caches and frozen settings, without UI references."""
     source = controller.simulator
     simulator = object.__new__(api.SimulatorApp)
-    simulator.element_colors = copy.deepcopy(getattr(source, "element_colors", {}))
+    simulator.element_colors = copy.deepcopy(controller.effective_element_colors())
     simulator.global_display_settings = copy.deepcopy(getattr(source, "global_display_settings", api.PanelDisplaySettings()))
+    simulator.global_diffraction_color = getattr(source, "global_diffraction_color", None)
     for name in ("model_cache", "reciprocal_table_cache", "diffraction_spot_cache", "pymatgen_tem_cache"):
         setattr(simulator, name, {})
     for name in ("current_voltage_kv", "current_thickness_nm", "current_max_hkl",
@@ -271,7 +272,8 @@ def render_diffraction(api: Any, controller: Any, size: int, transparent: bool,
     sim, state, model = controller.simulator, controller.state, controller.current_model
     limit = sim.current_diffraction_limit()
     dpi = size / 3.6
-    fig = Figure(figsize=(3.6, 3.6), dpi=dpi, facecolor="none" if transparent else "#050607")
+    backgrounds = (sim.global_display_settings if sources else state.display_settings).backgrounds
+    fig = Figure(figsize=(3.6, 3.6), dpi=dpi, facecolor="none" if transparent else backgrounds.diffraction)
     FigureCanvasAgg(fig)
     ax = fig.add_axes([0, 0, 1, 1], facecolor="none")
     ax.set(xlim=(-limit, limit), ylim=(-limit, limit), aspect="equal")
@@ -294,24 +296,26 @@ def render_diffraction(api: Any, controller: Any, size: int, transparent: bool,
             continue
         intensity = spots[:, 2]
         marker = api.BASE_DIFFRACTION_MARKER_SIZE + api.EXTRA_DIFFRACTION_MARKER_SIZE * sim.current_spot_size_scaling_effect() * intensity ** 1.18
-        colors = [(*api.color_to_rgb(source_state.diffraction_color), float(alpha))
+        spot_color = source_sim.display_diffraction_color(source_state, backgrounds.diffraction)
+        colors = [(*api.color_to_rgb(spot_color), float(alpha))
                   for alpha in source_sim.diffraction_spot_opacities(intensity, combo=bool(sources))]
         ax.scatter(spots[:, 0], spots[:, 1], s=(marker * 0.65) ** 2, c=colors, linewidths=0)
-        if sim.show_indices():
+        if (sim.show_indices() if sources else controller.annotation_visible("indices")):
             labels = [api.diffraction_label_for_hkl(*map(int, spot[3:6]), source_model, sim.use_hex_four_index_basis()) for spot in spots]
-            for label in controller.diffraction_index_annotations(spots, limit, labels, source_state.display_settings.annotations, marker):
+            for label in controller.diffraction_index_annotations(spots, limit, labels, api.display_annotations(source_state.display_settings, backgrounds), marker):
                 draw_annotation(label)
-    settings = sim.global_annotation_settings() if sources else state.display_settings.annotations
-    if sim.show_scale_bars():
+    settings = api.display_annotations(sim.global_display_settings if sources else state.display_settings)
+    show_scale = sim.show_scale_bars() if sources else controller.annotation_visible("scale")
+    if show_scale:
         shapes, labels = api.diffraction_scale_bar_items(limit, sim.current_reciprocal_units_per_plot_unit(), settings)
         for shape in shapes:
             ax.plot([shape["x0"], shape["x1"]], [shape["y0"], shape["y1"]],
                     color=shape["line"]["color"], linewidth=shape["line"]["width"] * .65, alpha=shape["opacity"])
         for label in labels:
             draw_annotation(label)
-    if sim.show_zone_axis_on_diffraction():
+    if (sim.show_zone_axis_on_diffraction() if sources else controller.annotation_visible("zone")):
         label = api.zone_axis_label_from_view(model, state.view_vector, use_hex_four_index=sim.use_hex_four_index_basis())
-        draw_annotation(api.diffraction_zone_axis_annotation(limit, label, settings, sim.show_scale_bars()))
+        draw_annotation(api.diffraction_zone_axis_annotation(limit, label, settings, show_scale))
     fig.canvas.draw()
     return Image.fromarray(np.asarray(fig.canvas.buffer_rgba()).copy())
 
@@ -335,7 +339,9 @@ def render_frame(api: Any, controller: Any, frame: np.ndarray, height: int, cont
         result.paste(image, (index * height, 0))
         image.close()
     if show_crystal_name:
-        titled = compose_animation_tiles([(controller.state.crystal_name, result)], transparent)
+        backgrounds = controller.state.display_settings.backgrounds
+        titled = compose_animation_tiles([(controller.state.crystal_name, result)], transparent,
+            background=backgrounds.diffraction if content == "diffraction" else backgrounds.crystal)
         result.close()
         result = titled
     buffer = io.BytesIO()
@@ -354,7 +360,7 @@ COMBO_LAYOUTS = {
 
 
 def compose_animation_tiles(tiles: list[tuple[str, Image.Image]], transparent: bool,
-                            show_crystal_name: bool = True) -> Image.Image:
+                            show_crystal_name: bool = True, *, background: str = "#000000") -> Image.Image:
     """Compose tiles without changing their scale; omit the title band when hidden."""
     columns = min(2, len(tiles))
     width = max(tile.width for _, tile in tiles)
@@ -365,7 +371,7 @@ def compose_animation_tiles(tiles: list[tuple[str, Image.Image]], transparent: b
             math.ceil(len(tiles) / columns) * (height + heading + gap) - gap)
     if size[0] * size[1] > 32_000_000:
         raise ValueError("Combined image exceeds 32 megapixels. Reduce the frame size or use separate files.")
-    result = Image.new("RGBA", size, (0, 0, 0, 0) if transparent else (11, 15, 20, 255))
+    result = Image.new("RGBA", size, (0, 0, 0, 0) if transparent else background)
     if show_crystal_name:
         draw = ImageDraw.Draw(result)
         try:
@@ -378,7 +384,9 @@ def compose_animation_tiles(tiles: list[tuple[str, Image.Image]], transparent: b
         if show_crystal_name:
             while title and draw.textlength(title, font=font) > width - 16:
                 title = title[:-4] + "..." if len(title) > 4 else ""
-            draw.text((x + 8, y + 4), title, font=font, fill="#80909F" if transparent else "#F7FAFC")
+            rgb = ImageColor.getrgb(background)
+            ink = "#000000" if sum(w * v for w, v in zip((.2126, .7152, .0722), rgb)) > 140 else "#FFFFFF"
+            draw.text((x + 8, y + 4), title, font=font, fill="#80909F" if transparent else ink)
         result.paste(tile, (x, y + heading))
     return result
 
@@ -400,7 +408,9 @@ def render_bound_layout(api: Any, snapshots: dict[int, Any], panel_paths: dict[i
             image = render_diffraction(api, sources[0], height, transparent, sources=sources)
             images.append(image)
             tiles.append((" + ".join(source.state.crystal_name for source in sources), image))
-        result = compose_animation_tiles(tiles, transparent, show_crystal_name)
+        defaults = next(iter(snapshots.values())).simulator.global_display_settings.backgrounds
+        result = compose_animation_tiles(tiles, transparent, show_crystal_name,
+                                         background=defaults.diffraction if layout == "combo" else defaults.crystal)
         images.append(result)
         buffer = io.BytesIO()
         result.save(buffer, format="PNG")
@@ -478,7 +488,7 @@ def encode_animation(paths: list[Path], output: Path, durations: np.ndarray, met
             sample = gif_rgb_image(image, matte)
             sample.thumbnail((160, 160))
             samples.append(sample)
-    atlas = Image.new("RGB", (160 * len(samples), 160), matte or "#0B0F14")
+    atlas = Image.new("RGB", (160 * len(samples), 160), matte or "#000000")
     for index, sample in enumerate(samples):
         atlas.paste(sample, (160 * index, 0))
         sample.close()
@@ -558,6 +568,7 @@ def three_scene_data(api: Any, controller: Any, occupancy_colors: str = "panel")
     planes, _ = api.parse_indices(state.plane_text, model, "plane", True)
     vectors, _ = api.parse_indices(state.vector_text, model, "direction", True, True)
     data = {"atoms": [], "edges": [], "planes": [], "vectors": [], "labels": [],
+            "background": state.display_settings.backgrounds.crystal,
             "frame_color": state.display_settings.frame_color, "frame_width": state.display_settings.frame_width,
             "frame_opacity": state.display_settings.frame_opacity}
     for atom in model.visible_display_atoms():
@@ -575,7 +586,7 @@ def three_scene_data(api: Any, controller: Any, occupancy_colors: str = "panel")
         opacity, edge_opacity = state.display_settings.plane_opacity, state.display_settings.plane_edge_opacity
         data["planes"].append({"points": polygon.tolist(), "color": color, "opacity": opacity, "edge_opacity": edge_opacity})
         if state.display_settings.plane_label_opacity > 0:
-            data["labels"].append({"text": plane.label, "point": polygon.mean(axis=0).tolist(), "color": color,
+            data["labels"].append({"text": plane.label, "point": polygon.mean(axis=0).tolist(), "color": api.crystal_text_color(state.display_settings, color),
                                    "opacity": state.display_settings.plane_label_opacity,
                                    "scale": state.display_settings.plane_label_scale})
     for index, vector in enumerate(vectors):
@@ -586,16 +597,16 @@ def three_scene_data(api: Any, controller: Any, occupancy_colors: str = "panel")
         opacity = state.display_settings.reciprocal_opacity if vector.is_reciprocal else state.display_settings.vector_opacity
         data["vectors"].append({"start": start.tolist(), "end": end.tolist(), "color": color, "reciprocal": vector.is_reciprocal, "opacity": opacity})
         if state.display_settings.vector_label_opacity > 0:
-            data["labels"].append({"text": vector.label, "point": end.tolist(), "color": color,
+            data["labels"].append({"text": vector.label, "point": end.tolist(), "color": api.crystal_text_color(state.display_settings, color),
                                    "opacity": state.display_settings.vector_label_opacity,
                                    "scale": state.display_settings.vector_label_scale})
     data["markers"] = api.marker_geometry(state.display_settings.markers, model)
     for marker in data["markers"]:
         if marker["label"]:
             data["labels"].append({"text": marker["label"], "point": np.mean(marker["points"], axis=0).tolist(),
-                "color": marker["label_color"], "opacity": marker["label_opacity"], "scale": marker["label_size"] / 13,
+                "color": api.crystal_text_color(state.display_settings, marker["label_color"]), "opacity": marker["label_opacity"], "scale": marker["label_size"] / 13,
                 "direction": marker["label_direction"], "gap": marker["label_gap"]})
-    if not sim.show_crystal_annotations():
+    if not controller.annotation_visible("crystal"):
         data["labels"] = []
     return data
 
@@ -618,7 +629,7 @@ try {
 const maxSize = Math.min(renderer.capabilities.maxTextureSize, renderer.getContext().getParameter(renderer.getContext().MAX_RENDERBUFFER_SIZE));
 if (width > maxSize || size > maxSize) throw new Error(`Requested image exceeds this browser's ${maxSize}px WebGL limit; lower Quality.`);
 renderer.setPixelRatio(1); renderer.setSize(width, size);
-renderer.setClearColor('#0B0F14', transparent ? 0 : 1);
+renderer.setClearColor(data.background, transparent ? 0 : 1);
 const distance = extent / (2 * Math.tan(fov * Math.PI / 360));
 const camera = new THREE.PerspectiveCamera(fov, width / size, 0.1, Math.max(5000, distance + 2 * extent));
 const V = p => new THREE.Vector3(...p);
@@ -720,8 +731,8 @@ async def initialize_three_renderer(api: Any, key: str, snapshot: Any, height: i
                                     atom_shading: str = "mild", occupancy_colors: str = "panel") -> None:
     width = height if width is None else width
     bar = None
-    settings = snapshot.state.display_settings.annotations
-    if snapshot.simulator.show_scale_bars() and settings.real_scale_visible:
+    settings = api.display_annotations(snapshot.state.display_settings)
+    if snapshot.annotation_visible("scale") and settings.real_scale_visible:
         width_nm = extent * width / height * snapshot.current_model.scale_nm
         bar_nm = api.choose_scale_bar(width_nm)
         bar = {"fraction": bar_nm / width_nm, "label": f"{bar_nm:g} nm", **asdict(settings.real_scale)}
@@ -786,7 +797,7 @@ class AnimationDialog:
             .animation-step .q-field__native,.animation-step .q-field__suffix,.animation-step .q-checkbox__label {font-size:13px;}
             .animation-step .q-field--outlined .q-field__control {padding:0 8px;}
             .animation-step .q-field__append {padding-left:2px;}
-            .animation-preview {width:100%;height:320px;object-fit:contain;background:#0b0f14;}
+            .animation-preview {width:100%;height:320px;object-fit:contain;background:#000000;}
             .animation-preview-transparent {background-color:#252525;background-image:conic-gradient(#383838 25%,#252525 0 50%,#383838 0 75%,#252525 0);background-size:20px 20px;}
             .animation-sequence-upload {width:164px;max-width:100%;box-shadow:none;border:1px solid var(--q-primary);border-radius:4px;}
             .animation-sequence-upload .q-uploader__list,.animation-sequence-upload .q-uploader__subtitle{display:none;}
