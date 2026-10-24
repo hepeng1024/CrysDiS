@@ -4363,7 +4363,7 @@ class PanelController:
                             grid=False,
                             background_color=self.state.display_settings.backgrounds.crystal,
                             camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
-                            on_click=self.inspect_atom, click_events=["click"],
+                            on_click=self.inspect_atom, click_events=["click", "dblclick"],
                         ).classes("real-scene")
                         self.build_atom_inspector()
                         with ui.element("div").classes("real-scale-bar") as self.scale_bar_container:
@@ -4399,6 +4399,9 @@ class PanelController:
     def inspect_atom(self, event) -> None:
         if event.button != 0 or self.atom_inspector is None or self.current_model is None:
             return
+        if getattr(event, "click_type", "click") == "dblclick":
+            self.reset_scene_view()
+            return
         atom = self.atom_at_click(event)
         if atom is None:
             self.hide_atom_inspector()
@@ -4412,6 +4415,12 @@ class PanelController:
         self.atom_fractional.set_text(point_text(fractional))
         self.atom_cartesian.set_text(point_text(cartesian))
         self.atom_inspector.set_visibility(True)
+
+    def reset_scene_view(self) -> None:
+        if self.scene is None or self.current_model is None:
+            return
+        self.hide_atom_inspector()
+        self.position_scene_camera(self.current_model, self.state.view_vector, self.state.roll)
 
     def atom_at_click(self, event) -> DisplayAtom | None:
         if event.button != 0:
@@ -5275,7 +5284,8 @@ class PanelController:
             return
         self.position_scene_camera(model, self.state.view_vector, self.state.roll)
 
-    def position_scene_camera(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> None:
+    def position_scene_camera(self, model: CrystalModel, view_vector: np.ndarray, roll: float, *,
+                              fit_limit: float | None = None) -> None:
         if self.state.initial_camera is not None:
             pose, self.state.initial_camera = self.state.initial_camera, None
             self.restore_camera_pose(pose, model)
@@ -5284,11 +5294,16 @@ class PanelController:
         if view is None:
             view = np.array([1.0, 0.0, 0.0])
         _u_axis, up_axis = projection_basis(view, roll)
-        distance = calculate_camera_distance(model.limit * 1.08, REAL_SCENE_FOV_DEGREES)
+        limit = max(model.limit, fit_limit or 0)
+        distance = calculate_camera_distance(limit * 1.08, REAL_SCENE_FOV_DEGREES)
         camera = view * distance
         self.scene.client.run_javascript(f"""
             const scene = getElement({self.scene.id});
-            if (scene?.camera) {{scene.camera.far = {max(5000, distance + 3 * model.limit)}; scene.camera.updateProjectionMatrix();}}
+            if (scene?.camera) {{
+                scene.camera.zoom = 1;
+                scene.camera.far = {max(5000, distance + 3 * limit)};
+                scene.camera.updateProjectionMatrix();
+            }}
         """)
         self.scene.move_camera(
             x=float(camera[0]),
@@ -6746,7 +6761,7 @@ class DisplaySettingsDialog:
                 if state is not None:
                     self.action_buttons.append(ui.button("Save view", icon="bookmark_add", on_click=self.open_save_view).props("outline dense"))
                     self.action_buttons.append(ui.button("Follow global settings", icon="public", on_click=lambda: self.request_action("global")).props("outline dense"))
-                self.action_buttons.append(ui.button("Reset display", icon="restart_alt", on_click=lambda: self.request_action("reset")).props("outline dense").tooltip("Restore built-in display settings; keep element colors"))
+                self.action_buttons.append(ui.button("Reset display", icon="restart_alt", on_click=lambda: self.request_action("reset")).props("outline dense").tooltip("Restore display defaults and current theme backgrounds; keep element colors"))
                 self.action_buttons.append(ui.button("Apply/Close", icon="check", on_click=lambda: self.run_action("apply")).props("unelevated dense"))
         self.load(self.draft)
         for controls in self.section_controls.values():
@@ -7085,7 +7100,7 @@ class DisplaySettingsDialog:
                     preview.scene = CrystalScene(
                         width=350, height=260, grid=False, background_color=preview.state.display_settings.backgrounds.crystal,
                         camera=ui.scene.perspective_camera(fov=REAL_SCENE_FOV_DEGREES, near=0.1, far=5000),
-                        on_click=self.inspect_preview_atom, click_events=["click"],
+                        on_click=self.inspect_preview_atom, click_events=["click", "dblclick"],
                     ).classes("real-scene settings-preview-scene")
                     preview.build_atom_inspector()
                     self.build_preview_magnify_button("crystal")
@@ -7136,11 +7151,30 @@ class DisplaySettingsDialog:
     def inspect_preview_atom(self, event) -> None:
         if self.preview is None or self.preview_closed:
             return
+        if getattr(event, "click_type", "click") == "dblclick":
+            if event.button == 0:
+                self.reset_preview_view()
+            return
         atom = self.preview.atom_at_click(event)
         if atom is not None and self.marker_editor is not None and self.marker_editor.pick_from_scene(atom, self.preview.current_model):
             self.preview.hide_atom_inspector()
             return
         self.preview.inspect_atom(event)
+
+    def reset_preview_view(self) -> None:
+        preview = self.preview
+        if preview is None or not self.preview_ready or self.preview_closed:
+            return
+        view, roll = preview.state.view_vector, preview.state.roll
+        if self.preview_camera is not None:
+            pose = self.preview_camera
+            # A panned camera's position alone is not its viewing direction.
+            direction = normalize_vector(np.subtract(pose["position"], pose["target"]))
+            if direction is not None:
+                view = direction
+                roll = roll_from_view_and_up(view, np.array(pose["up"]), roll)
+        preview.hide_atom_inspector()
+        preview.position_scene_camera(preview.current_model, view, roll, fit_limit=self.preview_view_limit)
 
     def build_preview_magnify_button(self, kind: str) -> None:
         self.preview_magnify_buttons[kind] = ui.button(icon="open_in_full",
@@ -7523,7 +7557,7 @@ class DisplaySettingsDialog:
         follow = action == "global"
         title = "Follow global settings?" if follow else "Reset display?"
         message = ("Replace this panel's display settings with the global defaults and follow future global changes?"
-                   if follow else "Restore the built-in display settings?")
+                   if follow else "Restore the built-in display settings with the current theme's panel backgrounds?")
         message += (" Crystal markers will be kept. Saved-view color and visibility overrides will follow global settings." if follow
                     else " Crystal markers will be removed. Element colors will be kept.")
         if self.panel_id is not None:
@@ -7561,6 +7595,7 @@ class DisplaySettingsDialog:
                 # Reset live display defaults without committing or discarding pending element edits.
                 colors = self.simulator.element_colors if self.panel_id is None else self.draft.element_colors
                 draft = DisplaySettingsDraft(element_colors=colors.copy())
+                draft.display.backgrounds = copy.deepcopy(self.simulator.theme.backgrounds)
                 draft.panel_element_colors = copy.deepcopy(self.draft.panel_element_colors)
             elif action == "global":
                 draft = self.simulator.display_settings_draft()
