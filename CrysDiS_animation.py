@@ -295,10 +295,10 @@ def render_diffraction(api: Any, controller: Any, size: int, transparent: bool,
         if not len(spots):
             continue
         intensity = spots[:, 2]
-        marker = api.BASE_DIFFRACTION_MARKER_SIZE + api.EXTRA_DIFFRACTION_MARKER_SIZE * sim.current_spot_size_scaling_effect() * intensity ** 1.18
+        marker = source_sim.diffraction_spot_sizes(intensity, source_state)
         spot_color = source_sim.display_diffraction_color(source_state, backgrounds.diffraction)
         colors = [(*api.color_to_rgb(spot_color), float(alpha))
-                  for alpha in source_sim.diffraction_spot_opacities(intensity, combo=bool(sources))]
+                  for alpha in source_sim.diffraction_spot_opacities(intensity, combo=bool(sources), state=source_state)]
         ax.scatter(spots[:, 0], spots[:, 1], s=(marker * 0.65) ** 2, c=colors, linewidths=0)
         if (sim.show_indices() if sources else controller.annotation_visible("indices")):
             labels = [api.diffraction_label_for_hkl(*map(int, spot[3:6]), source_model, sim.use_hex_four_index_basis()) for spot in spots]
@@ -586,7 +586,7 @@ def three_scene_data(api: Any, controller: Any, occupancy_colors: str = "panel")
         opacity, edge_opacity = state.display_settings.plane_opacity, state.display_settings.plane_edge_opacity
         data["planes"].append({"points": polygon.tolist(), "color": color, "opacity": opacity, "edge_opacity": edge_opacity})
         if state.display_settings.plane_label_opacity > 0:
-            data["labels"].append({"text": plane.label, "point": polygon.mean(axis=0).tolist(), "color": api.crystal_text_color(state.display_settings, color),
+            data["labels"].append({"text": plane.label, "point": polygon.mean(axis=0).tolist(), "color": api.crystal_text_color(state.display_settings, color, preserve_hue=True),
                                    "opacity": state.display_settings.plane_label_opacity,
                                    "scale": state.display_settings.plane_label_scale})
     for index, vector in enumerate(vectors):
@@ -597,7 +597,7 @@ def three_scene_data(api: Any, controller: Any, occupancy_colors: str = "panel")
         opacity = state.display_settings.reciprocal_opacity if vector.is_reciprocal else state.display_settings.vector_opacity
         data["vectors"].append({"start": start.tolist(), "end": end.tolist(), "color": color, "reciprocal": vector.is_reciprocal, "opacity": opacity})
         if state.display_settings.vector_label_opacity > 0:
-            data["labels"].append({"text": vector.label, "point": end.tolist(), "color": api.crystal_text_color(state.display_settings, color),
+            data["labels"].append({"text": vector.label, "point": end.tolist(), "color": api.crystal_text_color(state.display_settings, color, preserve_hue=True),
                                    "opacity": state.display_settings.vector_label_opacity,
                                    "scale": state.display_settings.vector_label_scale})
     data["markers"] = api.marker_geometry(state.display_settings.markers, model)

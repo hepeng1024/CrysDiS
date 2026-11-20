@@ -19,6 +19,7 @@ import tempfile
 import threading
 import uuid
 import warnings
+import zipfile
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from functools import lru_cache
@@ -179,7 +180,31 @@ def sanitize_export_filename_stem(value: Any, fallback: str = "crysdis_export") 
     text = re.sub(r"\s+", "_", text)
     text = text.strip(" ._")
     fallback_text = re.sub(r"[\\/:*?\"<>|\x00-\x1f\s]+", "_", str(fallback or "crysdis_export")).strip(" ._")
-    return text or fallback_text or "crysdis_export"
+    text = text or fallback_text or "crysdis_export"
+    if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)", text, re.I):
+        text = "_" + text
+    return shortened_export_stem(text, 180)
+
+
+def shortened_export_stem(text: str, max_bytes: int = 100) -> str:
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
+    return text.encode("utf-8")[:max_bytes - 9].decode("utf-8", errors="ignore").rstrip(" ._") + "_" + digest
+
+
+def structure_export_base(name: str, kind: str) -> str:
+    return shortened_export_stem(sanitize_export_filename_stem(name, "crystal")) + "_" + kind
+
+
+def unique_archive_filename(filename: str, used: set[str]) -> str:
+    stem, suffix = os.path.splitext(filename)
+    candidate, number = filename, 2
+    while candidate.casefold() in used:
+        candidate = f"{stem}_{number}{suffix}"
+        number += 1
+    used.add(candidate.casefold())
+    return candidate
 
 
 def sanitize_export_filename(value: Any, fallback_stem: str = "crysdis_export", extension: str = ".png") -> str:
@@ -691,6 +716,13 @@ THEME_COLOR_LABELS = {"primary": "Accent", "secondary": "Secondary accent", "pag
 
 
 @dataclass
+class PanelDiffractionSettings:
+    max_hkl: int | None = None
+    spot_opacity: float = 1.0
+    spot_scale: float = 1.0
+
+
+@dataclass
 class PanelDisplaySettings:
     frame_mode: str = "original"
     frame_color: str = "#7A8796"
@@ -712,6 +744,7 @@ class PanelDisplaySettings:
     backgrounds: PanelBackgrounds = field(default_factory=PanelBackgrounds)
     annotations: PanelAnnotations = field(default_factory=PanelAnnotations)
     markers: list[CrystalMarker] = field(default_factory=list)
+    diffraction: PanelDiffractionSettings = field(default_factory=PanelDiffractionSettings)
 
 
 DISPLAY_SETTING_FIELDS = {
@@ -722,24 +755,57 @@ DISPLAY_SETTING_FIELDS = {
                "vector_label_scale", "vector_label_opacity", "plane_label_scale", "plane_label_opacity"),
     "annotations": ("annotations",),
     "backgrounds": ("backgrounds",),
+    "diffraction": ("diffraction",),
 }
 DISPLAY_SETTING_SECTIONS = frozenset(DISPLAY_SETTING_FIELDS)
 
 
 def crystal_display_settings(settings: PanelDisplaySettings) -> PanelDisplaySettings:
     """Exclude 2D overlays from crystal geometry/cache invalidation."""
-    return replace(settings, annotations=PanelAnnotations(), backgrounds=PanelBackgrounds())
+    return replace(settings, annotations=PanelAnnotations(), backgrounds=PanelBackgrounds(),
+                   diffraction=PanelDiffractionSettings())
+
+
+def _color_luminance(color: str) -> float:
+    channels = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
+                for value in color_to_rgb(color)]
+    return sum(weight * value for weight, value in zip((.2126, .7152, .0722), channels))
 
 
 def contrast_text_color(background: str) -> str:
-    channels = [value / 12.92 if value <= .04045 else ((value + .055) / 1.055) ** 2.4
-                for value in color_to_rgb(background)]
-    luminance = sum(weight * value for weight, value in zip((.2126, .7152, .0722), channels))
-    return "#000000" if luminance > .179 else "#FFFFFF"
+    return "#000000" if _color_luminance(background) > .179 else "#FFFFFF"
 
 
-def crystal_text_color(settings: PanelDisplaySettings, color: str) -> str:
-    return contrast_text_color(settings.backgrounds.crystal) if settings.backgrounds.automatic_text else color
+def crystal_text_color(settings: PanelDisplaySettings, color: str, *, preserve_hue: bool = False) -> str:
+    """Adapt text contrast, optionally keeping vector/plane palette hues."""
+    if not settings.backgrounds.automatic_text:
+        return color
+    background = settings.backgrounds.crystal
+    fallback = contrast_text_color(background)
+    if not preserve_hue or normalized_hex_color(color) is None:
+        return fallback
+    background_luminance = _color_luminance(background)
+
+    def readable(candidate: str) -> bool:
+        light, dark = sorted((_color_luminance(candidate), background_luminance), reverse=True)
+        return (light + .05) / (dark + .05) >= 4.5
+
+    if readable(color):
+        return color
+    hue, lightness, saturation = colorsys.rgb_to_hls(*color_to_rgb(color))
+    target = 0.0 if fallback == "#000000" else 1.0
+    low, high = 0.0, 1.0
+    result = fallback
+    # Find the smallest lightness adjustment, testing the actual rounded RGB color.
+    for _ in range(24):
+        amount = (low + high) / 2
+        rgb = colorsys.hls_to_rgb(hue, lightness + (target - lightness) * amount, saturation)
+        candidate = "#" + "".join(f"{round(channel * 255):02X}" for channel in rgb)
+        if readable(candidate):
+            high, result = amount, candidate
+        else:
+            low = amount
+    return result
 
 
 def display_annotations(settings: PanelDisplaySettings, backgrounds: PanelBackgrounds | None = None) -> PanelAnnotations:
@@ -835,6 +901,7 @@ class PanelState:
     plane_colors: list[str] | None = None
     display_settings: PanelDisplaySettings = field(default_factory=PanelDisplaySettings)
     global_display_sections: set[str] = field(default_factory=lambda: set(DISPLAY_SETTING_SECTIONS))
+    display_inheritance_configured: bool = False
     diffraction_color_custom: bool = False
     element_colors: dict[str, str] | None = None
     annotation_visibility: dict[str, bool] = field(default_factory=dict)
@@ -895,6 +962,7 @@ def display_settings_from_dict(data: dict) -> PanelDisplaySettings:
             annotations[name] = AnnotationStyle(**annotations[name])
     settings = PanelDisplaySettings(
         annotations=PanelAnnotations(**annotations), backgrounds=PanelBackgrounds(**data.pop("backgrounds", {})),
+        diffraction=PanelDiffractionSettings(**data.pop("diffraction", {})),
         markers=[CrystalMarker(**marker) for marker in data.pop("markers", [])], **data)
     settings.cells = tuple(settings.cells)
     validate_display_settings(settings)
@@ -1426,6 +1494,16 @@ def make_model(definition: CrystalDefinition) -> CrystalModel:
 
 def validate_display_settings(settings: PanelDisplaySettings) -> None:
     validate_markers(settings.markers)
+    diffraction = settings.diffraction
+    if diffraction.max_hkl is not None and (
+            isinstance(diffraction.max_hkl, bool) or not isinstance(diffraction.max_hkl, (int, float))
+            or not math.isfinite(diffraction.max_hkl) or not 1 <= diffraction.max_hkl <= 30
+            or int(diffraction.max_hkl) != diffraction.max_hkl):
+        raise ValueError("Maximum hkl must be a whole number between 1 and 30.")
+    for value, name, low, high in ((diffraction.spot_opacity, "Spot opacity", 0, 1),
+                                   (diffraction.spot_scale, "Spot size", .1, 3)):
+        if not math.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"{name} must be between {low * 100:g} and {high * 100:g}%.")
     for value in (settings.backgrounds.crystal, settings.backgrounds.diffraction):
         if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
             raise ValueError("Panel backgrounds must be six-digit hex colors.")
@@ -4746,7 +4824,7 @@ class PanelController:
                     x1 + 0.025 * width,
                     y1 + 0.025 * height,
                     vector.label,
-                    color=crystal_text_color(settings, color),
+                    color=crystal_text_color(settings, color, preserve_hue=True),
                     alpha=settings.vector_label_opacity,
                     fontsize=9 * settings.vector_label_scale,
                     weight="bold",
@@ -4828,7 +4906,7 @@ class PanelController:
             for index, (plane, polygon) in enumerate(plane_polygons):
                 color = plane_palette[index % len(plane_palette)]
                 x, y = project(np.mean(polygon, axis=0))
-                ax.text(x, y, plane.label, color=crystal_text_color(settings, color), alpha=settings.plane_label_opacity,
+                ax.text(x, y, plane.label, color=crystal_text_color(settings, color, preserve_hue=True), alpha=settings.plane_label_opacity,
                         fontsize=9 * settings.plane_label_scale, weight="bold", ha="center", va="center", zorder=6)
 
         if self.annotation_visible("scale") and settings.annotations.real_scale_visible:
@@ -4902,18 +4980,29 @@ class PanelController:
     async def render_crystal_image(
         self, dpi: float, transparent: bool = False, renderer: str = "three",
         atom_shading: str = "mild", occupancy_colors: str = "panel", shaded_atoms: bool = False,
+        background: str | None = None,
     ) -> bytes:
         from CrysDiS_animation import RENDER_LOCK, render_static_three_png
 
         view, roll = await self.live_scene_orientation()
+        controller = self
+        if background is not None and not transparent:
+            background = normalized_hex_color(background)
+            if background is None:
+                raise ValueError("Choose a valid crystal background color.")
+            if background != self.state.display_settings.backgrounds.crystal:
+                controller = copy.copy(self)
+                controller.state = copy.deepcopy(self.state)
+                controller.state.display_settings.backgrounds.crystal = background
+                controller.state.display_settings.backgrounds.automatic_text = True
         if renderer == "three":
             return await render_static_three_png(
-                sys.modules[__name__], self, dpi, transparent, view, roll,
+                sys.modules[__name__], controller, dpi, transparent, view, roll,
                 atom_shading=atom_shading, occupancy_colors=occupancy_colors)
 
         def render() -> bytes:
             with RENDER_LOCK:
-                return self.render_crystal_png(
+                return controller.render_crystal_png(
                     dpi, transparent_background=transparent, view_vector=view, roll=roll,
                     shaded_atoms=shaded_atoms, atom_shading=atom_shading, occupancy_colors=occupancy_colors)
 
@@ -4929,150 +5018,47 @@ class PanelController:
         await self.animation_dialog.open()
 
     async def download_images(
-        self,
-        include_crystal: bool,
-        include_diffraction: bool,
-        dpi: float,
-        transparent_background: bool = False,
-        crystal_filename_base: str | None = None,
-        diffraction_filename_base: str | None = None,
-        include_suffixes: bool = True,
-        crystal_renderer: str = "three",
-        shaded_atoms: bool = False,
-        atom_shading: str | None = None,
-        occupancy_colors: str = "panel",
+        self, include_crystal: bool, include_diffraction: bool, dpi: float,
+        transparent_background: bool = False, crystal_filename_base: str | None = None,
+        diffraction_filename_base: str | None = None, include_suffixes: bool = True,
+        crystal_renderer: str = "three", shaded_atoms: bool = False,
+        atom_shading: str | None = None, occupancy_colors: str = "panel",
+        crystal_background: str | None = None, diffraction_background: str | None = None,
     ) -> None:
         if not include_crystal and not include_diffraction:
             ui.notify("Choose at least one image to download", type="warning")
             return
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
         direct_export = self.simulator.direct_file_exports_enabled()
-        saved_paths: list[Path] = []
-        crystal_downloaded = False
-        crystal_filename = export_image_filename(
-            crystal_filename_base,
-            f"panel_{self.state.panel_id}_crystal",
-            dpi,
-            transparent_background,
-            include_suffixes=include_suffixes,
-        )
-        diffraction_filename = export_image_filename(
-            diffraction_filename_base,
-            f"panel_{self.state.panel_id}_diffraction",
-            dpi,
-            transparent_background,
-            include_suffixes=include_suffixes,
-        )
-        if include_crystal:
+        saved_paths, completed = [], 0
+        for kind, selected, base in (("structure", include_crystal, crystal_filename_base),
+                                     ("diffraction", include_diffraction, diffraction_filename_base)):
+            if not selected:
+                continue
+            filename = export_image_filename(base, structure_export_base(self.state.crystal_name, kind),
+                                             dpi, transparent_background, include_suffixes)
             try:
-                shading = atom_shading or ("strong" if shaded_atoms else "mild")
-                image_bytes = await self.render_crystal_image(
-                    dpi, transparent_background, crystal_renderer, shading, occupancy_colors, shaded_atoms)
-                if direct_export:
-                    saved_paths.append(self.simulator.save_exported_image(image_bytes, crystal_filename))
+                if kind == "structure":
+                    image_bytes = await self.render_crystal_image(
+                        dpi, transparent_background, crystal_renderer,
+                        atom_shading or ("strong" if shaded_atoms else "mild"), occupancy_colors, shaded_atoms,
+                        background=crystal_background)
                 else:
-                    ui.download(image_bytes, crystal_filename, media_type="image/png")
-                crystal_downloaded = True
+                    image_bytes = await render_diffraction_image(self, dpi, transparent_background, diffraction_background)
+                if direct_export:
+                    saved_paths.append(self.simulator.save_exported_image(image_bytes, filename))
+                else:
+                    ui.download(image_bytes, filename, media_type="image/png")
+                completed += 1
             except Exception as exc:
-                ui.notify(f"Crystal export failed: {exc}", type="negative")
-                if not include_diffraction:
-                    return
-        if not include_diffraction:
+                ui.notify(f"{kind.capitalize()} export failed: {exc}", type="negative")
+        if completed:
             if self.download_dialog is not None:
                 self.download_dialog.close()
             if direct_export:
                 self.simulator.announce_saved_exports(saved_paths)
             else:
-                self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded image export")
-            return
-
-        selector = f".comparison-panel-{self.state.panel_id}"
-        script = f"""
-        const root = document.querySelector({json.dumps(selector)});
-        const dpi = {float(dpi):.6f};
-        const scale = Math.max(1, dpi / 150);
-        const transparentBackground = {json.dumps(bool(transparent_background))};
-        const directExport = {json.dumps(bool(direct_export))};
-        const filename = {json.dumps(diffraction_filename)};
-
-        function saveDataUrl(dataUrl, filename) {{
-            const link = document.createElement('a');
-            link.href = dataUrl;
-            link.download = filename;
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-        }}
-
-        async function downloadDiffraction() {{
-            const plot = root?.querySelector('.diffraction-plot.js-plotly-plot') || root?.querySelector('.diffraction-plot .js-plotly-plot');
-            if (!plot || !window.Plotly) return false;
-            const rect = plot.getBoundingClientRect();
-            const originalPaper = plot.layout?.paper_bgcolor;
-            const originalPlot = plot.layout?.plot_bgcolor;
-            if (transparentBackground) {{
-                await window.Plotly.relayout(plot, {{
-                    paper_bgcolor: 'rgba(0,0,0,0)',
-                    plot_bgcolor: 'rgba(0,0,0,0)',
-                }});
-            }}
-            let dataUrl;
-            try {{
-                dataUrl = await window.Plotly.toImage(plot, {{
-                    format: 'png',
-                    width: Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440)),
-                    height: Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280)),
-                    scale,
-                }});
-            }} finally {{
-                if (transparentBackground) {{
-                    await window.Plotly.relayout(plot, {{
-                        paper_bgcolor: originalPaper || '#000000',
-                        plot_bgcolor: originalPlot || '#000000',
-                    }});
-                }}
-            }}
-            if (directExport) {{
-                return {{filename, dataUrl}};
-            }}
-            saveDataUrl(dataUrl, filename);
-            return {{downloaded: true}};
-        }}
-
-        return await downloadDiffraction();
-        """
-        try:
-            result = await ui.run_javascript(script, timeout=20.0)
-        except Exception as exc:
-            ui.notify(f"Download failed: {exc}", type="negative")
-            return
-        diffraction_downloaded = False
-        if direct_export:
-            if isinstance(result, dict) and result.get("dataUrl") and result.get("filename"):
-                try:
-                    image_bytes = decode_png_data_url(str(result["dataUrl"]))
-                    saved_paths.append(self.simulator.save_exported_image(image_bytes, str(result["filename"])))
-                except Exception as exc:
-                    ui.notify(f"Diffraction export failed: {exc}", type="negative")
-                    if not saved_paths:
-                        return
-            elif not saved_paths:
-                ui.notify("Could not capture the selected image", type="warning")
-                return
-            else:
-                ui.notify("Could not capture the selected image", type="warning")
-        else:
-            diffraction_downloaded = bool(result and (result is True or (isinstance(result, dict) and result.get("downloaded"))))
-
-        if saved_paths or diffraction_downloaded or crystal_downloaded:
-            if self.download_dialog is not None:
-                self.download_dialog.close()
-            if direct_export:
-                self.simulator.announce_saved_exports(saved_paths)
-            else:
-                self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded image export")
-        else:
-            ui.notify("Could not capture the selected image", type="warning")
+                self.simulator.set_status(f"Panel {self.state.panel_id}: downloaded {completed} image(s)")
 
     async def apply_from_browser(self) -> None:
         if self._applying:
@@ -5427,7 +5413,7 @@ class PanelController:
         return (
             crystal_model_key(model),
             json.dumps(asdict(crystal_display_settings(self.state.display_settings)), sort_keys=True),
-            crystal_text_color(self.state.display_settings, ""),
+            self.state.display_settings.backgrounds.crystal if self.state.display_settings.backgrounds.automatic_text else "",
             self.state.plane_text,
             self.state.vector_text,
             self.annotation_visible("crystal"),
@@ -5528,7 +5514,7 @@ class PanelController:
                     self.scene.line(start.tolist(), end.tolist()).material(color=color, opacity=settings.plane_edge_opacity)
             if self.annotation_visible("crystal") and settings.plane_label_opacity > 0:
                 label_position = np.mean(vertices, axis=0)
-                self.scene.text(plane.label, style=f"color: {crystal_text_color(settings, color)}; opacity: {settings.plane_label_opacity}; font-size: {13 * settings.plane_label_scale:g}px; font-weight: 700;").move(
+                self.scene.text(plane.label, style=f"color: {crystal_text_color(settings, color, preserve_hue=True)}; opacity: {settings.plane_label_opacity}; font-size: {13 * settings.plane_label_scale:g}px; font-weight: 700;").move(
                     *label_position.tolist()
                 )
 
@@ -5550,7 +5536,7 @@ class PanelController:
                 if opacity > 0:
                     self.draw_arrow(start, end, color, opacity=opacity)
             if self.annotation_visible("crystal") and settings.vector_label_opacity > 0:
-                self.scene.text(vector.label, style=f"color: {crystal_text_color(settings, color)}; opacity: {settings.vector_label_opacity}; font-size: {13 * settings.vector_label_scale:g}px; font-weight: 700;").move(
+                self.scene.text(vector.label, style=f"color: {crystal_text_color(settings, color, preserve_hue=True)}; opacity: {settings.vector_label_opacity}; font-size: {13 * settings.vector_label_scale:g}px; font-weight: 700;").move(
                     *end.tolist()
                 )
 
@@ -5642,8 +5628,7 @@ class PanelController:
         data: list[dict[str, Any]] = []
         if len(spots):
             intensity = spots[:, 2]
-            size_scaling = self.simulator.current_spot_size_scaling_effect()
-            marker_size = BASE_DIFFRACTION_MARKER_SIZE + EXTRA_DIFFRACTION_MARKER_SIZE * size_scaling * intensity**1.18
+            marker_size = self.simulator.diffraction_spot_sizes(intensity, self.state)
             labels = []
             hover_text = []
             for spot in spots:
@@ -5663,9 +5648,10 @@ class PanelController:
                     "y": spots[:, 1].tolist(),
                     "text": hover_text,
                     "hovertemplate": "%{text}<extra></extra>",
+                    "meta": {"source_panel_id": self.state.panel_id},
                     "marker": {
                         "size": marker_size.tolist(),
-                        "color": [rgba_css(spot_color, alpha) for alpha in self.simulator.diffraction_spot_opacities(intensity)],
+                        "color": [rgba_css(spot_color, alpha) for alpha in self.simulator.diffraction_spot_opacities(intensity, state=self.state)],
                         "line": {"width": 0},
                     },
                 }
@@ -5879,102 +5865,25 @@ class ComboPanelController:
         await self.animation_dialog.open()
 
     async def download_diffraction_image(
-        self,
-        dpi: float,
-        transparent_background: bool = False,
-        filename_base: str | None = None,
-        include_suffixes: bool = True,
+        self, dpi: float, transparent_background: bool = False,
+        filename_base: str | None = None, include_suffixes: bool = True,
+        background: str | None = None,
     ) -> None:
         dpi = min(max(float(dpi or 300), 72.0), 1200.0)
-        direct_export = self.simulator.direct_file_exports_enabled()
-        selector = f".combo-panel-{self.state.combo_id}"
-        filename = export_image_filename(
-            filename_base,
-            f"combo_C{self.state.combo_id}_diffraction",
-            dpi,
-            transparent_background,
-            include_suffixes=include_suffixes,
-        )
-        script = f"""
-        const root = document.querySelector({json.dumps(selector)});
-        const dpi = {float(dpi):.6f};
-        const scale = Math.max(1, dpi / 150);
-        const transparentBackground = {json.dumps(bool(transparent_background))};
-        const directExport = {json.dumps(bool(direct_export))};
-        const filename = {json.dumps(filename)};
-
-        function saveDataUrl(dataUrl, filename) {{
-            const link = document.createElement('a');
-            link.href = dataUrl;
-            link.download = filename;
-            document.body.appendChild(link);
-            link.click();
-            link.remove();
-        }}
-
-        async function downloadDiffraction() {{
-            const plot = root?.querySelector('.diffraction-plot.js-plotly-plot') || root?.querySelector('.diffraction-plot .js-plotly-plot');
-            if (!plot || !window.Plotly) return false;
-            const rect = plot.getBoundingClientRect();
-            const originalPaper = plot.layout?.paper_bgcolor;
-            const originalPlot = plot.layout?.plot_bgcolor;
-            if (transparentBackground) {{
-                await window.Plotly.relayout(plot, {{
-                    paper_bgcolor: 'rgba(0,0,0,0)',
-                    plot_bgcolor: 'rgba(0,0,0,0)',
-                }});
-            }}
-            let dataUrl;
-            try {{
-                dataUrl = await window.Plotly.toImage(plot, {{
-                    format: 'png',
-                    width: Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440)),
-                    height: Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280)),
-                    scale,
-                }});
-            }} finally {{
-                if (transparentBackground) {{
-                    await window.Plotly.relayout(plot, {{
-                        paper_bgcolor: originalPaper || '#000000',
-                        plot_bgcolor: originalPlot || '#000000',
-                    }});
-                }}
-            }}
-            if (directExport) {{
-                return {{filename, dataUrl}};
-            }}
-            saveDataUrl(dataUrl, filename);
-            return {{downloaded: true}};
-        }}
-
-        return await downloadDiffraction();
-        """
+        filename = export_image_filename(filename_base, f"combo_C{self.state.combo_id}_diffraction",
+                                         dpi, transparent_background, include_suffixes)
         try:
-            result = await ui.run_javascript(script, timeout=20.0)
-        except Exception as exc:
-            ui.notify(f"Download failed: {exc}", type="negative")
-            return
-        saved_paths: list[Path] = []
-        if direct_export:
-            if not (isinstance(result, dict) and result.get("dataUrl") and result.get("filename")):
-                ui.notify("Could not capture the combo diffraction pattern", type="warning")
-                return
-            try:
-                image_bytes = decode_png_data_url(str(result["dataUrl"]))
-                saved_paths.append(self.simulator.save_exported_image(image_bytes, str(result["filename"])))
-            except Exception as exc:
-                ui.notify(f"Combo diffraction export failed: {exc}", type="negative")
-                return
-        downloaded = bool(result and (result is True or (isinstance(result, dict) and result.get("downloaded"))))
-        if saved_paths or downloaded:
+            image_bytes = await render_diffraction_image(self, dpi, transparent_background, background)
+            if self.simulator.direct_file_exports_enabled():
+                path = self.simulator.save_exported_image(image_bytes, filename)
+                self.simulator.announce_saved_exports([path])
+            else:
+                ui.download(image_bytes, filename, media_type="image/png")
+                self.simulator.set_status(f"Combo C{self.state.combo_id}: downloaded diffraction export")
             if self.download_dialog is not None:
                 self.download_dialog.close()
-            if direct_export:
-                self.simulator.announce_saved_exports(saved_paths)
-            else:
-                self.simulator.set_status(f"Combo C{self.state.combo_id}: downloaded diffraction export")
-        else:
-            ui.notify("Could not capture the combo diffraction pattern", type="warning")
+        except Exception as exc:
+            ui.notify(f"Combo diffraction export failed: {exc}", type="negative")
 
     def source_options(self) -> dict[int, str]:
         return {state.panel_id: f"{state.panel_id}. {state.crystal_name}" for state in self.simulator.panel_states}
@@ -6132,8 +6041,7 @@ class ComboPanelController:
                 continue
             intensity = spots[:, 2]
             spot_color = self.simulator.display_diffraction_color(source, display.backgrounds.diffraction)
-            size_scaling = self.simulator.current_spot_size_scaling_effect()
-            marker_size = BASE_DIFFRACTION_MARKER_SIZE + EXTRA_DIFFRACTION_MARKER_SIZE * size_scaling * intensity**1.18
+            marker_size = self.simulator.diffraction_spot_sizes(intensity, source)
             labels = []
             hover_text = []
             for spot in spots:
@@ -6154,9 +6062,10 @@ class ComboPanelController:
                     "y": spots[:, 1].tolist(),
                     "text": hover_text,
                     "hovertemplate": "%{text}<extra></extra>",
+                    "meta": {"source_panel_id": source.panel_id},
                     "marker": {
                         "size": marker_size.tolist(),
-                        "color": [rgba_css(spot_color, alpha) for alpha in self.simulator.diffraction_spot_opacities(intensity, combo=True)],
+                        "color": [rgba_css(spot_color, alpha) for alpha in self.simulator.diffraction_spot_opacities(intensity, combo=True, state=source)],
                         "line": {"width": 0},
                     },
                 }
@@ -6202,6 +6111,68 @@ class ComboPanelController:
         }
 
 
+async def render_diffraction_image(controller: Any, dpi: float, transparent: bool = False,
+                                   background: str | None = None, *, preview: bool = False) -> bytes:
+    """Capture a private Plotly figure, without relayout of the live panel."""
+    state = controller.state
+    combo = isinstance(controller, ComboPanelController)
+    selector = f".combo-panel-{state.combo_id}" if combo else f".comparison-panel-{state.panel_id}"
+    if transparent:
+        background = None
+    if background is not None:
+        background = normalized_hex_color(background)
+        if background is None:
+            raise ValueError("Choose a valid diffraction background color.")
+    settings = (getattr(controller.simulator, "global_display_settings", PanelDisplaySettings())
+                if combo else state.display_settings)
+    override = background is not None and background != settings.backgrounds.diffraction and not transparent
+    replacements = {}
+    if override:
+        sources = controller.selected_sources() if combo else [state]
+        for source in sources:
+            old = controller.simulator.display_diffraction_color(source, settings.backgrounds.diffraction)
+            new = controller.simulator.display_diffraction_color(source, background)
+            if old != new:
+                before = ",".join(str(round(v * 255)) for v in color_to_rgb(old))
+                after = ",".join(str(round(v * 255)) for v in color_to_rgb(new))
+                replacements[str(source.panel_id)] = {"before": before, "after": after}
+    data_url = await ui.run_javascript(fr"""
+        const root = document.querySelector({json.dumps(selector)});
+        const plot = root?.querySelector('.diffraction-plot.js-plotly-plot') || root?.querySelector('.diffraction-plot .js-plotly-plot');
+        if (!plot || !window.Plotly) throw new Error('Diffraction view is not ready');
+        const rect = plot.getBoundingClientRect();
+        const width = Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440));
+        const height = Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280));
+        const figure = JSON.parse(JSON.stringify({{data: plot.data, layout: plot.layout}}));
+        if ({json.dumps(transparent)}) {{
+            figure.layout.paper_bgcolor = 'rgba(0,0,0,0)';
+            figure.layout.plot_bgcolor = 'rgba(0,0,0,0)';
+        }} else if ({json.dumps(background is not None)}) {{
+            figure.layout.paper_bgcolor = {json.dumps(background)};
+            figure.layout.plot_bgcolor = {json.dumps(background)};
+        }}
+        if ({json.dumps(override)}) {{
+            const textColor = {json.dumps(contrast_text_color(background) if background else '#FFFFFF')};
+            for (const annotation of figure.layout.annotations || [])
+                annotation.font = {{...annotation.font, color:textColor}};
+            for (const shape of figure.layout.shapes || [])
+                shape.line = {{...shape.line, color:textColor}};
+            const replacements = {json.dumps(replacements)};
+            for (const trace of figure.data) {{
+                const replacement = replacements[String(trace.meta?.source_panel_id ?? {json.dumps(None if combo else state.panel_id)})];
+                if (!replacement || !Array.isArray(trace.marker?.color)) continue;
+                trace.marker.color = trace.marker.color.map(color => color.replace(
+                    /rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,/,
+                    (match,r,g,b) => replacement.before === `${{r}},${{g}},${{b}}` ? `rgba(${{replacement.after}},` : match));
+            }}
+        }}
+        const scale = {json.dumps(preview)} ? Math.min(1,690/Math.max(width,height)) * Math.min(1,{float(dpi)}/150)
+                                          : Math.max(1,{float(dpi)}/150);
+        return await window.Plotly.toImage(figure, {{format:'png', width, height, scale}});
+    """, timeout=60)
+    return decode_png_data_url(data_url)
+
+
 class StaticDownloadDialog:
     """Low-resolution export previews without changing the live panel."""
 
@@ -6217,12 +6188,14 @@ class StaticDownloadDialog:
         self.controls: list[Any] = []
         self.shading_by_renderer = {"png": "mild", "three": "mild"}
         self.last_renderer = "three"
-        self.crystal = self.renderer = self.shading = self.occupancy = self.crystal_filename = None
+        self.crystal = self.renderer = self.shading = self.crystal_background = self.crystal_filename = None
         self.tiles: dict[str, Any] = {}
         self.images: dict[str, Any] = {}
         self.errors: dict[str, Any] = {}
         name = f"combo C{controller.state.combo_id}" if self.combo else f"panel {controller.state.panel_id}"
-        base = f"combo_C{controller.state.combo_id}" if self.combo else f"panel_{controller.state.panel_id}"
+        base = f"combo_C{controller.state.combo_id}" if self.combo else shortened_export_stem(sanitize_export_filename_stem(controller.state.crystal_name))
+        backgrounds = (getattr(controller.simulator, "global_display_settings", PanelDisplaySettings())
+                       if self.combo else controller.state.display_settings).backgrounds
         self.dialog = ui.dialog()
         with self.dialog, ui.card().classes("download-card static-download-card"):
             with ui.row().classes("items-center justify-between full-width"):
@@ -6240,11 +6213,13 @@ class StaticDownloadDialog:
                     self.renderer = self.control(ui.select({"png": "Current PNG exporter", "three": "Three.js"},
                         value="three", label="Crystal renderer").props("outlined dense"))
                     self.renderer.tooltip("Both renderers save PNG files. Three.js uses a lit 3D scene.")
+                    self.crystal_background = self.control(ui.color_input("Crystal background", value=backgrounds.crystal,
+                        preview=True).props("outlined dense"))
+                self.diffraction_background = self.control(ui.color_input("Diffraction background", value=backgrounds.diffraction,
+                    preview=True).props("outlined dense"))
+                if not self.combo:
                     self.shading = self.control(ui.select(ATOM_SHADING_OPTIONS, value="mild", label="Shading").props("outlined dense"))
-                    self.occupancy = self.control(ui.select(EXPORT_OCCUPANCY_COLOR_OPTIONS, value="panel",
-                        label="Site occupancy colors").props("outlined dense"))
-                    self.occupancy.tooltip("Viewer-facing sectors represent site occupancy; gray is unoccupied.")
-                    self.crystal_filename = self.control(ui.input("Crystal file name base", value=base + "_crystal").props("outlined dense"))
+                    self.crystal_filename = self.control(ui.input("Crystal file name base", value=base + "_structure").props("outlined dense"))
                 self.diffraction_filename = self.control(ui.input("Diffraction file name base", value=base + "_diffraction").props("outlined dense"))
                 self.dpi = self.control(ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense"))
             self.suffix = self.control(ui.checkbox("Add transparency and DPI suffixes", value=True).props("dense"))
@@ -6274,7 +6249,8 @@ class StaticDownloadDialog:
                 with ui.row().classes("items-center gap-2"):
                     self.control(ui.button("Cancel", on_click=self.dialog.close).props("flat dense"))
                     self.download_button = self.control(ui.button("Download", icon="download", on_click=self.download).props("unelevated dense"))
-        for control in (self.crystal, self.diffraction, self.transparent, self.renderer, self.shading, self.occupancy, self.dpi):
+        for control in (self.crystal, self.diffraction, self.transparent, self.renderer, self.shading,
+                        self.crystal_background, self.diffraction_background, self.dpi):
             if control is not None:
                 control.on_value_change(self.schedule_preview)
         self.dialog.on("show", self.schedule_preview)
@@ -6295,9 +6271,11 @@ class StaticDownloadDialog:
                 self.shading_by_renderer[self.last_renderer] = self.shading.value
                 self.last_renderer = self.renderer.value
                 self.shading.set_value(self.shading_by_renderer[self.last_renderer])
-            for control in (self.renderer, self.shading, self.occupancy, self.crystal_filename):
+            for control in (self.renderer, self.shading, self.crystal_filename):
                 control.set_enabled(not self.busy and bool(self.crystal.value))
+            self.crystal_background.set_enabled(not self.busy and bool(self.crystal.value) and not self.transparent.value)
         self.diffraction_filename.set_enabled(not self.busy and bool(self.diffraction.value))
+        self.diffraction_background.set_enabled(not self.busy and bool(self.diffraction.value) and not self.transparent.value)
         selected = self.selected()
         self.download_button.set_enabled(not self.busy and bool(selected))
         for kind, tile in self.tiles.items():
@@ -6340,27 +6318,8 @@ class StaticDownloadDialog:
             with self.dialog:
                 self.timer = ui.timer(0.25, self.update_preview, once=True, immediate=False)
 
-    async def diffraction_preview(self, dpi: float, transparent: bool) -> bytes:
-        state = self.controller.state
-        selector = f".combo-panel-{state.combo_id}" if self.combo else f".comparison-panel-{state.panel_id}"
-        # Plotly.toImage accepts a figure copy, so transparency never relayouts the live plot.
-        data_url = await ui.run_javascript(f"""
-            const root = document.querySelector({json.dumps(selector)});
-            const plot = root?.querySelector('.diffraction-plot.js-plotly-plot') || root?.querySelector('.diffraction-plot .js-plotly-plot');
-            if (!plot || !window.Plotly) throw new Error('Diffraction view is not ready');
-            const rect = plot.getBoundingClientRect();
-            const width = Math.round(rect.width > 1 ? rect.width : (plot._fullLayout?.width || 440));
-            const height = Math.round(rect.height > 1 ? rect.height : (plot._fullLayout?.height || 280));
-            const figure = JSON.parse(JSON.stringify({{data: plot.data, layout: plot.layout}}));
-            if ({json.dumps(transparent)}) {{
-                figure.layout.paper_bgcolor = 'rgba(0,0,0,0)';
-                figure.layout.plot_bgcolor = 'rgba(0,0,0,0)';
-            }}
-            return await window.Plotly.toImage(figure, {{format: 'png',
-                width, height,
-                scale: Math.min(1, 690 / Math.max(width, height)) * Math.min(1, {dpi} / 150)}});
-        """, timeout=30)
-        return decode_png_data_url(data_url)
+    async def diffraction_preview(self, dpi: float, transparent: bool, background: str | None = None) -> bytes:
+        return await render_diffraction_image(self.controller, dpi, transparent, background, preview=True)
 
     async def update_preview(self) -> None:
         revision = self.revision
@@ -6374,13 +6333,18 @@ class StaticDownloadDialog:
             for kind in selected:
                 key = (dpi, transparent)
                 if kind == "crystal":
-                    key += (self.renderer.value, self.shading.value, self.occupancy.value)
+                    background = None if transparent else self.crystal_background.value
+                    key += (self.renderer.value, self.shading.value, background)
+                else:
+                    background = None if transparent else self.diffraction_background.value
+                    key += (background,)
                 try:
                     cached = self.cache.get(kind)
                     if cached is not None and cached[0] == key:
                         png = cached[1]
                     elif kind == "crystal":
-                        png = await self.controller.render_crystal_image(*key)
+                        png = await self.controller.render_crystal_image(dpi, transparent, self.renderer.value,
+                            self.shading.value, background=background)
                     else:
                         png = await self.diffraction_preview(*key)
                     if self.closed or self.busy or revision != self.revision:
@@ -6422,13 +6386,15 @@ class StaticDownloadDialog:
                 options = dict(dpi=float(self.dpi.value or 300), transparent_background=bool(self.transparent.value),
                                include_suffixes=bool(self.suffix.value))
                 if self.combo:
-                    await self.controller.download_diffraction_image(filename_base=self.diffraction_filename.value, **options)
+                    await self.controller.download_diffraction_image(filename_base=self.diffraction_filename.value,
+                        background=self.diffraction_background.value, **options)
                 else:
                     await self.controller.download_images(
                         bool(self.crystal.value), bool(self.diffraction.value),
                         crystal_filename_base=self.crystal_filename.value, diffraction_filename_base=self.diffraction_filename.value,
                         crystal_renderer=self.renderer.value, atom_shading=self.shading.value,
-                        occupancy_colors=self.occupancy.value, **options)
+                        crystal_background=self.crystal_background.value,
+                        diffraction_background=self.diffraction_background.value, **options)
         finally:
             self.busy = False
             self.dialog.props(remove="persistent")
@@ -6437,6 +6403,180 @@ class StaticDownloadDialog:
             self.update_controls()
             if self.dialog.value:
                 self.schedule_preview()
+
+
+class BatchDownloadDialog:
+    def __init__(self, simulator: "SimulatorApp") -> None:
+        self.simulator = simulator
+        self.busy = self.cancelled = False
+        self.rows: list[dict[str, Any]] = []
+        self.controls: list[Any] = []
+        self.dialog = ui.dialog()
+        with self.dialog, ui.card().classes("download-card batch-download-card"):
+            with ui.row().classes("full-width items-center justify-between"):
+                ui.label("Batch download").classes("text-h6")
+                self.control(ui.button(icon="close", on_click=self.dialog.close).props("flat round dense").tooltip("Close"))
+            with ui.element("div").classes("static-download-options"):
+                self.filename = self.control(ui.input("ZIP file name", value="CrysDiS_images").props("outlined dense"))
+                self.dpi = self.control(ui.number("Quality", value=300, min=72, max=1200, step=50, suffix="dpi").props("outlined dense"))
+                self.content = self.control(ui.select({"both": "Structure and diffraction", "structure": "Structure only",
+                    "diffraction": "Diffraction only"}, value="both", label="Images", on_change=self.set_content).props("outlined dense"))
+                self.renderer = self.control(ui.select({"three": "Three.js", "png": "Current PNG exporter"},
+                    value="three", label="Crystal renderer").props("outlined dense"))
+                self.shading = self.control(ui.select(ATOM_SHADING_OPTIONS, value="mild", label="Shading").props("outlined dense"))
+                self.prefix = self.control(ui.input("File name prefix", value="").props("outlined dense"))
+            with ui.row().classes("full-width items-center gap-3"):
+                self.transparent = self.control(ui.checkbox("Transparent background", value=False, on_change=self.update_controls))
+                self.suffix = self.control(ui.checkbox("Add transparency and DPI suffixes", value=True))
+                self.panel_backgrounds = self.control(ui.checkbox("Use each panel's backgrounds", value=True, on_change=self.update_controls))
+            with ui.row().classes("full-width gap-3"):
+                self.crystal_background = self.control(ui.color_input("Crystal background", preview=True,
+                    value=simulator.global_display_settings.backgrounds.crystal).props("outlined dense"))
+                self.diffraction_background = self.control(ui.color_input("Diffraction background", preview=True,
+                    value=simulator.global_display_settings.backgrounds.diffraction).props("outlined dense"))
+            with ui.row().classes("full-width items-center gap-2"):
+                self.control(ui.button("Select all", icon="select_all", on_click=lambda: self.select_all(True)).props("flat dense"))
+                self.control(ui.button("Clear", icon="deselect", on_click=lambda: self.select_all(False)).props("flat dense"))
+            with ui.column().classes("batch-download-panels full-width gap-2"):
+                controllers = list(simulator.controllers) + list(simulator.combo_controllers)
+                for controller in controllers:
+                    combo = isinstance(controller, ComboPanelController)
+                    state = controller.state
+                    label = f"Combo C{state.combo_id}" if combo else f"{state.panel_id}. {state.crystal_name}"
+                    stem = f"combo_C{state.combo_id}" if combo else shortened_export_stem(sanitize_export_filename_stem(state.crystal_name))
+                    with ui.row().classes("batch-download-row full-width items-center gap-2"):
+                        selected = self.control(ui.checkbox(label, value=True, on_change=self.update_controls).classes("batch-panel-select"))
+                        name = self.control(ui.input("File name base", value=stem).props("outlined dense").classes("batch-panel-name"))
+                        options = {"diffraction": "Diffraction only"} if combo else {"both": "Structure and diffraction",
+                            "structure": "Structure only", "diffraction": "Diffraction only"}
+                        content = self.control(ui.select(options, value="diffraction" if combo else "both",
+                            label="Images").props("outlined dense").classes("batch-panel-content"))
+                        self.rows.append(dict(controller=controller, combo=combo, selected=selected, name=name, content=content))
+            self.progress = ui.linear_progress(value=0, show_value=False).classes("full-width")
+            self.status = ui.label().classes("text-caption")
+            with ui.row().classes("full-width justify-end gap-2"):
+                self.cancel_button = ui.button("Cancel", on_click=self.cancel).props("flat dense")
+                self.download_button = self.control(ui.button("Download ZIP", icon="folder_zip", on_click=self.download).props("unelevated dense"))
+        self.dialog.client.on_disconnect(self.cancel)
+        self.update_controls()
+
+    def control(self, element: Any) -> Any:
+        self.controls.append(element)
+        return element
+
+    def open(self) -> None:
+        self.dialog.open()
+
+    def select_all(self, selected: bool) -> None:
+        for row in self.rows:
+            row['selected'].set_value(selected)
+        self.update_controls()
+
+    def set_content(self) -> None:
+        for row in self.rows:
+            if not row['combo']:
+                row['content'].set_value(self.content.value)
+
+    def update_controls(self) -> None:
+        if not hasattr(self, "download_button"):
+            return
+        self.download_button.set_enabled(not self.busy and any(row['selected'].value for row in self.rows))
+        for control in (self.crystal_background, self.diffraction_background):
+            control.set_enabled(not self.busy and not self.transparent.value and not self.panel_backgrounds.value)
+        self.panel_backgrounds.set_enabled(not self.busy and not self.transparent.value)
+        for row in self.rows:
+            row['name'].set_enabled(not self.busy and row['selected'].value)
+            row['content'].set_enabled(not self.busy and row['selected'].value and not row['combo'])
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        if self.busy:
+            self.status.set_text("Cancelling after the current image...")
+        else:
+            self.dialog.close()
+
+    async def download(self) -> None:
+        if self.busy:
+            return
+        rows = [row for row in self.rows if row['selected'].value]
+        if not rows:
+            return
+        self.busy, self.cancelled = True, False
+        for control in self.controls:
+            control.disable()
+        self.dialog.props("persistent")
+        try:
+            dpi = min(max(float(self.dpi.value or 300), 72), 1200)
+            transparent = bool(self.transparent.value)
+            backgrounds = (None, None)
+            if not transparent and not self.panel_backgrounds.value:
+                backgrounds = (normalized_hex_color(self.crystal_background.value), normalized_hex_color(self.diffraction_background.value))
+                if None in backgrounds:
+                    raise ValueError("Choose valid background colors.")
+            archive_name = sanitize_export_filename(self.filename.value, "CrysDiS_images", ".zip")
+            destination = None
+            if self.simulator.direct_file_exports_enabled():
+                destination = await self.simulator.choose_save_file(archive_name, ".zip")
+                if destination is None:
+                    self.status.set_text("Export cancelled")
+                    return
+            jobs = []
+            used: set[str] = set()
+            prefix = sanitize_export_filename_stem(self.prefix.value) + "_" if str(self.prefix.value or "").strip() else ""
+            for row in rows:
+                kinds = ("structure", "diffraction") if row['content'].value == "both" else (row['content'].value,)
+                for kind in kinds:
+                    base = structure_export_base(prefix + str(row['name'].value or "crystal"), kind)
+                    filename = unique_archive_filename(export_image_filename(base, base, dpi, transparent, bool(self.suffix.value)), used)
+                    jobs.append((row['controller'], kind, filename))
+            errors, completed = [], 0
+            self.progress.set_value(0)
+            with tempfile.SpooledTemporaryFile(max_size=32 * 1024 * 1024) as output:
+                with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_STORED) as archive:
+                    for index, (controller, kind, filename) in enumerate(jobs):
+                        if self.cancelled:
+                            self.status.set_text("Export cancelled; no archive saved")
+                            return
+                        self.status.set_text(f"{index + 1}/{len(jobs)}: {filename}")
+                        await asyncio.sleep(0)
+                        try:
+                            if kind == "structure":
+                                png = await controller.render_crystal_image(dpi, transparent, self.renderer.value,
+                                    self.shading.value, background=backgrounds[0])
+                            else:
+                                png = await render_diffraction_image(controller, dpi, transparent, backgrounds[1])
+                            archive.writestr(filename, png)
+                            completed += 1
+                        except Exception as exc:
+                            errors.append(f"{filename}: {exc}")
+                        self.progress.set_value((index + 1) / len(jobs))
+                    if errors:
+                        archive.writestr("export_errors.txt", "\n".join(errors))
+                if self.cancelled:
+                    self.status.set_text("Export cancelled; no archive saved")
+                    return
+                if not completed:
+                    raise ValueError("No images could be exported. " + "; ".join(errors))
+                output.seek(0)
+                if destination is not None:
+                    with destination.open("wb") as handle:
+                        shutil.copyfileobj(output, handle)
+                    self.simulator.announce_saved_exports([destination])
+                else:
+                    ui.download(output.read(), archive_name, media_type="application/zip")
+            message = f"Exported {completed} image(s)" + (f"; {len(errors)} failed (see export_errors.txt)" if errors else "")
+            self.status.set_text(message)
+            self.simulator.set_status(message)
+            ui.notify(message, type="warning" if errors else "positive")
+        except Exception as exc:
+            self.status.set_text(f"Export failed: {exc}")
+            ui.notify(f"Batch export failed: {exc}", type="negative")
+        finally:
+            self.busy = False
+            self.dialog.props(remove="persistent")
+            for control in self.controls:
+                control.enable()
+            self.update_controls()
 
 
 class ThemeDialog:
@@ -6481,7 +6621,7 @@ class ThemeDialog:
                     self.diffraction_background = ui.color_input("Diffraction background", preview=True,
                         on_change=self.customize_theme).props("outlined dense")
                 self.background_auto_text = ui.checkbox("Automatic text contrast", on_change=self.customize_theme)
-                self.background_auto_text.tooltip("Use black or white annotations against each panel background. Panel-specific background overrides are kept.")
+                self.background_auto_text.tooltip("Adjust vector/plane label brightness while keeping their colors. Other annotations and marker labels use black or white. Panel-specific background overrides are kept.")
                 with ui.row().classes("items-center gap-2"):
                     ui.button("White background", icon="light_mode", on_click=lambda:
                               self.set_backgrounds(PanelBackgrounds("#FFFFFF", "#FFFFFF", True))).props("outline dense")
@@ -6706,9 +6846,10 @@ class DisplaySettingsDialog:
     def __init__(self, simulator: SimulatorApp, panel_id: int | None) -> None:
         self.simulator, self.panel_id = simulator, panel_id
         self.draft = simulator.display_settings_draft(panel_id)
-        if panel_id is not None:
-            # Start with local edits; opening the dialog does not change live inheritance.
-            self.draft.inherited.clear()
+        state = simulator.panel_state_by_id(panel_id) if panel_id is not None else None
+        if state is not None and not state.display_inheritance_configured:
+            # Keep theme backgrounds linked initially; preserve local/saved-view overrides.
+            self.draft.inherited.intersection_update({"backgrounds"})
         self.loading = True
         self.busy = False
         self.preview: PanelController | None = None
@@ -6738,7 +6879,6 @@ class DisplaySettingsDialog:
         self.grid_spacing = self.grid_volume = self.grid_extent = self.grid_notice = None
         self.grid_bounds = []
         self.scale_visibility_inputs: dict[str, Any] = {}
-        state = simulator.panel_state_by_id(panel_id) if panel_id is not None else None
         self.dialog = ui.dialog()
         with self.dialog, ui.card().classes("palette-card" + (" panel-settings-card" if state else "")):
             with ui.row().classes("items-center justify-between full-width"):
@@ -6860,17 +7000,30 @@ class DisplaySettingsDialog:
             self.extend = ui.checkbox("Extend planes and vectors")
             self.extend.tooltip("Clip planes and extend vectors to the displayed block. Otherwise annotations stay inside the original cell.")
             self.section_controls["cells"] = [*self.cells, self.extend]
-        with ui.expansion("Vector/Plane colors", icon="palette").classes("full-width"):
-            self.inheritance_control("colors", "Use global colors")
+        with ui.expansion("Diffraction patterns", icon="scatter_plot").classes("full-width"):
+            self.inheritance_control("diffraction", "Use global diffraction settings")
+            self.diffraction_max_global = None
+            if state is not None:
+                self.diffraction_max_global = ui.checkbox("Use global maximum hkl", on_change=lambda _: self.refresh_enabled())
+                self.section_controls["diffraction"].append(self.diffraction_max_global)
+            with ui.grid(columns=2).classes("full-width gap-3"):
+                self.diffraction_max_hkl = ui.number("Maximum hkl", min=1, max=30, step=1).props("outlined dense")
+                self.diffraction_max_hkl.tooltip("Maximum reflection order; the global value is shared with Advanced settings.")
+                self.diffraction_spot_scale = ui.number("Spot size", value=100, min=10, max=300, step=10, suffix="%").props("outlined dense")
+                self.diffraction_spot_opacity = self.opacity_control("Spot opacity", 1.0)
+            self.section_controls["diffraction"].extend([self.diffraction_max_hkl, self.diffraction_spot_scale,
+                                                        self.diffraction_spot_opacity])
             if state is None:
                 self.crystal_default = ui.checkbox("Crystal default diffraction color", on_change=lambda _: self.refresh_enabled())
-                self.section_controls["colors"].append(self.crystal_default)
+                self.section_controls["diffraction"].append(self.crystal_default)
             with ui.row().classes("items-center full-width gap-2"):
                 self.diffraction_color = ui.color_input("Diffraction pattern", preview=True).props("outlined dense").classes("panel-diffraction-color")
-                self.section_controls["colors"].append(self.diffraction_color)
+                self.section_controls["diffraction"].append(self.diffraction_color)
                 if state is not None:
                     reset_color = ui.button(icon="restart_alt", on_click=self.reset_diffraction_color).props("flat round dense").classes("panel-diffraction-reset").tooltip("Reset diffraction color")
-                    self.section_controls["colors"].append(reset_color)
+                    self.section_controls["diffraction"].append(reset_color)
+        with ui.expansion("Vector/Plane colors", icon="palette").classes("full-width"):
+            self.inheritance_control("colors", "Use global colors")
             with ui.row().classes("palette-columns"):
                 self.annotation_inputs = {}
                 for kind, label in (("vector", "Vectors"), ("plane", "Planes")):
@@ -6904,7 +7057,7 @@ class DisplaySettingsDialog:
                 self.crystal_background = ui.color_input("Crystal background", preview=True).props("outlined dense")
                 self.diffraction_background = ui.color_input("Diffraction background", preview=True).props("outlined dense")
             self.background_auto_text = ui.checkbox("Automatic text contrast")
-            self.background_auto_text.tooltip("Use black or white annotations against each panel background. Uncheck to restore your annotation colors.")
+            self.background_auto_text.tooltip("Adjust vector/plane label brightness while keeping their colors. Other annotations and marker labels use black or white. Uncheck to restore your original colors.")
             with ui.row().classes("items-center gap-2"):
                 white = ui.button("White background", icon="light_mode", on_click=self.white_background).props("outline dense")
                 black = ui.button("Black background", icon="dark_mode", on_click=self.black_background).props("outline dense")
@@ -7275,6 +7428,7 @@ class DisplaySettingsDialog:
         annotations_changed = (draft.display.annotations != preview.state.display_settings.annotations or
                                draft.display.backgrounds != preview.state.display_settings.backgrounds or
                                draft.annotation_visibility != preview.state.annotation_visibility)
+        diffraction_changed = draft.display.diffraction != preview.state.display_settings.diffraction
         preview.state.display_settings = draft.display
         preview.state.element_colors = colors.copy()
         preview.state.annotation_visibility = draft.annotation_visibility.copy()
@@ -7302,7 +7456,7 @@ class DisplaySettingsDialog:
         if self.marker_editor is not None:
             self.marker_editor.update_model(model)
         preview.apply_scale_bar_visibility()
-        if self.preview_color != preview.state.diffraction_color or annotations_changed:
+        if self.preview_color != preview.state.diffraction_color or annotations_changed or diffraction_changed:
             preview.redraw_diffraction()
             self.preview_color = preview.state.diffraction_color
         if initial_view or not math.isclose(previous_limit, self.preview_view_limit):
@@ -7388,6 +7542,7 @@ class DisplaySettingsDialog:
             self.draft.display = inherited_display_settings(self.draft.display, defaults.display, {section})
             if section == "colors":
                 self.draft.vector_colors, self.draft.plane_colors = defaults.vector_colors, defaults.plane_colors
+            if section == "diffraction":
                 self.draft.diffraction_color = defaults.diffraction_color
             self.load_section(section)
         else:
@@ -7432,14 +7587,21 @@ class DisplaySettingsDialog:
             self.crystal_background.value = settings.backgrounds.crystal
             self.diffraction_background.value = settings.backgrounds.diffraction
             self.background_auto_text.value = settings.backgrounds.automatic_text
-        else:
-            for attribute, control in self.annotation_inputs.items():
-                control.value = 100 * getattr(settings, attribute)
+        elif section == "diffraction":
+            diffraction = settings.diffraction
+            self.diffraction_max_hkl.value = (self.simulator.current_max_hkl() if diffraction.max_hkl is None else diffraction.max_hkl)
+            if self.diffraction_max_global is not None:
+                self.diffraction_max_global.value = diffraction.max_hkl is None
+            self.diffraction_spot_scale.value = 100 * diffraction.spot_scale
+            self.diffraction_spot_opacity.value = 100 * diffraction.spot_opacity
             if self.crystal_default is not None:
                 self.crystal_default.value = self.draft.diffraction_color is None
             state = self.simulator.panel_state_by_id(self.panel_id) if self.panel_id is not None else None
             fallback = self.simulator.default_diffraction_color_for_crystal(state.crystal_name if state else "FCC")
             self.diffraction_color.value = self.draft.diffraction_color or fallback
+        elif section == "colors":
+            for attribute, control in self.annotation_inputs.items():
+                control.value = 100 * getattr(settings, attribute)
             self.refresh_palette("vector")
             self.refresh_palette("plane")
 
@@ -7451,14 +7613,16 @@ class DisplaySettingsDialog:
                 control.set_enabled(section not in self.draft.inherited)
         self.frame_mode.set_enabled("frame" not in self.draft.inherited and self.frame_visible.value)
         use_default = self.crystal_default is not None and self.crystal_default.value
-        self.diffraction_color.set_enabled("colors" not in self.draft.inherited and not use_default)
+        self.diffraction_color.set_enabled("diffraction" not in self.draft.inherited and not use_default)
+        self.diffraction_max_hkl.set_enabled("diffraction" not in self.draft.inherited and not (
+            self.diffraction_max_global is not None and self.diffraction_max_global.value))
         for widgets in self.palette_widgets.values():
             for widget, allowed in widgets:
                 widget.set_enabled(allowed and "colors" not in self.draft.inherited)
 
     def reset_diffraction_color(self) -> None:
         state = self.simulator.panel_state_by_id(self.panel_id)
-        if state is None or "colors" in self.draft.inherited:
+        if state is None or "diffraction" in self.draft.inherited:
             return
         self.draft.diffraction_color = None
         self.diffraction_color.value = self.simulator.default_diffraction_color_for_crystal(state.crystal_name)
@@ -7541,14 +7705,22 @@ class DisplaySettingsDialog:
         if "colors" not in draft.inherited:
             for attribute, control in self.annotation_inputs.items():
                 setattr(settings, attribute, float(control.value) / 100)
+            for kind, controls in self.palette_inputs.items():
+                setattr(draft, f"{kind}_colors", [str(control.value) for control in controls])
+        if "diffraction" not in draft.inherited:
+            follow_max = self.diffraction_max_global is not None and self.diffraction_max_global.value
+            if not follow_max and self.diffraction_max_hkl.value is None:
+                raise ValueError("Maximum hkl must be a whole number between 1 and 30.")
+            settings.diffraction = PanelDiffractionSettings(
+                max_hkl=None if follow_max else self.diffraction_max_hkl.value,
+                spot_opacity=float(self.diffraction_spot_opacity.value) / 100,
+                spot_scale=float(self.diffraction_spot_scale.value) / 100)
             use_default = self.crystal_default is not None and self.crystal_default.value
             if self.crystal_default is None and self.draft.diffraction_color is None:
                 state = self.simulator.panel_state_by_id(self.panel_id)
                 fallback = self.simulator.default_diffraction_color_for_crystal(state.crystal_name)
                 use_default = str(self.diffraction_color.value).upper() == fallback.upper()
             draft.diffraction_color = None if use_default else str(self.diffraction_color.value)
-            for kind, controls in self.palette_inputs.items():
-                setattr(draft, f"{kind}_colors", [str(control.value) for control in controls])
         return draft
 
     def request_action(self, action: str) -> None:
@@ -7713,6 +7885,7 @@ class SimulatorApp:
             ).classes("top-checkbox")
             ui.button("Advanced", icon="tune", on_click=lambda: self.advanced_dialog.open()).props("flat dense")
             ui.button("Crystal list", icon="format_list_bulleted", on_click=self.open_crystal_list).props("flat dense")
+            ui.button("Batch", icon="folder_zip", on_click=self.open_batch_download).props("flat dense").tooltip("Batch download")
             ui.button("Load CIF", icon="upload_file", on_click=lambda: self.cif_dialog.open()).props("flat dense")
             ui.button(
                 "New crystal",
@@ -7720,7 +7893,7 @@ class SimulatorApp:
                 on_click=lambda: self.builder.open(mode="new"),
             ).props("flat dense")
             self.add_combo_button = ui.button(
-                "Add combo panel",
+                "Combo panel",
                 icon="join_inner",
                 on_click=self.add_combo_panel,
             ).props("flat dense")
@@ -7817,13 +7990,14 @@ Both builder Save buttons and **Export as CIF** check the sum of occupancies at 
 - Diffraction hover labels show relative intensities below `0.01` in scientific notation, such as `1e-5` or `1.235e-5`. Larger values retain four decimal places; exact zero is shown as `0`. This formatting does not change the calculated intensity.
 
 ### Combo panels
-Use `Add combo panel` to overlay diffraction patterns from multiple ordinary panels. This is useful for multiphase comparisons.
+Use `Combo panel` to overlay diffraction patterns from multiple ordinary panels. This is useful for multiphase comparisons.
 Enable `Bind crystal motion` inside a combo panel after manually setting an orientation relationship; later Apply, Sync, or auto-sync motion from any listed panel is applied as the same view-frame motion to the other listed panels.
 
 ### Display controls
 - `Scale bar` toggles scale bars in both crystal and diffraction panels.
 - `Crystal annotations` toggles vector and plane labels in the 3D crystal view.
-- `Panel colors` sets the panel's diffraction color and vector/plane palettes. `Palette for vectors/planes` in Advanced sets global defaults; local palettes can return to these with `Use global default`.
+- Open the panel's gear icon for display settings. `Diffraction patterns` controls maximum hkl, spot size, opacity, and diffraction color; `Vector/Plane colors` controls vector and plane palettes and styling.
+- `Global display settings` in Advanced sets section defaults. Panel sections can opt into these with their `Use global` checkboxes. `Use global maximum hkl` keeps following Advanced's `Max hkl`, even when other panel settings are local; uncheck it for a panel-specific limit.
                 """
             ).classes("intro-text")
 
@@ -7865,11 +8039,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                     ).props("outlined dense")
                     self.max_hkl_input = ui.number(
                         "Max hkl",
-                        value=DEFAULT_MAX_HKL,
+                        value=self.current_max_hkl(),
                         min=1,
                         max=30,
                         step=1,
-                        on_change=lambda _: self.refresh_diffractions(clear_cache=True),
+                        on_change=lambda _: None if getattr(self, "_applying_display_settings", False) else self.refresh_diffractions(clear_cache=True),
                     ).props("outlined dense")
                     self.spot_threshold_input = ui.input(
                         "Spot intensity threshold",
@@ -7995,7 +8169,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         color = self.diffraction_color_for_state(state)
         if not state.diffraction_color_custom and color == self.default_diffraction_color_for_crystal(state.crystal_name):
             color = None
-        if "colors" in state.global_display_sections:
+        if "diffraction" in state.global_display_sections:
             color = self.global_diffraction_color
         return DisplaySettingsDraft(copy.deepcopy(state.display_settings), state.global_display_sections.copy(),
                                     self.vector_palette(panel_id).copy(), self.plane_palette(panel_id).copy(), color,
@@ -8016,6 +8190,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             draft.display = inherited_display_settings(draft.display, self.global_display_settings, draft.inherited)
             if "colors" in draft.inherited:
                 draft.vector_colors, draft.plane_colors = self.vector_colors.copy(), self.plane_colors.copy()
+            if "diffraction" in draft.inherited:
                 draft.diffraction_color = self.global_diffraction_color
         draft.display.frame_color = color(draft.display.frame_color)
         draft.display.backgrounds.crystal = color(draft.display.backgrounds.crystal)
@@ -8024,6 +8199,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             style = getattr(draft.display.annotations, name)
             style.color = color(style.color)
         validate_display_settings(draft.display)
+        if draft.display.diffraction.max_hkl is not None:
+            draft.display.diffraction.max_hkl = int(draft.display.diffraction.max_hkl)
         draft.display.cells = tuple(int(n) for n in draft.display.cells)
         for kind in ("vector", "plane"):
             values = getattr(draft, f"{kind}_colors")
@@ -8050,6 +8227,12 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self._applying_display_settings = True
         try:
             draft = self.validated_display_settings_draft(panel_id, draft)
+            max_hkl = self.current_max_hkl()
+            if panel_id is None and theme is None:
+                max_hkl = draft.display.diffraction.max_hkl or max_hkl
+                # Advanced owns the global limit; inherited panels retain the live sentinel.
+                draft.display.diffraction.max_hkl = None
+            max_hkl_changed = max_hkl != self.current_max_hkl()
             next_theme = (validate_theme(replace(theme or self.theme, backgrounds=copy.deepcopy(draft.display.backgrounds)))
                           if panel_id is None else self.theme)
             global_display = draft.display if panel_id is None else self.global_display_settings
@@ -8082,10 +8265,12 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 diffraction_custom = state.diffraction_color_custom
                 if "colors" in inherited and theme is None:
                     vectors = planes = None
+                elif panel_id is not None:
+                    vectors, planes = draft.vector_colors.copy(), draft.plane_colors.copy()
+                if "diffraction" in inherited and theme is None:
                     diffraction = global_diffraction or self.default_diffraction_color_for_crystal(state.crystal_name)
                     diffraction_custom = False
                 elif panel_id is not None:
-                    vectors, planes = draft.vector_colors.copy(), draft.plane_colors.copy()
                     diffraction = draft.diffraction_color or self.default_diffraction_color_for_crystal(state.crystal_name)
                     diffraction_custom = draft.diffraction_color is not None
                 geometry_changed = crystal_display_settings(settings) != crystal_display_settings(state.display_settings)
@@ -8094,7 +8279,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 annotations_changed = settings.annotations != state.display_settings.annotations or backgrounds_changed or visibility_changed
                 palette_changed = (self.vector_palette(state.panel_id) != (vectors or global_vectors) or
                                    self.plane_palette(state.panel_id) != (planes or global_planes))
-                diffraction_changed = self.diffraction_color_for_state(state) != diffraction
+                diffraction_changed = (self.diffraction_color_for_state(state) != diffraction or
+                                       settings.diffraction != state.display_settings.diffraction or
+                                       max_hkl_changed and settings.diffraction.max_hkl is None)
                 controller = self.controller_by_panel_id(state.panel_id)
                 element_colors_changed = panel_colors != state.element_colors or (panel_colors is None and bool(changed_elements) and any(
                     site.element.strip().capitalize() in changed_elements
@@ -8139,6 +8326,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 self.global_display_settings = copy.deepcopy(draft.display)
                 self.vector_colors, self.plane_colors = draft.vector_colors.copy(), draft.plane_colors.copy()
                 self.global_diffraction_color = draft.diffraction_color
+                self._max_hkl = max_hkl
+                if self.max_hkl_input is not None:
+                    self.max_hkl_input.value = max_hkl
                 self.scale_bars_enabled = scale_bars_enabled
                 if self.show_scale_bar_input is not None:
                     # Commit all panel state below before refreshing the master switch's followers.
@@ -8151,6 +8341,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             for change in changes:
                 state, controller = change["state"], change["controller"]
                 state.display_settings, state.global_display_sections = change["settings"], change["inherited"]
+                if panel_id is not None:
+                    state.display_inheritance_configured = True
                 state.element_colors, state.annotation_visibility = change["panel_colors"], change["visibility"]
                 state.vector_colors = copy.deepcopy(change["vectors"])
                 state.plane_colors = copy.deepcopy(change["planes"])
@@ -8226,7 +8418,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def diffraction_color_for_state(self, state: PanelState) -> str:
         fallback = self.default_diffraction_color_for_crystal(state.crystal_name)
         global_color = getattr(self, "global_diffraction_color", None)
-        value = global_color if "colors" in state.global_display_sections and global_color is not None else state.diffraction_color
+        value = global_color if "diffraction" in state.global_display_sections and global_color is not None else state.diffraction_color
         color = self.normalize_palette_color(value, fallback)
         state.diffraction_color = color
         return color
@@ -8234,7 +8426,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
     def display_diffraction_color(self, state: PanelState, background: str | None = None) -> str:
         color = self.diffraction_color_for_state(state)
         custom = state.diffraction_color_custom or (
-            "colors" in state.global_display_sections and getattr(self, "global_diffraction_color", None) is not None)
+            "diffraction" in state.global_display_sections and getattr(self, "global_diffraction_color", None) is not None)
         if not custom and color == DEFAULT_DIFFRACTION_COLORS.get(state.crystal_name):
             return self.default_diffraction_color_for_crystal(state.crystal_name,
                 background=background if background is not None else state.display_settings.backgrounds.diffraction)
@@ -8253,7 +8445,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             state.initial_camera = None
         old_default = self.default_diffraction_color_for_crystal(state.crystal_name)
         current_color = self.normalize_palette_color(state.diffraction_color, old_default)
-        if "colors" in state.global_display_sections:
+        if "diffraction" in state.global_display_sections:
             state.diffraction_color = self.global_diffraction_color or self.default_diffraction_color_for_crystal(selected_name)
             state.diffraction_color_custom = False
         elif not state.diffraction_color_custom and (force_default_color or selected_name != state.crystal_name):
@@ -8267,7 +8459,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if state is None:
             return
         color = self.normalize_palette_color(value, self.diffraction_color_for_state(state))
-        state.global_display_sections.discard("colors")
+        state.global_display_sections.discard("diffraction")
         state.diffraction_color_custom = True
         if color == state.diffraction_color:
             return
@@ -8279,7 +8471,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         state = self.panel_state_by_id(panel_id)
         if state is None:
             return
-        state.global_display_sections.discard("colors")
+        state.global_display_sections.discard("diffraction")
         state.diffraction_color = self.default_diffraction_color_for_crystal(state.crystal_name)
         state.diffraction_color_custom = False
         self.redraw_panel_diffractions({panel_id})
@@ -8526,6 +8718,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 ui.label("Crystal list").classes("text-h6")
                 ui.button(icon="close", on_click=self.crystal_list_dialog.close).props("flat round dense").tooltip("Close")
             self.crystal_list_container = ui.column().classes("crystal-list")
+
+    def open_batch_download(self) -> None:
+        self.batch_download_editor = BatchDownloadDialog(self)
+        self.batch_download_editor.open()
 
     def open_crystal_list(self) -> None:
         self.refresh_crystal_list()
@@ -9375,6 +9571,11 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 width: 100%;
             }
             .static-download-options .q-field { min-width: 0; }
+            .batch-download-card { width: 1050px; max-width: 96vw; max-height: 94vh; overflow-y: auto; }
+            .batch-download-panels { max-height: 40vh; overflow-y: auto; flex-shrink: 0; }
+            .batch-panel-select { flex: 1 1 180px; min-width: 0; overflow-wrap: anywhere; }
+            .batch-panel-name { flex: 1 1 220px; min-width: 140px; }
+            .batch-panel-content { flex: 0 1 230px; min-width: 190px; }
             .static-download-previews {
                 display: grid;
                 grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -10214,9 +10415,18 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         return selection
 
     def save_exported_image(self, image_bytes: bytes, filename: str) -> Path:
-        path = self.ensure_export_dir() / sanitize_export_filename(filename)
-        path.write_bytes(image_bytes)
-        return path
+        folder = self.ensure_export_dir()
+        name = sanitize_export_filename(filename)
+        stem, suffix = os.path.splitext(name)
+        number = 1
+        while True:
+            path = folder / (name if number == 1 else f"{stem}_{number}{suffix}")
+            try:
+                with path.open("xb") as handle:
+                    handle.write(image_bytes)
+                return path
+            except FileExistsError:
+                number += 1
 
     def save_exported_text(self, text: str, filename: str, extension: str = ".txt") -> Path:
         path = self.ensure_export_dir() / sanitize_export_filename(filename, "crysdis_export", extension)
@@ -10307,8 +10517,12 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         return max(float(value or DEFAULT_THICKNESS_NM), 0.05)
 
     def current_max_hkl(self) -> int:
-        value = getattr(getattr(self, "max_hkl_input", None), "value", DEFAULT_MAX_HKL)
+        value = getattr(getattr(self, "max_hkl_input", None), "value", getattr(self, "_max_hkl", DEFAULT_MAX_HKL))
         return int(min(max(int(float(value or DEFAULT_MAX_HKL)), 1), 30))
+
+    def max_hkl_for_state(self, state: PanelState) -> int:
+        value = state.display_settings.diffraction.max_hkl
+        return self.current_max_hkl() if value is None else int(value)
 
     def current_spot_intensity_threshold(self) -> float:
         value = getattr(getattr(self, "spot_threshold_input", None), "value", DEFAULT_SPOT_INTENSITY_THRESHOLD)
@@ -10346,12 +10560,18 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         compression = self.current_intensity_compression_factor()
         return np.log1p(compression * intensity) / math.log1p(compression)
 
-    def diffraction_spot_opacities(self, intensity: np.ndarray, combo: bool = False) -> np.ndarray:
+    def diffraction_spot_sizes(self, intensity: np.ndarray, state: PanelState) -> np.ndarray:
+        sizes = BASE_DIFFRACTION_MARKER_SIZE + EXTRA_DIFFRACTION_MARKER_SIZE * self.current_spot_size_scaling_effect() * intensity**1.18
+        return sizes * state.display_settings.diffraction.spot_scale
+
+    def diffraction_spot_opacities(self, intensity: np.ndarray, combo: bool = False,
+                                  *, state: PanelState | None = None) -> np.ndarray:
         base, scale = (0.14, 0.70) if combo else (0.18, 0.82)
+        opacity = state.display_settings.diffraction.spot_opacity if state is not None else 1.0
         if self.uniform_spot_brightness():
             # Preserve relative intensities for filtering, size scaling, labels, and hover text.
-            return np.full_like(intensity, base + scale, dtype=float)
-        return base + scale * intensity
+            return np.full_like(intensity, (base + scale) * opacity, dtype=float)
+        return (base + scale * intensity) * opacity
 
     def current_camera_length_mm(self) -> float:
         value = getattr(getattr(self, "camera_length_input", None), "value", f"{DEFAULT_CAMERA_LENGTH_MM:g} mm")
@@ -10715,7 +10935,7 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         return (
             method,
             crystal_model_key(model),
-            self.current_max_hkl(),
+            self.max_hkl_for_state(state),
             round(self.current_voltage_kv(), 5),
             round(self.current_thickness_nm(), 5),
             round(self.current_camera_length_mm(), 5),
@@ -10732,9 +10952,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         if cached is not None:
             return cached
         if self.current_simulation_method() == SIMULATION_METHOD_PYMATGEN:
-            spots = self.compute_pymatgen_tem_spots(model, state.view_vector, state.roll)
+            spots = self.compute_pymatgen_tem_spots(model, state.view_vector, state.roll, max_hkl=self.max_hkl_for_state(state))
         else:
-            spots = self.compute_ewald_spots(model, state.view_vector, state.roll)
+            spots = self.compute_ewald_spots(model, state.view_vector, state.roll, max_hkl=self.max_hkl_for_state(state))
         self.diffraction_spot_cache[key] = spots
         self.trim_cache(self.diffraction_spot_cache, 512)
         return spots
@@ -10790,8 +11010,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
                 controller.redraw_diffraction(model)
         self.refresh_combo_panels_for_sources(affected_panel_ids)
 
-    def pymatgen_tem_reflections(self, model: CrystalModel, zone_axis: tuple[int, int, int]) -> np.ndarray | None:
-        max_order = self.current_max_hkl()
+    def pymatgen_tem_reflections(self, model: CrystalModel, zone_axis: tuple[int, int, int],
+                                *, max_hkl: int | None = None) -> np.ndarray | None:
+        max_order = self.current_max_hkl() if max_hkl is None else max_hkl
         camera_length = max(int(round(self.current_camera_length_mm() / 10.0)), 1)
         cache_key = (
             crystal_model_key(model),
@@ -10827,9 +11048,10 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
         self.trim_cache(self.pymatgen_tem_cache, 128)
         return reflections
 
-    def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
+    def compute_pymatgen_tem_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float,
+                                   *, max_hkl: int | None = None) -> np.ndarray:
         zone_axis = integer_zone_axis_from_view(model, view_vector)
-        reflections = self.pymatgen_tem_reflections(model, zone_axis)
+        reflections = self.pymatgen_tem_reflections(model, zone_axis, max_hkl=max_hkl)
         if reflections is None:
             return np.empty((0, 6), dtype=float)
         if not len(reflections):
@@ -10871,8 +11093,9 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             self.set_status(f"Pymatgen TEM projection failed: {exc}")
             return np.empty((0, 6), dtype=float)
 
-    def compute_ewald_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float) -> np.ndarray:
-        hkl, reciprocal_points, structure_intensity = self.reciprocal_points_for_model(model)
+    def compute_ewald_spots(self, model: CrystalModel, view_vector: np.ndarray, roll: float,
+                            *, max_hkl: int | None = None) -> np.ndarray:
+        hkl, reciprocal_points, structure_intensity = self.reciprocal_points_for_model(model, max_hkl=max_hkl)
         if len(hkl) == 0:
             return np.empty((0, 6), dtype=float)
         normal = normalize_vector(view_vector)
@@ -10916,8 +11139,8 @@ Enable `Bind crystal motion` inside a combo panel after manually setting an orie
             )
         )
 
-    def reciprocal_points_for_model(self, model: CrystalModel) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        max_order = self.current_max_hkl()
+    def reciprocal_points_for_model(self, model: CrystalModel, *, max_hkl: int | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        max_order = self.current_max_hkl() if max_hkl is None else max_hkl
         cache_key = (crystal_model_key(model), max_order)
         cached = self.reciprocal_table_cache.get(cache_key)
         if cached is not None:
